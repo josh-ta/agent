@@ -209,22 +209,27 @@ class AgentLoop:
             except Exception:
                 pass
 
-    async def _progress_ticker(self, task: Task, elapsed_ref: list[float]) -> None:
+    async def _progress_ticker(self, task: Task, start: float) -> None:
         """
-        Coroutine that sends periodic "still working" pings.
-        Runs concurrently with agent.run() — cancelled when the agent finishes.
-        elapsed_ref is a single-element list mutated by _process so the ticker
-        can include real elapsed time in its messages.
+        Coroutine that sends periodic status pings after the agent has been running a while.
+        Sleeps first, then fires — so the first ping only appears if the task is genuinely slow.
+        start is the asyncio loop time when the task began, used to compute real elapsed time.
         """
         ping_num = 0
         while True:
             await asyncio.sleep(PROGRESS_PING_INTERVAL)
             ping_num += 1
-            elapsed_s = elapsed_ref[0]
+            elapsed_s = asyncio.get_event_loop().time() - start
             mins = int(elapsed_s // 60)
             secs = int(elapsed_s % 60)
             time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            await self._send_progress(task, f"⏳ Still working… ({time_str} elapsed)")
+            messages = [
+                f"⏳ Still running ({time_str})…",
+                f"⏳ Still working ({time_str})… model is thinking or waiting on a tool.",
+                f"⏳ Long task in progress ({time_str})… will reply when done.",
+            ]
+            msg = messages[min(ping_num - 1, len(messages) - 1)]
+            await self._send_progress(task, msg)
 
     async def _summarize_context(self, task: Task, accumulated_prompt: str) -> str:
         """
@@ -258,7 +263,6 @@ class AgentLoop:
         """Core observe→think→act cycle."""
         self._task_count += 1
         start = asyncio.get_event_loop().time()
-        elapsed_ref = [0.0]  # mutable ref updated each loop for the progress ticker
 
         # Parse user model override (/fast, /smart, /best) and classify tier
         content, forced_tier = _parse_override(task.content)
@@ -293,8 +297,7 @@ class AgentLoop:
 
         # Immediate acknowledgment so the user knows the agent received the task
         if task.source == "discord" and task.channel_id:
-            preview = task.content[:80] + ("…" if len(task.content) > 80 else "")
-            await self._send_progress(task, f"🔍 Working on: *{preview}*")
+            await self._send_progress(task, f"🔍 Working on: *{task.content}*")
 
         # Surface top-3 relevant past lessons — capped to avoid bloating prompt
         lessons_context = ""
@@ -341,7 +344,7 @@ class AgentLoop:
         # Start progress ticker — runs concurrently, cancelled when agent finishes
         ticker: asyncio.Task | None = None  # type: ignore[type-arg]
         if task.progress_callback:
-            ticker = asyncio.create_task(self._progress_ticker(task, elapsed_ref))
+            ticker = asyncio.create_task(self._progress_ticker(task, start))
 
         try:
             # Retry loop handles:
@@ -360,9 +363,6 @@ class AgentLoop:
                     break  # success
                 except Exception as _exc:
                     exc_str = str(_exc)
-
-                    # Update elapsed time for ticker
-                    elapsed_ref[0] = asyncio.get_event_loop().time() - start
 
                     is_context_overflow = (
                         "prompt is too long" in exc_str
@@ -419,9 +419,6 @@ class AgentLoop:
                         _attempt += 1
                     else:
                         raise
-
-                    # Update elapsed ref at end of each error handler
-                    elapsed_ref[0] = asyncio.get_event_loop().time() - start
 
             output = str(result.output)
 
