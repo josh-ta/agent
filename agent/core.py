@@ -42,15 +42,26 @@ def _load_skills_compact(skills_path: Path) -> str:
 
 
 def _load_identity(identity_path: Path) -> str:
-    """Load IDENTITY.md, GOALS.md, MEMORY.md into the system prompt."""
+    """Load IDENTITY.md, GOALS.md, MEMORY.md — with a size cap on MEMORY.md."""
     if not identity_path.exists():
         return ""
+
+    # Character budget per file (rough: 1 token ≈ 4 chars)
+    MEMORY_CHAR_CAP = 4_000   # ~1k tokens — most recent lessons only
+    IDENTITY_CHAR_CAP = 2_000 # ~500 tokens each for identity/goals
 
     sections: list[str] = []
     for filename in ("IDENTITY.md", "GOALS.md", "MEMORY.md"):
         fp = identity_path / filename
-        if fp.exists():
-            sections.append(fp.read_text(encoding="utf-8").strip())
+        if not fp.exists():
+            continue
+        text = fp.read_text(encoding="utf-8").strip()
+        cap = MEMORY_CHAR_CAP if filename == "MEMORY.md" else IDENTITY_CHAR_CAP
+        if len(text) > cap:
+            # Keep the tail (most recent content is at the bottom)
+            text = "[...truncated...]\n\n" + text[-cap:]
+            log.warning("identity_file_truncated", file=filename, cap=cap)
+        sections.append(text)
 
     return "\n\n".join(sections)
 
@@ -88,7 +99,17 @@ shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, 
 
 {skills}
 """
-    return base.strip()
+    prompt = base.strip()
+
+    # Hard cap: ~40k chars ≈ 10k tokens. Keep system prompt small so there's
+    # plenty of room for tool call output within the 200k token window.
+    MAX_CHARS = 40_000
+    if len(prompt) > MAX_CHARS:
+        prompt = prompt[:MAX_CHARS] + "\n[...system prompt truncated — MEMORY.md too large, use identity_edit to trim it...]"
+        log.warning("system_prompt_truncated", chars=len(base), cap=MAX_CHARS)
+
+    log.info("system_prompt_built", chars=len(prompt))
+    return prompt
 
 
 def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type: ignore[type-arg]

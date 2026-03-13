@@ -76,5 +76,18 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     export GH_TOKEN="${GITHUB_TOKEN}"
 fi
 
+# ── Trim oversized MEMORY.md ──────────────────────────────────────────────────
+# Bob appends lessons after every failure. If MEMORY.md grows too large it
+# blows the context window. Keep only the last 4000 chars (most recent lessons).
+MEMORY_FILE="${IDENTITY_PATH:-/app/agent/identity}/MEMORY.md"
+if [[ -f "$MEMORY_FILE" ]]; then
+    SIZE=$(wc -c < "$MEMORY_FILE")
+    if [[ "$SIZE" -gt 8000 ]]; then
+        echo "[entrypoint] MEMORY.md is ${SIZE} bytes — trimming to last 4000 chars"
+        TAIL=$(tail -c 4000 "$MEMORY_FILE")
+        printf '[...older entries trimmed at startup...]\n\n%s' "$TAIL" > "$MEMORY_FILE"
+    fi
+fi
+
 # ── Start agent ────────────────────────────────────────────────────────────────
 exec python -m agent.main start "$@"
