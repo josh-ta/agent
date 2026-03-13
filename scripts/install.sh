@@ -115,10 +115,10 @@ multiselect() {
         fi
         case "$key" in
             $'\x1b[A'|k) # up
-                ((cursor > 0)) && ((cursor--))
+                ((cursor > 0)) && ((cursor--)) || true
                 ;;
             $'\x1b[B'|j) # down
-                ((cursor < n-1)) && ((cursor++))
+                ((cursor < n-1)) && ((cursor++)) || true
                 ;;
             ' ') # spacebar — toggle
                 if [[ "${selected[$cursor]}" == "true" ]]; then
@@ -163,20 +163,29 @@ configure_env() {
 
     # ── LLM provider selection ───────────────────────────────────────────────
     echo ""
-    echo -e "${CYAN}── LLM Provider ──────────────────────────────────────${NC}"
+    echo -e "${CYAN}── LLM Providers ─────────────────────────────────────${NC}"
     echo -e "  Use ${YELLOW}Space${NC} to select providers, ${YELLOW}Enter${NC} to confirm:"
     echo ""
 
     selected_providers=""
     multiselect selected_providers \
         "Anthropic (Claude — recommended)" \
-        "OpenAI (GPT-4o)"
+        "OpenAI (GPT-4o / o-series)" \
+        "Google (Gemini)" \
+        "Groq (fast open-source models)" \
+        "Mistral" \
+        "xAI (Grok)"
 
     # Parse selections
-    want_anthropic=false; want_openai=false
+    want_anthropic=false; want_openai=false; want_google=false
+    want_groq=false; want_mistral=false; want_xai=false
     for idx in $selected_providers; do
         [[ "$idx" == "0" ]] && want_anthropic=true
         [[ "$idx" == "1" ]] && want_openai=true
+        [[ "$idx" == "2" ]] && want_google=true
+        [[ "$idx" == "3" ]] && want_groq=true
+        [[ "$idx" == "4" ]] && want_mistral=true
+        [[ "$idx" == "5" ]] && want_xai=true
     done
 
     if [[ "$want_anthropic" == "true" ]]; then
@@ -188,8 +197,8 @@ configure_env() {
         current_model="$(current_val AGENT_MODEL)"
         if [[ -z "$current_model" || "$current_model" == "claude-opus-4-5" ]]; then
             echo ""
-            echo -e "${CYAN}── Model ─────────────────────────────────────────────${NC}"
-            echo -e "  Choose Claude model (Space to select, Enter to confirm):"
+            echo -e "${CYAN}── Default Claude Model ──────────────────────────────${NC}"
+            echo -e "  Choose default model (Space to select, Enter to confirm):"
             echo ""
             selected_model=""
             multiselect selected_model \
@@ -214,6 +223,51 @@ configure_env() {
             set_var "AGENT_MODEL" "gpt-4o"
         fi
     fi
+
+    if [[ "$want_google" == "true" ]]; then
+        prompt_var "GOOGLE_API_KEY" \
+            "Google AI API key — aistudio.google.com/app/apikey" \
+            "$(current_val GOOGLE_API_KEY)" 1
+        if [[ "$want_anthropic" == "false" && "$want_openai" == "false" ]]; then
+            set_var "AGENT_MODEL" "gemini-2.0-flash"
+        fi
+    fi
+
+    if [[ "$want_groq" == "true" ]]; then
+        prompt_var "GROQ_API_KEY" \
+            "Groq API key — console.groq.com/keys" \
+            "$(current_val GROQ_API_KEY)" 1
+    fi
+
+    if [[ "$want_mistral" == "true" ]]; then
+        prompt_var "MISTRAL_API_KEY" \
+            "Mistral API key — console.mistral.ai" \
+            "$(current_val MISTRAL_API_KEY)" 1
+    fi
+
+    if [[ "$want_xai" == "true" ]]; then
+        prompt_var "XAI_API_KEY" \
+            "xAI API key — console.x.ai" \
+            "$(current_val XAI_API_KEY)" 1
+        if [[ "$want_anthropic" == "false" && "$want_openai" == "false" && "$want_google" == "false" ]]; then
+            set_var "AGENT_MODEL" "grok-3"
+        fi
+    fi
+
+    # ── Model tiers ──────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── Model Tiers (optional) ────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Users can prefix messages with /fast, /smart, /best"
+    echo -e "       to route to different model tiers. Press Enter to keep defaults."
+    prompt_var "MODEL_FAST" \
+        "Fast tier — simple Q&A, greetings" \
+        "$(current_val MODEL_FAST)"
+    prompt_var "MODEL_SMART" \
+        "Smart tier — code, research, multi-step tasks" \
+        "$(current_val MODEL_SMART)"
+    prompt_var "MODEL_BEST" \
+        "Best tier — complex reasoning, architecture" \
+        "$(current_val MODEL_BEST)"
 
     # ── Discord ──────────────────────────────────────────────────────────────
     echo ""
