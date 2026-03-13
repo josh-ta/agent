@@ -26,15 +26,29 @@ identity_edit("GOALS.md", "# Goals\n\n1. ...\n")
    ```
    write_file("/app/agent/tools/shell.py", "<new content>")
    ```
-3. Commit to git:
+3. Validate syntax first:
    ```
-   run_shell("cd /app && git add -A && git commit -m 'agent: <description of change>'")
+   run_shell("python -m py_compile /app/agent/tools/shell.py && echo OK")
    ```
-4. Restart the container:
+4. Commit and push to **your own fork** (not the base repo):
+   ```
+   run_shell("cd /app && git add -A && git commit -m 'fix: <description>'")
+   run_shell("cd /app && git push origin main")
+   ```
+5. Restart the container:
    ```
    agent_restart("code update: <description>")
    ```
    ⚠️ You will be offline for ~15–30 seconds. Warn users in Discord first.
+
+## Pulling Base Repo Updates
+
+The base agent template lives in `upstream`. To merge improvements from it:
+```
+run_shell("cd /app && git fetch upstream && git merge upstream/main --no-edit")
+run_shell("cd /app && git push origin main")
+agent_restart("merged upstream improvements")
+```
 
 ## Safety Rules
 

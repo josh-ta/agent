@@ -268,6 +268,97 @@ if [[ "${do_ssh,,}" != "n" ]]; then
     setup_github_ssh
 fi
 
+# ── 4. Fork base repo into agent's own GitHub repo ────────────────────────────
+setup_fork() {
+    local agent_name
+    agent_name=$(grep "^AGENT_NAME=" .env 2>/dev/null | sed 's/^AGENT_NAME=//' | sed 's/[[:space:]]*#.*//' | tr -d '"' || echo "agent-1")
+
+    local github_user
+    github_user=$(grep "^GITHUB_USERNAME=" .env 2>/dev/null | sed 's/^GITHUB_USERNAME=//' | sed 's/[[:space:]]*#.*//' | tr -d '"' || echo "")
+
+    local github_token
+    github_token=$(grep "^GITHUB_TOKEN=" .env 2>/dev/null | sed 's/^GITHUB_TOKEN=//' | sed 's/[[:space:]]*#.*//' | tr -d '"' || echo "")
+
+    if [[ -z "$github_user" || -z "$github_token" ]]; then
+        warn "Skipping fork — GITHUB_USERNAME or GITHUB_TOKEN not set."
+        return
+    fi
+
+    export GH_TOKEN="$github_token"
+
+    # Detect base repo from current remote (if already cloned from GitHub)
+    local base_repo=""
+    if git remote get-url origin &>/dev/null; then
+        local remote_url
+        remote_url=$(git remote get-url origin)
+        # Extract owner/repo from https or ssh URL
+        base_repo=$(echo "$remote_url" \
+            | sed 's|https://github.com/||' \
+            | sed 's|git@github.com:||' \
+            | sed 's|\.git$||')
+    fi
+
+    if [[ -z "$base_repo" ]]; then
+        echo ""
+        echo -e "  ${CYAN}GITHUB_USERNAME${NC}: ${github_user}"
+        read -rp "  Base repo to fork (e.g. ${github_user}/agent): " base_repo
+    fi
+
+    if [[ -z "$base_repo" ]]; then
+        warn "No base repo provided — skipping fork."
+        return
+    fi
+
+    local fork_name="${agent_name}"
+    local fork_full="${github_user}/${fork_name}"
+
+    # Check if fork already exists
+    if gh repo view "$fork_full" &>/dev/null 2>&1; then
+        info "Fork ${fork_full} already exists — skipping creation."
+    else
+        info "Forking ${base_repo} → ${fork_full}..."
+        gh repo fork "$base_repo" \
+            --org "" \
+            --fork-name "$fork_name" \
+            --clone=false \
+            --default-branch-only
+        success "Forked to ${fork_full}"
+    fi
+
+    # Re-point origin to the fork (SSH)
+    local fork_ssh="git@github.com:${fork_full}.git"
+    info "Setting origin → ${fork_ssh}"
+    if git remote get-url origin &>/dev/null; then
+        git remote set-url origin "$fork_ssh"
+    else
+        git remote add origin "$fork_ssh"
+    fi
+
+    # Keep the base repo as 'upstream' so you can pull improvements later
+    local base_ssh="git@github.com:${base_repo}.git"
+    if ! git remote get-url upstream &>/dev/null 2>&1; then
+        git remote add upstream "$base_ssh"
+        info "Added upstream → ${base_ssh}"
+    fi
+
+    # Write AGENT_REPO to .env so the agent knows its own repo
+    if grep -q "^AGENT_REPO=" .env 2>/dev/null; then
+        sed -i.bak "s|^AGENT_REPO=.*|AGENT_REPO=${fork_full}|" .env && rm -f .env.bak
+    else
+        echo "AGENT_REPO=${fork_full}" >> .env
+    fi
+
+    success "Repo setup: origin=${fork_full}  upstream=${base_repo}"
+    echo -e "  ${YELLOW}Tip:${NC} Pull base updates later with: git fetch upstream && git merge upstream/main"
+}
+
+echo ""
+echo -ne "  ${YELLOW}Fork base repo to create this agent's own GitHub repo?${NC} [Y/n] "
+read -r do_fork
+if [[ "${do_fork,,}" != "n" ]]; then
+    setup_fork
+fi
+
 # ── 4. Set up git ──────────────────────────────────────────────────────────────
 if [[ ! -d .git ]]; then
     info "Initialising git repository..."
