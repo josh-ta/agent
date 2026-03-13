@@ -254,9 +254,9 @@ class AgentLoop:
         parts.append(task.content)
         prompt = "\n\n---\n\n".join(parts)
 
-        # Hard timeout so a stuck agent (e.g. waiting on interactive stdin)
-        # never hangs the loop indefinitely.
-        TASK_TIMEOUT = 300  # 5 minutes
+        # Hard timeout: long enough for real work (e.g. cloning + building) but short
+        # enough to prevent infinite loops or waiting on interactive stdin.
+        TASK_TIMEOUT = 600  # 10 minutes
 
         try:
             async with agent.run_mcp_servers():
@@ -304,7 +304,7 @@ class AgentLoop:
             log.error("task_timeout", elapsed_ms=round(elapsed_ms))
             return TaskResult(
                 task=task,
-                output="Task timed out after 5 minutes. If you were waiting for user input, please rephrase or split the task.",
+                output="Task timed out after 10 minutes. Please break this into smaller steps.",
                 success=False,
                 elapsed_ms=elapsed_ms,
             )
