@@ -76,7 +76,7 @@ def build_system_prompt() -> str:
 {identity}
 
 ## Tools
-shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, discord_send, read_discord, read_channel(name), edit_skill, edit_identity, self_restart, memory_save, lesson_search, skill_read
+shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, discord_send, read_discord, read_channel(name), edit_skill, edit_identity, self_restart, memory_save, lesson_search, skill_read, task_note, task_resume, task_journal_clear, gh_pr_view, gh_pr_diff, gh_pr_comment, gh_pr_review, gh_pr_review_inline, gh_pr_checks, gh_pr_merge, gh_issue_view, gh_issue_comment, gh_issue_create, gh_ci_list, gh_ci_logs_failed, gh_ci_rerun
 
 ## Rules
 1. Think before acting. Use shell for system tasks.

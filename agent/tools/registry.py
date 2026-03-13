@@ -14,7 +14,7 @@ import structlog
 from pydantic_ai import Agent, RunContext
 
 from agent.config import settings
-from agent.tools import filesystem, self_edit, shell
+from agent.tools import filesystem, github, self_edit, shell
 from agent.tools.discord_tools import discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
@@ -184,6 +184,108 @@ class ToolRegistry:
             Use this to catch up on conversation history or check what other agents said.
             """
             return await discord_read_named(name, limit)
+
+        # ── GitHub ────────────────────────────────────────────────────────────
+
+        @agent.tool_plain
+        async def gh_pr_view(pr: int, repo: str = "") -> str:
+            """Read a PR: title, body, status, CI checks, and all comments."""
+            return await github.pr_view(pr, repo or None)
+
+        @agent.tool_plain
+        async def gh_pr_list(repo: str = "", state: str = "open", limit: int = 20) -> str:
+            """List PRs. state: open | closed | merged | all."""
+            return await github.pr_list(repo or None, state, limit)
+
+        @agent.tool_plain
+        async def gh_pr_diff(pr: int, repo: str = "") -> str:
+            """Get the diff for a PR (capped at 300 lines)."""
+            return await github.pr_diff(pr, repo or None)
+
+        @agent.tool_plain
+        async def gh_pr_comment(pr: int, body: str, repo: str = "") -> str:
+            """Post a general comment on a PR."""
+            return await github.pr_comment(pr, body, repo or None)
+
+        @agent.tool_plain
+        async def gh_pr_review(pr: int, action: str, body: str = "", repo: str = "") -> str:
+            """
+            Submit a PR review.
+            action: 'approve' | 'request-changes' | 'comment'
+            body: review summary (required for request-changes).
+            """
+            return await github.pr_review(pr, action, body, repo or None)
+
+        @agent.tool_plain
+        async def gh_pr_review_inline(
+            pr: int,
+            action: str,
+            body: str,
+            comments: list[dict],
+            repo: str = "",
+        ) -> str:
+            """
+            Submit a PR review with inline line-level comments.
+            action: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT'
+            body: top-level review summary.
+            comments: list of {path, line, message} dicts.
+            """
+            return await github.pr_review_with_comments(pr, action, body, comments, repo or None)
+
+        @agent.tool_plain
+        async def gh_pr_checks(pr: int, repo: str = "") -> str:
+            """Show CI check status for a PR."""
+            return await github.pr_checks(pr, repo or None)
+
+        @agent.tool_plain
+        async def gh_pr_merge(pr: int, method: str = "squash", repo: str = "") -> str:
+            """Merge a PR. method: 'merge' | 'squash' | 'rebase'."""
+            return await github.pr_merge(pr, method, repo or None)
+
+        @agent.tool_plain
+        async def gh_issue_view(issue: int, repo: str = "") -> str:
+            """Read an issue and all its comments."""
+            return await github.issue_view(issue, repo or None)
+
+        @agent.tool_plain
+        async def gh_issue_list(repo: str = "", state: str = "open", limit: int = 20) -> str:
+            """List issues. state: open | closed | all."""
+            return await github.issue_list(repo or None, state, limit)
+
+        @agent.tool_plain
+        async def gh_issue_comment(issue: int, body: str, repo: str = "") -> str:
+            """Post a comment on an issue."""
+            return await github.issue_comment(issue, body, repo or None)
+
+        @agent.tool_plain
+        async def gh_issue_create(title: str, body: str, labels: list[str] | None = None, repo: str = "") -> str:
+            """Create a new GitHub issue."""
+            return await github.issue_create(title, body, labels, repo or None)
+
+        @agent.tool_plain
+        async def gh_issue_close(issue: int, reason: str = "completed", repo: str = "") -> str:
+            """Close an issue. reason: 'completed' | 'not planned'."""
+            return await github.issue_close(issue, reason, repo or None)
+
+        @agent.tool_plain
+        async def gh_ci_list(repo: str = "", branch: str = "", limit: int = 5) -> str:
+            """List recent CI workflow runs."""
+            return await github.ci_list(repo or None, branch or None, limit)
+
+        @agent.tool_plain
+        async def gh_ci_view(run_id: str, repo: str = "") -> str:
+            """Show job status for a CI run."""
+            return await github.ci_view(run_id, repo or None)
+
+        @agent.tool_plain
+        async def gh_ci_logs_failed(run_id: str, repo: str = "") -> str:
+            """Fetch failed step logs from a CI run (capped at 200 lines / ~4KB)."""
+            return await github.ci_logs_failed(run_id, repo or None)
+
+        @agent.tool_plain
+        async def gh_ci_rerun(run_id: str, failed_only: bool = True, repo: str = "") -> str:
+            """Re-trigger a CI run (or only its failed jobs)."""
+            return await github.ci_rerun(run_id, failed_only, repo or None)
 
         # ── Memory search ─────────────────────────────────────────────────────
         if sqlite:

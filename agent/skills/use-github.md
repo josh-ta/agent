@@ -1,74 +1,94 @@
 # Use GitHub
 
-Use this skill when working with GitHub repositories: cloning, branching, committing, opening PRs, managing issues, or querying the API.
+Use this skill when working with GitHub repositories: cloning, branching, committing, opening PRs, reviewing PRs, managing issues, or checking CI.
 
 ## Tools Available
 
-- **`gh` CLI** — full GitHub CLI, authenticated via `GH_TOKEN` at container startup
-- **`git`** — authenticated for HTTPS via `GITHUB_TOKEN` (no SSH key needed)
-- **`run_shell`** — all git/gh commands run through the shell tool
+Dedicated structured tools (use these — they're more reliable than raw shell):
 
-## Common Operations
+| Tool | What it does |
+|---|---|
+| `gh_pr_view(pr, repo?)` | Read PR: title, body, status, checks, all comments |
+| `gh_pr_list(repo?, state?, limit?)` | List PRs (state: open/closed/merged/all) |
+| `gh_pr_diff(pr, repo?)` | Get the PR diff (capped at 300 lines) |
+| `gh_pr_comment(pr, body, repo?)` | Post a general comment on a PR |
+| `gh_pr_review(pr, action, body?, repo?)` | Submit a review: action = approve / request-changes / comment |
+| `gh_pr_review_inline(pr, action, body, comments, repo?)` | Review with inline line comments: comments = [{path, line, message}] |
+| `gh_pr_checks(pr, repo?)` | Show CI check results for a PR |
+| `gh_pr_merge(pr, method?, repo?)` | Merge a PR (method: merge/squash/rebase) |
+| `gh_issue_view(issue, repo?)` | Read an issue and all comments |
+| `gh_issue_list(repo?, state?, limit?)` | List issues |
+| `gh_issue_comment(issue, body, repo?)` | Comment on an issue |
+| `gh_issue_create(title, body, labels?, repo?)` | Create a new issue |
+| `gh_issue_close(issue, reason?, repo?)` | Close an issue |
+| `gh_ci_list(repo?, branch?, limit?)` | List recent CI runs |
+| `gh_ci_view(run_id, repo?)` | Show CI run job status |
+| `gh_ci_logs_failed(run_id, repo?)` | Fetch failed step logs (capped at 200 lines) |
+| `gh_ci_rerun(run_id, failed_only?, repo?)` | Re-trigger a CI run |
 
-### Clone a repository
-```bash
-run_shell("gh repo clone owner/repo /workspace/repo")
-# or with HTTPS:
-run_shell("git clone https://github.com/owner/repo /workspace/repo")
+The `repo` argument is `owner/repo` (e.g. `josh-ta/TicketActionApp`). Omit it when running from inside a cloned repo directory — `gh` infers it automatically.
+
+## Workflows
+
+### Review a PR and request changes
+```
+gh_pr_view(1, "owner/repo")          # read the PR
+gh_pr_diff(1, "owner/repo")          # read the diff
+gh_pr_review(1, "request-changes",
+    body="Please fix X before merging:\n- Line 42: ...\n- Missing tests for Y",
+    repo="owner/repo")
 ```
 
-### Create a branch and commit
-```bash
-run_shell("cd /workspace/repo && git checkout -b feature/my-change")
-# ... make changes with write_file ...
-run_shell("cd /workspace/repo && git add -A && git commit -m 'feat: description'")
+### Review with inline comments
+```
+gh_pr_review_inline(
+    pr=1,
+    action="REQUEST_CHANGES",
+    body="A few things to address:",
+    comments=[
+        {"path": "src/api/main.py", "line": 42, "message": "This will throw if `user` is None"},
+        {"path": "src/api/main.py", "line": 87, "message": "Missing error handling for 404"},
+    ],
+    repo="owner/repo"
+)
 ```
 
-### Open a Pull Request
-```bash
-run_shell("cd /workspace/repo && git push origin feature/my-change")
-run_shell('cd /workspace/repo && gh pr create --title "My change" --body "Description of what and why"')
+### Approve a PR
+```
+gh_pr_review(1, "approve", body="LGTM — tests pass and logic looks solid.", repo="owner/repo")
 ```
 
-### List / read issues
-```bash
-run_shell("gh issue list --repo owner/repo --limit 20")
-run_shell("gh issue view 42 --repo owner/repo")
+### Investigate and fix failing CI
+```
+gh_ci_list(repo="owner/repo", branch="fix/my-branch")   # get run ID
+gh_ci_view("23057002906", "owner/repo")                 # see which jobs failed
+gh_ci_logs_failed("23057002906", "owner/repo")          # read the error output
+# ... fix the code ...
+gh_ci_rerun("23057002906", failed_only=True, repo="owner/repo")
 ```
 
-### Create an issue
-```bash
-run_shell('gh issue create --repo owner/repo --title "Bug: X" --body "Steps to reproduce..."')
+### Comment on an issue
+```
+gh_issue_view(42, "owner/repo")
+gh_issue_comment(42, "I looked into this — the root cause is X. PR incoming.", "owner/repo")
 ```
 
-### Read PR comments / reviews
-```bash
-run_shell("gh pr view 123 --repo owner/repo --comments")
+## Shell fallback
+For anything not covered above, use `run_shell` with `gh` or `git` directly:
 ```
-
-### Check workflow / CI status
-```bash
-run_shell("gh run list --repo owner/repo --limit 5")
-run_shell("gh run view <run-id> --log-failed")
-```
-
-### Search code on GitHub
-```bash
-run_shell("gh search code 'function parseConfig' --repo owner/repo")
+run_shell("cd /workspace/repo && gh pr create --title '...' --body '...'")
+run_shell("cd /workspace/repo && git log --oneline -10")
 ```
 
 ## Auth Check
-
-If you're unsure whether auth is working:
-```bash
+```
 run_shell("gh auth status")
-run_shell("git config --global --list | grep user")
 ```
 
 ## Tips
-
-- Always `cd` into the repo directory before running git commands.
-- Use `gh repo fork` to fork before contributing to repos you don't own.
-- For large file changes, write them with `write_file` then `git add` — don't try to echo large content in shell.
-- Commit messages should follow conventional commits: `type(scope): description`
-- After opening a PR, save the PR URL to memory with `memory_save`.
+- Always `cd` into the repo dir before raw git commands.
+- Clone repos to `/workspace/<repo-name>` (not `/tmp`).
+- Set git identity once per clone: `git config user.name "bob-agent" && git config user.email "bob@agent.local"`
+- `gh` CLI is pre-authenticated via `GH_TOKEN` — never run `gh auth login`.
+- Follow conventional commits: `type(scope): description`
+- After opening a PR or resolving a significant issue, call `memory_save` with the PR URL and outcome.
