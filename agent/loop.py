@@ -229,19 +229,30 @@ class AgentLoop:
         # Inject recent channel history as plain text so the agent has context.
         # We fetch this directly (not via a tool call) so it's always present
         # without Bob needing to remember to ask for it.
+        # Hard limits to avoid blowing the context window:
+        #   - max 6 messages (3 exchanges)
+        #   - each message truncated to 300 chars
+        #   - total history capped at 1500 chars
         channel_context = ""
         if task.source == "discord" and task.channel_id:
             try:
                 from agent.tools.discord_tools import discord_read
-                # Fetch last 15 messages; exclude the triggering message itself
-                # (it will be in the prompt as task.content already)
-                raw = await discord_read(task.channel_id, limit=16)
+                raw = await discord_read(task.channel_id, limit=7)
                 lines = raw.splitlines()
                 # Drop the last line — that's the message we're currently processing
                 if lines:
                     lines = lines[:-1]
-                if lines:
-                    channel_context = "## Recent conversation history\n" + "\n".join(lines)
+                # Truncate each line and cap total
+                truncated = []
+                total_chars = 0
+                for line in lines:
+                    short = line[:300] + ("…" if len(line) > 300 else "")
+                    if total_chars + len(short) > 1500:
+                        break
+                    truncated.append(short)
+                    total_chars += len(short)
+                if truncated:
+                    channel_context = "## Recent conversation history\n" + "\n".join(truncated)
             except Exception:
                 pass
 
