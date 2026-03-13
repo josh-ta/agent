@@ -36,6 +36,14 @@ Progress updates
 For Discord tasks, the loop sends an immediate acknowledgment when the task
 starts, periodic "still working" pings every 60 s, and a note whenever the
 agent calls task_note() (forwarded from the journal write hook).
+
+Zipper-merge injection (Option C)
+----------------------------------
+While the agent is mid-task, new messages from the user are held in
+Task.inject_queue. Between each tool-call round-trip (after CallToolsNode
+completes, before ModelRequestNode sends its next request), the loop drains
+inject_queue and appends the messages as a UserPromptPart so the model sees
+them at exactly the right moment — between thoughts, not before or after.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ from typing import Any, Callable, Awaitable
 
 import structlog
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from agent.config import settings
 
@@ -124,6 +133,9 @@ class Task:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Optional callback for mid-task progress messages (set by discord_bot)
     progress_callback: Callable[[str], Awaitable[None]] | None = field(default=None, repr=False)
+    # Queue for zipper-merge injection: new user messages arriving mid-task
+    # are pushed here by DiscordBot and drained between tool-call rounds.
+    inject_queue: asyncio.Queue[str] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -266,20 +278,23 @@ class AgentLoop:
             return f"Task in progress: {task.content[:300]}\n(Context was compressed due to length; some history may be lost.)"
 
     async def _process(self, task: Task) -> TaskResult:
-        """Core observe→think→act cycle."""
+        """
+        Core observe→think→act cycle using agent.iter() for step-by-step control.
+
+        Drives the pydantic-ai graph node-by-node so we can:
+          - Inject queued user messages between tool-call rounds (zipper merge)
+          - Detect context overflow at each ModelRequestNode and compress
+          - Forward task_note tool calls to Discord as they happen (not post-hoc)
+        """
         self._task_count += 1
         start = asyncio.get_event_loop().time()
 
         # Parse user model override (/fast, /smart, /best) and classify tier
         content, forced_tier = _parse_override(task.content)
-
-        if forced_tier:
-            tier = forced_tier
-        else:
-            tier = _classify_tier(content)
-
+        tier = forced_tier or _classify_tier(content)
         agent = self.agents.get(tier, self.agent)
-        # Update task content if prefix was stripped
+
+        # Preserve progress_callback and inject_queue across the Task rebuild
         task = Task(
             content=content,
             source=task.source,
@@ -289,6 +304,7 @@ class AgentLoop:
             metadata=task.metadata,
             created_at=task.created_at,
             progress_callback=task.progress_callback,
+            inject_queue=task.inject_queue,
         )
 
         log.info(
@@ -301,11 +317,11 @@ class AgentLoop:
             content=task.content[:120],
         )
 
-        # Immediate acknowledgment so the user knows the agent received the task
+        # Immediate acknowledgment
         if task.source == "discord" and task.channel_id:
             await self._send_progress(task, f"🔍 Working on: *{task.content}*")
 
-        # Surface top-3 relevant past lessons — capped to avoid bloating prompt
+        # Surface relevant past lessons
         lessons_context = ""
         if self.memory and hasattr(self.memory, "search_lessons"):
             try:
@@ -313,17 +329,15 @@ class AgentLoop:
             except Exception:
                 pass
 
-        # Inject recent channel history as plain text so the agent has context.
+        # Inject recent channel history
         channel_context = ""
         if task.source == "discord" and task.channel_id:
             try:
                 from agent.tools.discord_tools import discord_read
                 raw = await discord_read(task.channel_id, limit=7)
                 lines = raw.splitlines()
-                # Drop the last line — that's the message we're currently processing
                 if lines:
                     lines = lines[:-1]
-                # Truncate each line and cap total
                 truncated = []
                 total_chars = 0
                 for line in lines:
@@ -337,7 +351,6 @@ class AgentLoop:
             except Exception:
                 pass
 
-        # Build prompt — prepend channel context and lessons if available
         parts: list[str] = []
         if channel_context:
             parts.append(channel_context)
@@ -347,29 +360,99 @@ class AgentLoop:
         base_prompt = "\n\n---\n\n".join(parts)
         prompt = base_prompt
 
-        # Start progress ticker — runs concurrently, cancelled when agent finishes
+        # Progress ticker
         ticker: asyncio.Task | None = None  # type: ignore[type-arg]
         if task.progress_callback:
             ticker = asyncio.create_task(self._progress_ticker(task, start))
 
         try:
-            # Retry loop handles:
-            #   - 429 rate-limit errors (exponential backoff)
-            #   - 400 context-overflow errors (summarize + retry with compressed prompt)
-            _max_retries = 4
-            _delay = 5.0
             _context_retries = 0
             _max_context_retries = 2
-            _attempt = 0
+            _rate_retries = 0
+            _max_rate_retries = 3
+            _rate_delay = 5.0
 
-            while _attempt < _max_retries:
+            while True:  # outer retry loop for context overflow + rate limits
+                    discord_replied = False
+                                tool_calls = 0
+
                 try:
                     async with agent.run_mcp_servers():
-                        result = await agent.run(prompt)
-                    break  # success
+                        async with agent.iter(prompt) as agent_run:
+                            node = agent_run.next_node
+
+                            while not Agent.is_end_node(node):
+                                # Drive the node forward
+                                next_node = await agent_run.next(node)
+
+                                # ── After CallToolsNode finishes: inspect results ──
+                                if Agent.is_call_tools_node(node):
+                                    tool_calls += 1
+
+                                    # Scan the model response parts for tool calls
+                                    # we care about (send_discord, task_note)
+                                    for part in getattr(node.model_response, "parts", []):
+                                        tool_name = getattr(part, "tool_name", None)
+                                        if tool_name == "send_discord":
+                                            discord_replied = True
+                                        elif tool_name == "task_note":
+                                            args = getattr(part, "args", {})
+                                            note = (
+                                                args.get("note", "")
+                                                if isinstance(args, dict)
+                                                else str(args)
+                                            )
+                                            if note:
+                                                await self._send_progress(
+                                                    task, f"📝 **Checkpoint:** {note[:300]}"
+                                                )
+
+                                    # Drain inject_queue and fold pending messages
+                                    # into the run's message history as a UserPromptPart
+                                    if task.inject_queue and not task.inject_queue.empty():
+                                        injected: list[str] = []
+                                        while not task.inject_queue.empty():
+                                            try:
+                                                injected.append(task.inject_queue.get_nowait())
+                                            except asyncio.QueueEmpty:
+                                                break
+
+                                        if injected:
+                                            combined = "\n".join(
+                                                f"[{i+1}] {m}" for i, m in enumerate(injected)
+                                            )
+                                            injection_text = (
+                                                f"\n\n---\n## New instructions received while working:\n"
+                                                f"{combined}\n"
+                                                f"Please incorporate these into your ongoing work."
+                                            )
+                                            log.info(
+                                                "messages_injected",
+                                                count=len(injected),
+                                                chars=len(injection_text),
+                                            )
+                                            await self._send_progress(
+                                                task,
+                                                f"💬 Got your message"
+                                                f"{' (×'+str(len(injected))+')' if len(injected) > 1 else ''}"
+                                                f" — incorporating into current work.",
+                                            )
+                                            # Append as a user-turn message so the model
+                                            # sees it on its next request
+                                            agent_run.ctx.state.message_history.append(
+                                                ModelRequest(parts=[
+                                                    UserPromptPart(content=injection_text)
+                                                ])
+                                            )
+
+                                node = next_node
+
+                            # Ran to End — grab result
+                            result_output = str(agent_run.result.output) if agent_run.result else ""
+                            break  # success, exit outer retry loop
+
                 except Exception as _exc:
                     exc_str = str(_exc)
-
                     is_context_overflow = (
                         "prompt is too long" in exc_str
                         or ("400" in exc_str and "maximum" in exc_str)
@@ -380,7 +463,6 @@ class AgentLoop:
                         _context_retries += 1
                         log.warning(
                             "context_overflow",
-                            attempt=_attempt + 1,
                             context_retry=_context_retries,
                             tier=tier,
                         )
@@ -390,7 +472,6 @@ class AgentLoop:
                             f"(attempt {_context_retries}/{_max_context_retries})",
                         )
                         summary = await self._summarize_context(task, prompt)
-                        # Save checkpoint to task journal so it persists across restarts
                         try:
                             journal = settings.workspace_path / ".task_journal.md"
                             from datetime import datetime as _dt
@@ -403,55 +484,29 @@ class AgentLoop:
                                 )
                         except Exception:
                             pass
-                        # Rebuild prompt with compressed context instead of raw history
-                        # Don't increment _attempt — retry the same slot with fresh prompt
                         prompt = (
                             f"{base_prompt}\n\n"
                             f"## Progress so far (summarized — context was compressed):\n{summary}"
                         )
+                        continue  # retry outer loop with compressed prompt
 
-                    elif is_rate_limit and _attempt < _max_retries - 1:
+                    elif is_rate_limit and _rate_retries < _max_rate_retries:
+                        _rate_retries += 1
                         log.warning(
                             "rate_limit_retry",
-                            attempt=_attempt + 1,
-                            wait_s=_delay,
+                            attempt=_rate_retries,
+                            wait_s=_rate_delay,
                             tier=tier,
                         )
                         await self._send_progress(
-                            task, f"⏸️ Rate limited — retrying in {int(_delay)}s…"
+                            task, f"⏸️ Rate limited — retrying in {int(_rate_delay)}s…"
                         )
-                        await asyncio.sleep(_delay)
-                        _delay *= 2
-                        _attempt += 1
+                        await asyncio.sleep(_rate_delay)
+                        _rate_delay *= 2
+                        continue  # retry outer loop
+
                     else:
                         raise
-
-            output = str(result.output)
-
-            # Check if the agent called send_discord during this task.
-            discord_replied = False
-            for msg in result.new_messages():
-                for part in getattr(msg, "parts", []):
-                    if getattr(part, "tool_name", None) == "send_discord":
-                        discord_replied = True
-                        break
-
-            # Forward any task_note calls to Discord as progress updates
-            for msg in result.new_messages():
-                for part in getattr(msg, "parts", []):
-                    if getattr(part, "tool_name", None) == "task_note":
-                        note_args = getattr(part, "args", {})
-                        note_text = (
-                            note_args.get("note", "")
-                            if isinstance(note_args, dict)
-                            else str(note_args)
-                        )
-                        if note_text:
-                            await self._send_progress(
-                                task, f"📝 **Checkpoint:** {note_text[:300]}"
-                            )
-
-            tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.info(
@@ -459,14 +514,15 @@ class AgentLoop:
                 n=self._task_count,
                 tier=tier,
                 elapsed_ms=round(elapsed_ms),
-                output_len=len(output),
+                output_len=len(result_output),
                 discord_replied=discord_replied,
+                tool_calls=tool_calls,
             )
 
             self._success_count += 1
             return TaskResult(
                 task=task,
-                output=output,
+                output=result_output,
                 discord_replied=discord_replied,
                 success=True,
                 elapsed_ms=elapsed_ms,
@@ -477,12 +533,8 @@ class AgentLoop:
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.error("task_failed", error=str(exc), exc=traceback.format_exc())
 
-            # Notify user of the failure so they aren't left hanging
-            await self._send_progress(
-                task, f"❌ Task failed: {str(exc)[:200]}"
-            )
+            await self._send_progress(task, f"❌ Task failed: {str(exc)[:200]}")
 
-            # If this was a rate-limit failure, write a recovery note to the task journal
             if "429" in str(exc):
                 try:
                     from datetime import datetime as _dt
@@ -508,7 +560,6 @@ class AgentLoop:
             )
 
         finally:
-            # Always cancel the progress ticker when the agent finishes
             if ticker and not ticker.done():
                 ticker.cancel()
                 try:

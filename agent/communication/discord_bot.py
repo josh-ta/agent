@@ -30,6 +30,12 @@ class DiscordBot:
 
     def __init__(self, loop: AgentLoop) -> None:
         self._agent_loop = loop
+        # Per-channel inject queues: while a task is running, new messages for
+        # the same channel are pushed here instead of starting a new task.
+        # _process() drains these between tool-call rounds (zipper merge).
+        self._inject_queues: dict[int, asyncio.Queue[str]] = {}
+        # The channel_id of the task currently running (0 if none)
+        self._active_channel: int = 0
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -108,21 +114,35 @@ class DiscordBot:
         if not task_content.strip():
             return
 
-        task = Task(
-            content=task_content,
-            source="discord",
-            author=parsed.author,
-            channel_id=parsed.channel_id,
-            message_id=parsed.message_id,
-            progress_callback=self._make_progress_callback(message.channel),  # type: ignore[arg-type]
-        )
-
         channel = message.channel
 
-        # If the agent is already busy, queue the task and ack immediately.
-        # This prevents parallel agent.run() calls which would conflict.
+        # If the agent is busy with a task on the same channel, inject the new
+        # message into the running task's inject_queue (zipper merge).
+        # If busy on a different channel, queue it as a separate task with ack.
         if self._agent_loop.is_busy:
-            await self._agent_loop.enqueue(task)
+            if self._active_channel == parsed.channel_id:
+                inject_q = self._inject_queues.get(parsed.channel_id)
+                if inject_q is not None:
+                    await inject_q.put(task_content)
+                    try:
+                        await message.reply(
+                            "💬 Got it — I'll fold that into what I'm working on.",
+                            mention_author=False,
+                        )
+                    except discord.HTTPException:
+                        pass
+                    return
+
+            # Different channel or no inject queue — queue as a separate task
+            await self._agent_loop.enqueue(Task(
+                content=task_content,
+                source="discord",
+                author=parsed.author,
+                channel_id=parsed.channel_id,
+                message_id=parsed.message_id,
+                progress_callback=self._make_progress_callback(channel),  # type: ignore[arg-type]
+                inject_queue=asyncio.Queue(),
+            ))
             queue_depth = self._agent_loop.queue.qsize()
             position = f"#{queue_depth}" if queue_depth > 1 else "next"
             try:
@@ -134,14 +154,29 @@ class DiscordBot:
                 pass
             return
 
-        # Agent is free — run directly (bypass queue for zero-latency response).
-        # Mark as busy so concurrent messages queue up while this runs.
+        # Agent is free — build inject queue and run directly
+        inject_q: asyncio.Queue[str] = asyncio.Queue()
+        self._inject_queues[parsed.channel_id] = inject_q
+        self._active_channel = parsed.channel_id
+
+        task = Task(
+            content=task_content,
+            source="discord",
+            author=parsed.author,
+            channel_id=parsed.channel_id,
+            message_id=parsed.message_id,
+            progress_callback=self._make_progress_callback(channel),  # type: ignore[arg-type]
+            inject_queue=inject_q,
+        )
+
         self._agent_loop.is_busy = True
         try:
             async with channel.typing():  # type: ignore[union-attr]
                 result = await self._agent_loop._process(task)
         finally:
             self._agent_loop.is_busy = False
+            self._active_channel = 0
+            self._inject_queues.pop(parsed.channel_id, None)
 
         # Don't send a second reply if the agent already called send_discord
         # as a tool during this task (would produce duplicate messages).
