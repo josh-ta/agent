@@ -147,8 +147,8 @@ class AgentLoop:
             output = str(result.output)
             tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
 
-            # Update rolling history for this channel (keep last 40 messages)
-            self._histories[task.channel_id] = list(result.all_messages())[-40:]
+            # Update rolling history for this channel (keep last 10 messages)
+            self._histories[task.channel_id] = list(result.all_messages())[-10:]
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.info(
