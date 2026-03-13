@@ -46,7 +46,19 @@ from playwright.async_api import async_playwright
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3080
 
-print(f"[mcp_bridge] Starting on port {PORT} (starlette={'yes' if HAS_STARLETTE else 'no'}, markdownify={'yes' if HAS_MARKDOWNIFY else 'no'})", flush=True)
+# Optional proxy — set PROXY_URL env var to route all browser traffic through it.
+# Format: http://user:pass@host:port  or  socks5://user:pass@host:port
+import os as _os
+_PROXY_URL = _os.environ.get("PROXY_URL", "").strip()
+_PROXY_SETTINGS: dict | None = {"server": _PROXY_URL} if _PROXY_URL else None
+
+print(
+    f"[mcp_bridge] Starting on port {PORT} "
+    f"(starlette={'yes' if HAS_STARLETTE else 'no'}, "
+    f"markdownify={'yes' if HAS_MARKDOWNIFY else 'no'}, "
+    f"proxy={'yes' if _PROXY_SETTINGS else 'no'})",
+    flush=True,
+)
 
 # ── HTML → Markdown conversion ─────────────────────────────────────────────────
 # Tags that add zero information when converted — strip them entirely before md
@@ -105,7 +117,10 @@ async def get_page():
         if _pw is None:
             _pw = await async_playwright().start()
         if _browser is None or not _browser.is_connected():
-            _browser = await _pw.chromium.launch(headless=False)
+            _browser = await _pw.chromium.launch(
+                headless=False,
+                proxy=_PROXY_SETTINGS,
+            )
             _page = await _browser.new_page()
         elif _page is None:
             _page = await _browser.new_page()

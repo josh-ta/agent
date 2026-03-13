@@ -312,6 +312,16 @@ configure_env() {
         set_var "POSTGRES_URL" "postgresql+asyncpg://${_pg_user}:${_pg_pass}@${_pg_host}:${_pg_port}/${_pg_db}"
     fi
 
+    # ── Proxy ────────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── Proxy (optional) ──────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Routes all browser traffic through a residential or ISP proxy"
+    echo -e "       to avoid datacenter IP blocks (Ticketmaster, Cloudflare, etc.)."
+    echo -e "       Format: http://user:pass@host:port  or  socks5://user:pass@host:port"
+    prompt_var "PROXY_URL" \
+        "Proxy URL (leave blank to skip)" \
+        "$(current_val PROXY_URL)"
+
     # ── Discord ──────────────────────────────────────────────────────────────
     echo ""
     echo -e "${CYAN}── Discord ───────────────────────────────────────────${NC}"

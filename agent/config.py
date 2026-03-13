@@ -45,6 +45,10 @@ class Settings(BaseSettings):
         default="http://browser:3080/sse", alias="BROWSER_MCP_URL"
     )
 
+    # ── Proxy (optional — routes browser + shell HTTP through a residential/ISP proxy)
+    # Format: http://user:pass@host:port  or  socks5://user:pass@host:port
+    proxy_url: str = Field(default="", alias="PROXY_URL")
+
     # ── Paths ─────────────────────────────────────────────────────────────────
     workspace_path: Path = Field(default=Path("/workspace"), alias="WORKSPACE_PATH")
     skills_path: Path = Field(
