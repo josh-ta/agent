@@ -16,7 +16,7 @@ services:
       - ./workspace:/workspace                    # Agent writable workspace
       - ./agent/skills:/app/agent/skills          # Editable skills (survives image rebuild)
       - ./agent/identity:/app/agent/identity      # Editable identity
-      - ./.ssh:/root/.ssh:ro                      # SSH key for GitHub (read-only)
+      - ~/.ssh:/root/.ssh:ro                      # SSH key for GitHub (read-only)
       - /var/run/docker.sock:/var/run/docker.sock # Self-restart capability
     depends_on:
       browser:

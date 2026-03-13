@@ -137,6 +137,9 @@ class AgentLoop:
         # Per-channel, per-tier message history — keyed by (channel_id, tier)
         # Histories are never shared across tiers to avoid tool_use_id mismatches
         self._histories: dict[tuple[int, str], list[Any]] = {}
+        # Locked tier per channel — once a conversation starts on a tier, stick
+        # to it until the channel goes idle or the user forces a new tier
+        self._channel_tier: dict[int, str] = {}
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -191,7 +194,20 @@ class AgentLoop:
 
         # Parse user model override (/fast, /smart, /best) and classify tier
         content, forced_tier = _parse_override(task.content)
-        tier = forced_tier or _classify_tier(content)
+
+        if forced_tier:
+            # User explicitly chose a tier — lock this channel to it and reset history
+            tier = forced_tier
+            self._channel_tier[task.channel_id] = tier
+            self._histories.pop((task.channel_id, tier), None)  # fresh context
+        elif task.channel_id in self._channel_tier:
+            # Channel already has a locked tier — keep it regardless of classification
+            tier = self._channel_tier[task.channel_id]
+        else:
+            # First message on this channel — classify and lock
+            tier = _classify_tier(content)
+            self._channel_tier[task.channel_id] = tier
+
         agent = self.agents.get(tier, self.agent)
         # Update task content if prefix was stripped
         task = Task(
