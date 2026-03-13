@@ -24,7 +24,7 @@ x11vnc \
     -display ":${DISPLAY_NUM}" \
     -nopw \
     -listen 0.0.0.0 \
-    -port "${VNC_PORT}" \
+    -rfbport "${VNC_PORT}" \
     -xkb \
     -forever \
     -shared \
