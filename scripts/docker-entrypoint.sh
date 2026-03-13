@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Runtime entrypoint: configures git identity, SSH, and gh CLI auth,
-# then hands off to the Python agent.
+# Runtime entrypoint: fixes workspace permissions, configures git/SSH/gh,
+# then starts the Python agent.
 set -euo pipefail
+
+# ── Workspace permissions ──────────────────────────────────────────────────────
+# ./workspace is bind-mounted from the host and may be owned by root.
+# Make it fully writable so the agent can clone repos and create files there.
+chmod -R a+rwX /workspace 2>/dev/null || true
 
 # ── Git identity ───────────────────────────────────────────────────────────────
 if [[ -n "${GITHUB_USERNAME:-}" ]]; then

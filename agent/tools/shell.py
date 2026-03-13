@@ -40,7 +40,15 @@ async def shell_run(
         Combined output string with exit code appended.
     """
     cwd = Path(working_dir) if working_dir else settings.workspace_path
-    cwd.mkdir(parents=True, exist_ok=True)
+    # Only auto-create the default workspace — don't create arbitrary dirs,
+    # as they may be owned by a different user (e.g. after a root-created clone).
+    if not working_dir:
+        cwd.mkdir(parents=True, exist_ok=True)
+    elif not cwd.exists():
+        # Fall back to workspace root so the shell command can report the error
+        # cleanly (e.g. "cd: no such file") rather than crashing the tool call.
+        cwd = settings.workspace_path
+        cwd.mkdir(parents=True, exist_ok=True)
 
     log.info("shell_run", command=command[:200], cwd=str(cwd), timeout=timeout)
 
