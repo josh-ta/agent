@@ -283,21 +283,33 @@ configure_env() {
     # ── PostgreSQL ───────────────────────────────────────────────────────────
     echo ""
     echo -e "${CYAN}── PostgreSQL (optional) ─────────────────────────────${NC}"
-    echo -e "  ${YELLOW}Tip:${NC} Enables persistent memory, semantic search (pgvector), and"
-    echo -e "       multi-agent coordination. Runs as a sidecar container."
-    echo -ne "  Enable PostgreSQL? [y/N] "
+    echo -e "  ${YELLOW}Tip:${NC} Connect to an external Postgres server for your own data/tools."
+    echo -e "       (SQLite handles agent-internal state automatically.)"
+    echo -ne "  Connect to an external PostgreSQL database? [y/N] "
     read -r use_postgres
     if [[ "${use_postgres,,}" == "y" ]]; then
-        current_pg_pass="$(current_val POSTGRES_PASSWORD)"
-        prompt_var "POSTGRES_PASSWORD" \
-            "Password for the local Postgres container (anything works here)" \
-            "${current_pg_pass:-changeme}" 1
-        # Derive POSTGRES_URL from the password that was just set
-        pg_pass="$(current_val POSTGRES_PASSWORD)"
-        set_var "POSTGRES_URL" "postgresql+asyncpg://agent:${pg_pass}@postgres/agentdb"
-        set_var "ENABLE_POSTGRES" "true"
-    else
-        set_var "ENABLE_POSTGRES" "false"
+        prompt_var "PG_HOST" \
+            "Postgres host (IP or hostname)" \
+            "$(current_val PG_HOST)"
+        prompt_var "PG_PORT" \
+            "Postgres port" \
+            "$(current_val PG_PORT)"
+        prompt_var "PG_DATABASE" \
+            "Database name" \
+            "$(current_val PG_DATABASE)"
+        prompt_var "PG_USER" \
+            "Database user" \
+            "$(current_val PG_USER)"
+        prompt_var "PG_PASSWORD" \
+            "Database password" \
+            "$(current_val PG_PASSWORD)" 1
+        # Assemble POSTGRES_URL from the individual fields
+        _pg_host="$(current_val PG_HOST)"
+        _pg_port="$(current_val PG_PORT)"
+        _pg_db="$(current_val PG_DATABASE)"
+        _pg_user="$(current_val PG_USER)"
+        _pg_pass="$(current_val PG_PASSWORD)"
+        set_var "POSTGRES_URL" "postgresql+asyncpg://${_pg_user}:${_pg_pass}@${_pg_host}:${_pg_port}/${_pg_db}"
     fi
 
     # ── Discord ──────────────────────────────────────────────────────────────
@@ -352,11 +364,8 @@ chmod 755 workspace
 
 # ── 4. Build + start ───────────────────────────────────────────────────────────
 info "Building and starting containers (this takes ~2 min on first run)..."
-COMPOSE_PROFILES=""
-[[ "$(current_val ENABLE_POSTGRES)" == "true" ]] && COMPOSE_PROFILES="--profile postgres"
 docker compose build --no-cache
-# shellcheck disable=SC2086
-docker compose $COMPOSE_PROFILES up -d
+docker compose up -d
 
 # ── 5. Wait for healthy ────────────────────────────────────────────────────────
 info "Waiting for services to be healthy (up to 120s)..."
