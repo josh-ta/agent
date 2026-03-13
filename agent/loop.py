@@ -58,6 +58,7 @@ from typing import Any, Callable, Awaitable
 import structlog
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai import FinalResultEvent, PartDeltaEvent, PartEndEvent, TextPartDelta, ThinkingPartDelta
 
 from agent.config import settings
 
@@ -373,8 +374,8 @@ class AgentLoop:
             _rate_delay = 5.0
 
             while True:  # outer retry loop for context overflow + rate limits
-                    discord_replied = False
-                                tool_calls = 0
+                discord_replied = False
+                tool_calls = 0
 
                 try:
                     async with agent.run_mcp_servers():
@@ -382,6 +383,40 @@ class AgentLoop:
                             node = agent_run.next_node
 
                             while not Agent.is_end_node(node):
+
+                                # ── ModelRequestNode: stream reasoning to Discord ──
+                                if Agent.is_model_request_node(node):
+                                    async with node.stream(agent_run.ctx) as request_stream:
+                                        thinking_buf: list[str] = []
+                                        text_buf: list[str] = []
+                                        is_final = False
+                                        async for event in request_stream:
+                                            if isinstance(event, PartDeltaEvent):
+                                                if isinstance(event.delta, ThinkingPartDelta):
+                                                    thinking_buf.append(event.delta.content_delta)
+                                                elif isinstance(event.delta, TextPartDelta):
+                                                    text_buf.append(event.delta.content_delta)
+                                            elif isinstance(event, PartEndEvent):
+                                                # Flush completed thinking block immediately
+                                                if thinking_buf:
+                                                    content = "".join(thinking_buf).strip()
+                                                    if content:
+                                                        await self._send_progress(
+                                                            task, f"🧠 *{content[:1800]}*"
+                                                        )
+                                                    thinking_buf = []
+                                                # Flush completed text turn if it's not the
+                                                # final answer (final answer is sent as reply)
+                                                elif text_buf and not is_final:
+                                                    content = "".join(text_buf).strip()
+                                                    if content:
+                                                        await self._send_progress(
+                                                            task, f"💭 {content[:1800]}"
+                                                        )
+                                                    text_buf = []
+                                            elif isinstance(event, FinalResultEvent):
+                                                is_final = True
+
                                 # Drive the node forward
                                 next_node = await agent_run.next(node)
 
