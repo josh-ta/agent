@@ -48,4 +48,4 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
 fi
 
 # ── Start agent ────────────────────────────────────────────────────────────────
-exec python -m agent.main "$@"
+exec python -m agent.main start "$@"
