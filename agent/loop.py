@@ -154,6 +154,8 @@ class AgentLoop:
         self._running = False
         self._task_count = 0
         self._success_count = 0
+        # True while _process() is running — used by DiscordBot to detect concurrency
+        self.is_busy = False
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -177,7 +179,11 @@ class AgentLoop:
                     await self._heartbeat()
                     continue
 
-                result = await self._process(task)
+                self.is_busy = True
+                try:
+                    result = await self._process(task)
+                finally:
+                    self.is_busy = False
                 self.queue.task_done()
 
                 if self.memory:

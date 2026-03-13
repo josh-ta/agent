@@ -117,10 +117,31 @@ class DiscordBot:
             progress_callback=self._make_progress_callback(message.channel),  # type: ignore[arg-type]
         )
 
-        # Show typing indicator while the agent thinks
         channel = message.channel
-        async with channel.typing():  # type: ignore[union-attr]
-            result = await self._agent_loop._process(task)
+
+        # If the agent is already busy, queue the task and ack immediately.
+        # This prevents parallel agent.run() calls which would conflict.
+        if self._agent_loop.is_busy:
+            await self._agent_loop.enqueue(task)
+            queue_depth = self._agent_loop.queue.qsize()
+            position = f"#{queue_depth}" if queue_depth > 1 else "next"
+            try:
+                await message.reply(
+                    f"⏸️ I'm still working on the previous task — queued yours ({position} up).",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+            return
+
+        # Agent is free — run directly (bypass queue for zero-latency response).
+        # Mark as busy so concurrent messages queue up while this runs.
+        self._agent_loop.is_busy = True
+        try:
+            async with channel.typing():  # type: ignore[union-attr]
+                result = await self._agent_loop._process(task)
+        finally:
+            self._agent_loop.is_busy = False
 
         # Don't send a second reply if the agent already called send_discord
         # as a tool during this task (would produce duplicate messages).
@@ -133,9 +154,7 @@ class DiscordBot:
             return
 
         try:
-            # Split into Discord-sized chunks
             chunks = [reply[i:i+MAX_REPLY_LEN] for i in range(0, len(reply), MAX_REPLY_LEN)]
-            # Reply to the original message for the first chunk
             await message.reply(chunks[0], mention_author=False)
             for chunk in chunks[1:]:
                 await channel.send(chunk)  # type: ignore[union-attr]
