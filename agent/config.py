@@ -21,10 +21,17 @@ class Settings(BaseSettings):
     agent_model: str = Field(default="claude-haiku-4-5", alias="AGENT_MODEL")
     # Embedding model used for semantic memory search (requires OPENAI_API_KEY)
     embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
-    # Model tiers for dynamic routing (override with env vars)
+    # ── Model tiers for dynamic routing (override with env vars)
     model_fast: str = Field(default="claude-haiku-4-5", alias="MODEL_FAST")
     model_smart: str = Field(default="claude-sonnet-4-5", alias="MODEL_SMART")
     model_best: str = Field(default="claude-opus-4-5", alias="MODEL_BEST")
+
+    # ── Extended thinking ─────────────────────────────────────────────────────
+    # Enables Claude's extended thinking (chain-of-thought) feature.
+    # Only supported on claude-3-7-sonnet and newer models.
+    # When enabled, thinking blocks are streamed to Discord as 🧠 messages.
+    thinking_enabled: bool = Field(default=False, alias="THINKING_ENABLED")
+    thinking_budget_tokens: int = Field(default=8000, alias="THINKING_BUDGET_TOKENS")
 
     # ── Identity ──────────────────────────────────────────────────────────────
     agent_name: str = Field(default="agent-1", alias="AGENT_NAME")

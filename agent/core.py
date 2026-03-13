@@ -130,11 +130,28 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
         except Exception as exc:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
-    # No static system_prompt here — we register a dynamic one below so it's
-    # re-evaluated on every run, picking up MEMORY.md changes mid-session.
+    # Extended thinking: only supported on claude-3-7-sonnet and newer Claude models.
+    # Haiku does not support thinking — only enable for smart/best tiers.
+    model_settings = None
+    is_claude = "claude" in model_string
+    is_haiku = "haiku" in model_string
+    if settings.thinking_enabled and is_claude and not is_haiku:
+        model_settings = {
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": settings.thinking_budget_tokens,
+            }
+        }
+        log.info(
+            "thinking_enabled",
+            model=model_string,
+            budget_tokens=settings.thinking_budget_tokens,
+        )
+
     agent: Agent = Agent(  # type: ignore[type-arg]
         model=model_string,
         mcp_servers=mcp_servers,
+        model_settings=model_settings,
         retries=2,
     )
 

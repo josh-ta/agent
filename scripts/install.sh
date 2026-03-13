@@ -205,13 +205,41 @@ configure_env() {
                 "claude-opus-4-5   (most capable, slower)" \
                 "claude-sonnet-4-5 (balanced — recommended)" \
                 "claude-haiku-4-5  (fastest, lightest)"
+            chosen_model=""
             for idx in $selected_model; do
                 case "$idx" in
-                    0) set_var "AGENT_MODEL" "claude-opus-4-5" ;;
-                    1) set_var "AGENT_MODEL" "claude-sonnet-4-5" ;;
-                    2) set_var "AGENT_MODEL" "claude-haiku-4-5" ;;
+                    0) chosen_model="claude-opus-4-5" ;;
+                    1) chosen_model="claude-sonnet-4-5" ;;
+                    2) chosen_model="claude-haiku-4-5" ;;
                 esac
             done
+            [[ -n "$chosen_model" ]] && set_var "AGENT_MODEL" "$chosen_model"
+        else
+            chosen_model="$current_model"
+        fi
+
+        # ── Extended thinking ─────────────────────────────────────────────────
+        # Supported on claude-3-7-sonnet and newer (not Haiku).
+        # Streams the model's chain-of-thought reasoning to Discord as 🧠 messages.
+        if [[ "$chosen_model" != *"haiku"* ]]; then
+            echo ""
+            echo -e "${CYAN}── Extended Thinking ─────────────────────────────────${NC}"
+            echo -e "  ${YELLOW}Tip:${NC} When enabled, the model's chain-of-thought reasoning"
+            echo -e "       is streamed to Discord in real time as ${CYAN}🧠${NC} messages."
+            echo -e "       Supported on claude-3-7-sonnet, claude-opus-4-5, and claude-sonnet-4-5."
+            echo -ne "  Enable extended thinking? [y/N] "
+            read -r use_thinking
+            if [[ "${use_thinking,,}" == "y" ]]; then
+                set_var "THINKING_ENABLED" "true"
+                echo ""
+                current_budget="$(current_val THINKING_BUDGET_TOKENS)"
+                prompt_var "THINKING_BUDGET_TOKENS" \
+                    "Max tokens the model can spend thinking (min 1024, recommended 8000)" \
+                    "${current_budget:-8000}"
+                success "Extended thinking enabled (budget: $(current_val THINKING_BUDGET_TOKENS) tokens)"
+            else
+                set_var "THINKING_ENABLED" "false"
+            fi
         fi
     fi
 
