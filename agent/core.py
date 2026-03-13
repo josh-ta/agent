@@ -71,9 +71,11 @@ shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, 
 1. Think before acting. Use shell for system tasks.
 2. Read files before writing. Ask if unsure.
 3. After failures: call lesson_save(kind="mistake"). Before complex tasks: call lesson_search.
-4. Use read_skill <name> to load a skill's full procedure before following it.
+4. Use skill_read <name> to load a skill's full procedure before following it.
 5. Use read_channel('private') to catch up on recent conversation history when context is needed.
 6. Each mistake happens only once — record it and move on.
+7. NEVER call send_discord to reply to the user. Your text response IS the reply — it is sent automatically. Only call send_discord to proactively message a *different* channel than the one you were addressed in.
+8. Give one clear response. Do not send multiple messages saying the same thing.
 
 {skills}
 """

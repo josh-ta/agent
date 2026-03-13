@@ -16,16 +16,26 @@ fi
 # The .ssh directory is bind-mounted from the host at /root/.ssh (read-only).
 # We need correct permissions — SSH refuses keys that are group/world readable.
 if [[ -d /root/.ssh ]]; then
-    cp -r /root/.ssh /tmp/agent_ssh
-    chmod 700 /tmp/agent_ssh
-    chmod 600 /tmp/agent_ssh/* 2>/dev/null || true
+    # Copy to /data/ssh (persistent volume) so keys survive container restarts.
+    # Fall back to /tmp/agent_ssh if /data isn't writable yet.
+    if [[ -d /data ]] && touch /data/.writable 2>/dev/null; then
+        rm -f /data/.writable
+        SSH_DEST=/data/ssh
+    else
+        SSH_DEST=/tmp/agent_ssh
+    fi
+
+    mkdir -p "$SSH_DEST"
+    cp -r /root/.ssh/. "$SSH_DEST/"
+    chmod 700 "$SSH_DEST"
+    chmod 600 "$SSH_DEST"/* 2>/dev/null || true
 
     # Prefer agent_ed25519, fall back to id_ed25519 or id_rsa (server's own key)
     KEY=""
     for candidate in \
-        /tmp/agent_ssh/agent_ed25519 \
-        /tmp/agent_ssh/id_ed25519 \
-        /tmp/agent_ssh/id_rsa; do
+        "$SSH_DEST/agent_ed25519" \
+        "$SSH_DEST/id_ed25519" \
+        "$SSH_DEST/id_rsa"; do
         if [[ -f "$candidate" ]]; then
             KEY="$candidate"
             break
@@ -37,6 +47,10 @@ if [[ -d /root/.ssh ]]; then
         chmod 700 ~/.ssh
         cat > ~/.ssh/config <<EOF
 Host github.com
+    IdentityFile ${KEY}
+    StrictHostKeyChecking accept-new
+    AddKeysToAgent no
+Host *
     IdentityFile ${KEY}
     StrictHostKeyChecking accept-new
     AddKeysToAgent no

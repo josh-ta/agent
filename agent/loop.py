@@ -114,6 +114,7 @@ class TaskResult:
     success: bool
     elapsed_ms: float
     tool_calls: int = 0
+    discord_replied: bool = False  # True if agent called send_discord during this task
 
 
 class AgentLoop:
@@ -247,6 +248,16 @@ class AgentLoop:
                 )
 
             output = str(result.output)
+
+            # Check if the agent called send_discord during this task.
+            # If so, the bot should NOT send an additional reply — it would duplicate.
+            discord_replied = False
+            for msg in result.new_messages():
+                for part in getattr(msg, "parts", []):
+                    if getattr(part, "tool_name", None) == "send_discord":
+                        discord_replied = True
+                        break
+
             tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
 
             # Update rolling history — keyed by (channel, tier) so histories
@@ -260,12 +271,14 @@ class AgentLoop:
                 tier=tier,
                 elapsed_ms=round(elapsed_ms),
                 output_len=len(output),
+                discord_replied=discord_replied,
             )
 
             self._success_count += 1
             return TaskResult(
                 task=task,
                 output=output,
+                discord_replied=discord_replied,
                 success=True,
                 elapsed_ms=elapsed_ms,
                 tool_calls=tool_calls,

@@ -121,6 +121,11 @@ class DiscordBot:
         async with channel.typing():  # type: ignore[union-attr]
             result = await self._agent_loop._process(task)
 
+        # Don't send a second reply if the agent already called send_discord
+        # as a tool during this task (would produce duplicate messages).
+        if result.discord_replied:
+            return
+
         # Send reply
         reply = result.output
         if not reply:
