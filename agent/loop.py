@@ -287,6 +287,8 @@ class AgentLoop:
                     else:
                         raise
 
+            output = str(result.output)
+
             # Check if the agent called send_discord during this task.
             # If so, the bot should NOT send an additional reply — it would duplicate.
             discord_replied = False
