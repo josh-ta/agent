@@ -114,6 +114,7 @@ class DiscordBot:
             author=parsed.author,
             channel_id=parsed.channel_id,
             message_id=parsed.message_id,
+            progress_callback=self._make_progress_callback(message.channel),  # type: ignore[arg-type]
         )
 
         # Show typing indicator while the agent thinks
@@ -140,6 +141,17 @@ class DiscordBot:
                 await channel.send(chunk)  # type: ignore[union-attr]
         except discord.HTTPException as exc:
             log.error("discord_send_failed", error=str(exc))
+
+    def _make_progress_callback(self, channel: discord.abc.Messageable):  # type: ignore[return]
+        """Return an async callable that sends a progress message to the given channel."""
+        async def _callback(message: str) -> None:
+            try:
+                chunks = [message[i:i+MAX_REPLY_LEN] for i in range(0, len(message), MAX_REPLY_LEN)]
+                for chunk in chunks:
+                    await channel.send(chunk)
+            except discord.HTTPException as exc:
+                log.warning("progress_send_failed", error=str(exc))
+        return _callback
 
     async def _announce_online(self) -> None:
         """Post an online announcement to the bus channel."""

@@ -2,6 +2,25 @@
 
 Use this skill when you need to delegate a task to, or receive work from, another agent.
 
+## Sending Progress Updates (for long tasks)
+
+For any task expected to take more than 2 tool calls, send progress updates to the
+user's channel so they know you're working. The loop automatically forwards `task_note()`
+calls to Discord, so **the best approach is to call `task_note()` frequently** — you get
+journal checkpointing AND Discord visibility in one call.
+
+For a proactive "started" message at the beginning:
+```
+send_discord(DISCORD_AGENT_CHANNEL_ID, "Working on X — checking CI logs now…")
+```
+
+For step-by-step notes (auto-forwarded to Discord AND saved to journal):
+```
+task_note("Checked CI run 23065824301. Jobs: backend=failed. Root cause: PYTHONPATH missing. Next: fix ci-cd.yml.")
+```
+
+Do NOT call `send_discord` at the end to summarize — your final text response is the reply.
+
 ## Channel Layout
 
 | Channel | Purpose |

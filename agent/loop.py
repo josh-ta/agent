@@ -22,6 +22,20 @@ Users can override per-message with a prefix:
   /fast  <task>   force haiku
   /smart <task>   force sonnet
   /best  <task>   force opus
+
+Context management
+------------------
+When a task's accumulated tool call history exceeds the model's context window
+(~200k tokens for Claude), the loop catches the 400 "prompt is too long" error,
+asks the fast agent to compress all progress into a brief summary, saves it to
+the task journal, then retries with that compressed context instead of raw history.
+This mirrors how Cursor/Claude Code handle long tasks: periodic summarization.
+
+Progress updates
+----------------
+For Discord tasks, the loop sends an immediate acknowledgment when the task
+starts, periodic "still working" pings every 60 s, and a note whenever the
+agent calls task_note() (forwarded from the journal write hook).
 """
 
 from __future__ import annotations
@@ -31,7 +45,7 @@ import re
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 import structlog
 from pydantic_ai import Agent
@@ -42,6 +56,9 @@ log = structlog.get_logger()
 
 # Reflect on MEMORY.md every N successful tasks
 MEMORY_UPDATE_INTERVAL = 10
+
+# How often to send a "still working" ping for long tasks (seconds)
+PROGRESS_PING_INTERVAL = 60
 
 
 # ── Model routing ──────────────────────────────────────────────────────────────
@@ -105,6 +122,8 @@ class Task:
     message_id: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Optional callback for mid-task progress messages (set by discord_bot)
+    progress_callback: Callable[[str], Awaitable[None]] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -135,6 +154,7 @@ class AgentLoop:
         self._running = False
         self._task_count = 0
         self._success_count = 0
+
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
         """Default agent (smart tier) — used by reflection passes."""
@@ -181,19 +201,71 @@ class AgentLoop:
         task = Task(content=content, source=source)
         return await self._process(task)
 
+    async def _send_progress(self, task: Task, message: str) -> None:
+        """Send a progress message via the task's callback (no-op if not set)."""
+        if task.progress_callback:
+            try:
+                await task.progress_callback(message)
+            except Exception:
+                pass
+
+    async def _progress_ticker(self, task: Task, elapsed_ref: list[float]) -> None:
+        """
+        Coroutine that sends periodic "still working" pings.
+        Runs concurrently with agent.run() — cancelled when the agent finishes.
+        elapsed_ref is a single-element list mutated by _process so the ticker
+        can include real elapsed time in its messages.
+        """
+        ping_num = 0
+        while True:
+            await asyncio.sleep(PROGRESS_PING_INTERVAL)
+            ping_num += 1
+            elapsed_s = elapsed_ref[0]
+            mins = int(elapsed_s // 60)
+            secs = int(elapsed_s % 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            await self._send_progress(task, f"⏳ Still working… ({time_str} elapsed)")
+
+    async def _summarize_context(self, task: Task, accumulated_prompt: str) -> str:
+        """
+        Ask the fast agent to compress accumulated tool-call history into a
+        brief checkpoint summary. Called when the context window overflows.
+        Returns the summary string (never raises).
+        """
+        log.warning("context_overflow_summarizing", task=task.content[:80])
+        try:
+            summarize_prompt = (
+                "The following is the accumulated progress log for an ongoing task. "
+                "Compress it into a concise bullet-point summary (max 1500 chars) that captures: "
+                "what has been done, what was found/discovered, and what still needs to happen. "
+                "Keep all key facts, file paths, error messages, and decisions. "
+                "Discard verbose tool output and redundant steps.\n\n"
+                f"TASK: {task.content[:300]}\n\n"
+                f"ACCUMULATED CONTEXT (truncated for summarization):\n{accumulated_prompt[-20_000:]}"
+            )
+            fast_agent = self.agents.get("fast", self.agent)
+            async with fast_agent.run_mcp_servers():
+                summary_result = await fast_agent.run(summarize_prompt)
+            summary = str(summary_result.output).strip()
+            log.info("context_summarized", summary_len=len(summary))
+            return summary
+        except Exception:
+            log.warning("context_summarize_failed", exc=traceback.format_exc())
+            # Return a minimal fallback summary so the task can continue
+            return f"Task in progress: {task.content[:300]}\n(Context was compressed due to length; some history may be lost.)"
+
     async def _process(self, task: Task) -> TaskResult:
         """Core observe→think→act cycle."""
         self._task_count += 1
         start = asyncio.get_event_loop().time()
+        elapsed_ref = [0.0]  # mutable ref updated each loop for the progress ticker
 
         # Parse user model override (/fast, /smart, /best) and classify tier
         content, forced_tier = _parse_override(task.content)
 
         if forced_tier:
-            # User explicitly chose a tier — use it
             tier = forced_tier
         else:
-            # Classify fresh on every new task
             tier = _classify_tier(content)
 
         agent = self.agents.get(tier, self.agent)
@@ -206,6 +278,7 @@ class AgentLoop:
             message_id=task.message_id,
             metadata=task.metadata,
             created_at=task.created_at,
+            progress_callback=task.progress_callback,
         )
 
         log.info(
@@ -218,6 +291,11 @@ class AgentLoop:
             content=task.content[:120],
         )
 
+        # Immediate acknowledgment so the user knows the agent received the task
+        if task.source == "discord" and task.channel_id:
+            preview = task.content[:80] + ("…" if len(task.content) > 80 else "")
+            await self._send_progress(task, f"🔍 Working on: *{preview}*")
+
         # Surface top-3 relevant past lessons — capped to avoid bloating prompt
         lessons_context = ""
         if self.memory and hasattr(self.memory, "search_lessons"):
@@ -227,12 +305,6 @@ class AgentLoop:
                 pass
 
         # Inject recent channel history as plain text so the agent has context.
-        # We fetch this directly (not via a tool call) so it's always present
-        # without Bob needing to remember to ask for it.
-        # Hard limits to avoid blowing the context window:
-        #   - max 6 messages (3 exchanges)
-        #   - each message truncated to 300 chars
-        #   - total history capped at 1500 chars
         channel_context = ""
         if task.source == "discord" and task.channel_id:
             try:
@@ -263,34 +335,97 @@ class AgentLoop:
         if lessons_context:
             parts.append(lessons_context)
         parts.append(task.content)
-        prompt = "\n\n---\n\n".join(parts)
+        base_prompt = "\n\n---\n\n".join(parts)
+        prompt = base_prompt
+
+        # Start progress ticker — runs concurrently, cancelled when agent finishes
+        ticker: asyncio.Task | None = None  # type: ignore[type-arg]
+        if task.progress_callback:
+            ticker = asyncio.create_task(self._progress_ticker(task, elapsed_ref))
 
         try:
-            # Retry on 429 rate-limit errors with exponential backoff
+            # Retry loop handles:
+            #   - 429 rate-limit errors (exponential backoff)
+            #   - 400 context-overflow errors (summarize + retry with compressed prompt)
             _max_retries = 4
             _delay = 5.0
-            for _attempt in range(_max_retries):
+            _context_retries = 0
+            _max_context_retries = 2
+            _attempt = 0
+
+            while _attempt < _max_retries:
                 try:
                     async with agent.run_mcp_servers():
                         result = await agent.run(prompt)
-                    break
+                    break  # success
                 except Exception as _exc:
-                    if "429" in str(_exc) and _attempt < _max_retries - 1:
+                    exc_str = str(_exc)
+
+                    # Update elapsed time for ticker
+                    elapsed_ref[0] = asyncio.get_event_loop().time() - start
+
+                    is_context_overflow = (
+                        "prompt is too long" in exc_str
+                        or ("400" in exc_str and "maximum" in exc_str)
+                    )
+                    is_rate_limit = "429" in exc_str
+
+                    if is_context_overflow and _context_retries < _max_context_retries:
+                        _context_retries += 1
+                        log.warning(
+                            "context_overflow",
+                            attempt=_attempt + 1,
+                            context_retry=_context_retries,
+                            tier=tier,
+                        )
+                        await self._send_progress(
+                            task,
+                            f"📦 Context window full — compressing progress and continuing… "
+                            f"(attempt {_context_retries}/{_max_context_retries})",
+                        )
+                        summary = await self._summarize_context(task, prompt)
+                        # Save checkpoint to task journal so it persists across restarts
+                        try:
+                            journal = settings.workspace_path / ".task_journal.md"
+                            from datetime import datetime as _dt
+                            ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                            journal.parent.mkdir(parents=True, exist_ok=True)
+                            with journal.open("a", encoding="utf-8") as f:
+                                f.write(
+                                    f"\n### [{ts}] — CONTEXT COMPRESSED (retry {_context_retries})\n"
+                                    f"{summary}\n"
+                                )
+                        except Exception:
+                            pass
+                        # Rebuild prompt with compressed context instead of raw history
+                        # Don't increment _attempt — retry the same slot with fresh prompt
+                        prompt = (
+                            f"{base_prompt}\n\n"
+                            f"## Progress so far (summarized — context was compressed):\n{summary}"
+                        )
+
+                    elif is_rate_limit and _attempt < _max_retries - 1:
                         log.warning(
                             "rate_limit_retry",
                             attempt=_attempt + 1,
                             wait_s=_delay,
                             tier=tier,
                         )
+                        await self._send_progress(
+                            task, f"⏸️ Rate limited — retrying in {int(_delay)}s…"
+                        )
                         await asyncio.sleep(_delay)
                         _delay *= 2
+                        _attempt += 1
                     else:
                         raise
+
+                    # Update elapsed ref at end of each error handler
+                    elapsed_ref[0] = asyncio.get_event_loop().time() - start
 
             output = str(result.output)
 
             # Check if the agent called send_discord during this task.
-            # If so, the bot should NOT send an additional reply — it would duplicate.
             discord_replied = False
             for msg in result.new_messages():
                 for part in getattr(msg, "parts", []):
@@ -298,11 +433,22 @@ class AgentLoop:
                         discord_replied = True
                         break
 
-            tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
+            # Forward any task_note calls to Discord as progress updates
+            for msg in result.new_messages():
+                for part in getattr(msg, "parts", []):
+                    if getattr(part, "tool_name", None) == "task_note":
+                        note_args = getattr(part, "args", {})
+                        note_text = (
+                            note_args.get("note", "")
+                            if isinstance(note_args, dict)
+                            else str(note_args)
+                        )
+                        if note_text:
+                            await self._send_progress(
+                                task, f"📝 **Checkpoint:** {note_text[:300]}"
+                            )
 
-            # Don't store message_history — pydantic-ai message objects with
-            # tool_use/tool_result pairs cause Anthropic 400 errors when reused
-            # across requests. Context is retrieved on demand via read_channel().
+            tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.info(
@@ -328,8 +474,12 @@ class AgentLoop:
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.error("task_failed", error=str(exc), exc=traceback.format_exc())
 
-            # If this was a rate-limit failure, write a recovery note to the
-            # task journal so the next run can resume from the last checkpoint.
+            # Notify user of the failure so they aren't left hanging
+            await self._send_progress(
+                task, f"❌ Task failed: {str(exc)[:200]}"
+            )
+
+            # If this was a rate-limit failure, write a recovery note to the task journal
             if "429" in str(exc):
                 try:
                     from datetime import datetime as _dt
@@ -353,6 +503,15 @@ class AgentLoop:
                 success=False,
                 elapsed_ms=elapsed_ms,
             )
+
+        finally:
+            # Always cancel the progress ticker when the agent finishes
+            if ticker and not ticker.done():
+                ticker.cancel()
+                try:
+                    await ticker
+                except asyncio.CancelledError:
+                    pass
 
     async def _reflect(self, task: Task, result: TaskResult) -> None:
         """
