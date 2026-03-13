@@ -38,6 +38,11 @@ from pydantic_ai import Agent
 
 from agent.config import settings
 
+log = structlog.get_logger()
+
+# Reflect on MEMORY.md every N successful tasks
+MEMORY_UPDATE_INTERVAL = 10
+
 
 # ── Model routing ──────────────────────────────────────────────────────────────
 
