@@ -38,20 +38,8 @@ websockify \
     "localhost:${VNC_PORT}" \
     &
 
-echo "[browser] Starting Playwright MCP server on port ${MCP_PORT}"
-# Try playwright-mcp package first, fall back to simple HTTP health endpoint
-if python -c "import playwright_mcp" 2>/dev/null; then
-    echo "[browser] Using playwright-mcp package"
-    python -m playwright_mcp.server \
-        --port "${MCP_PORT}" \
-        --host "0.0.0.0" \
-        --browser chromium \
-        --headless false \
-        &
-else
-    echo "[browser] playwright-mcp not available; using minimal MCP bridge"
-    python /mcp_bridge.py "${MCP_PORT}" &
-fi
+echo "[browser] Starting MCP HTTP bridge on port ${MCP_PORT}"
+python /mcp_bridge.py "${MCP_PORT}" &
 
 echo "[browser] All services started. VNC=${VNC_PORT} noVNC=${NOVNC_PORT} MCP=${MCP_PORT}"
 
