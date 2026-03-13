@@ -170,17 +170,17 @@ configure_env() {
 
     # ── GitHub ───────────────────────────────────────────────────────────────
     echo ""
-    echo -e "${CYAN}── GitHub (optional) ─────────────────────────────────${NC}"
-    echo -e "  ${YELLOW}Tip:${NC} Create a fine-grained PAT at https://github.com/settings/tokens"
-    echo -e "       Scopes needed: Contents (read/write), Pull requests, Issues"
-
-    prompt_var "GITHUB_TOKEN" \
-        "GitHub personal access token (enables gh CLI + private repo access)" \
-        "$(current_val GITHUB_TOKEN)" 1
+    echo -e "${CYAN}── GitHub SSH ────────────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} We'll generate an SSH key for this agent and walk you through"
+    echo -e "       adding it to GitHub so the agent can clone/push repos."
 
     prompt_var "GITHUB_USERNAME" \
         "Your GitHub username (used for git commit authorship)" \
         "$(current_val GITHUB_USERNAME)"
+
+    prompt_var "GITHUB_TOKEN" \
+        "GitHub personal access token (for gh CLI — API calls, PRs, issues). Leave blank to skip." \
+        "$(current_val GITHUB_TOKEN)" 1
 
     echo ""
     success "Configuration saved to .env"
@@ -198,7 +198,77 @@ else
     fi
 fi
 
-# ── 3. Set up git ──────────────────────────────────────────────────────────────
+# ── 3. GitHub SSH key ──────────────────────────────────────────────────────────
+setup_github_ssh() {
+    local ssh_dir="${ROOT_DIR}/.ssh"
+    local key_file="${ssh_dir}/agent_ed25519"
+
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+
+    # Generate key if it doesn't exist yet
+    if [[ ! -f "$key_file" ]]; then
+        info "Generating SSH key for this agent..."
+        local label="agent@$(hostname)"
+        ssh-keygen -t ed25519 -C "$label" -f "$key_file" -N ""
+        success "SSH key generated: ${key_file}"
+    else
+        info "SSH key already exists: ${key_file}"
+    fi
+
+    # Show the public key and wait for the user to add it to GitHub
+    echo ""
+    echo -e "${CYAN}┌──────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│  Add this public key to GitHub as a Deploy Key or        │${NC}"
+    echo -e "${CYAN}│  go to: https://github.com/settings/ssh/new              │${NC}"
+    echo -e "${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    cat "${key_file}.pub"
+    echo ""
+    echo -e "  ${YELLOW}→ Copy the key above, add it to GitHub, then press Enter to verify.${NC}"
+    read -rp "  Press Enter when done (or Ctrl+C to skip SSH setup): "
+
+    # Test the connection
+    info "Testing SSH connection to github.com..."
+    if ssh -i "$key_file" \
+           -o StrictHostKeyChecking=accept-new \
+           -o BatchMode=yes \
+           -o ConnectTimeout=10 \
+           -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        success "SSH connection to GitHub verified!"
+    else
+        # ssh returns exit 1 even on success (GitHub closes the shell), so
+        # check the output text rather than the exit code
+        local result
+        result=$(ssh -i "$key_file" \
+                     -o StrictHostKeyChecking=accept-new \
+                     -o BatchMode=yes \
+                     -o ConnectTimeout=10 \
+                     -T git@github.com 2>&1 || true)
+        if echo "$result" | grep -q "successfully authenticated"; then
+            success "SSH connection to GitHub verified!"
+        else
+            warn "Could not verify SSH connection. Output: ${result}"
+            warn "You can test manually later: ssh -i ${key_file} -T git@github.com"
+        fi
+    fi
+
+    # Write the SSH key path to .env so the entrypoint can use it
+    if grep -q "^GITHUB_SSH_KEY=" .env 2>/dev/null; then
+        sed -i.bak "s|^GITHUB_SSH_KEY=.*|GITHUB_SSH_KEY=/root/.ssh/agent_ed25519|" .env && rm -f .env.bak
+    else
+        echo "GITHUB_SSH_KEY=/root/.ssh/agent_ed25519" >> .env
+    fi
+}
+
+echo ""
+echo -ne "  ${YELLOW}Set up GitHub SSH key?${NC} [Y/n] "
+read -r do_ssh
+if [[ "${do_ssh,,}" != "n" ]]; then
+    setup_github_ssh
+fi
+
+# ── 4. Set up git ──────────────────────────────────────────────────────────────
 if [[ ! -d .git ]]; then
     info "Initialising git repository..."
     git init
@@ -206,16 +276,16 @@ if [[ ! -d .git ]]; then
     git commit -m "chore: initial agent setup"
 fi
 
-# ── 4. Create workspace ────────────────────────────────────────────────────────
+# ── 5. Create workspace ────────────────────────────────────────────────────────
 mkdir -p workspace
 chmod 755 workspace
 
-# ── 5. Build + start containers ───────────────────────────────────────────────
+# ── 6. Build + start containers ───────────────────────────────────────────────
 info "Building and starting agent containers..."
 docker compose build --no-cache
 docker compose up -d
 
-# ── 6. Health check ────────────────────────────────────────────────────────────
+# ── 7. Health check ────────────────────────────────────────────────────────────
 info "Waiting for services to be healthy (up to 60s)..."
 TIMEOUT=60
 ELAPSED=0

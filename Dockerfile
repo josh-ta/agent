@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
-# System dependencies: git, gh CLI, curl, docker CLI (for self-restart)
+# System dependencies: git, gh CLI, openssh, curl, docker CLI (for self-restart)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    openssh-client \
     curl \
     ca-certificates \
     docker.io \
@@ -15,12 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
-
-# Configure git to use GITHUB_TOKEN for HTTPS auth automatically
-# (injected at runtime via .env; the credential helper reads it from the env)
-RUN git config --global credential.helper \
-    '!f() { echo username=x-token; echo "password=${GITHUB_TOKEN}"; }; f' \
-    && git config --global url."https://github.com/".insteadOf "git@github.com:"
 
 WORKDIR /app
 
