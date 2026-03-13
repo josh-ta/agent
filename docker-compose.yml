@@ -1,0 +1,97 @@
+services:
+  # ─── Main Agent ────────────────────────────────────────────────────────────
+  agent:
+    build: .
+    container_name: ${AGENT_NAME:-agent-1}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - BROWSER_MCP_URL=http://browser:3080/sse
+      - SQLITE_PATH=/data/agent.db
+      - WORKSPACE_PATH=/workspace
+      - SKILLS_PATH=/app/agent/skills
+      - IDENTITY_PATH=/app/agent/identity
+    volumes:
+      - agent_data:/data                          # SQLite database
+      - ./workspace:/workspace                    # Agent writable workspace
+      - ./agent/skills:/app/agent/skills          # Editable skills (survives image rebuild)
+      - ./agent/identity:/app/agent/identity      # Editable identity
+      - /var/run/docker.sock:/var/run/docker.sock # Self-restart capability
+    depends_on:
+      browser:
+        condition: service_healthy
+    networks:
+      - agent_net
+    mem_limit: 2g
+    cpus: "2.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ─── Browser Sidecar (Playwright MCP + noVNC) ─────────────────────────────
+  browser:
+    build:
+      context: ./mcps/browser
+      dockerfile: Dockerfile
+    container_name: ${AGENT_NAME:-agent-1}-browser
+    restart: unless-stopped
+    environment:
+      - DISPLAY_NUM=99
+      - VNC_PORT=5900
+      - NOVNC_PORT=6080
+      - MCP_PORT=3080
+    ports:
+      - "6080:6080"   # noVNC web viewer (human observation)
+      - "5900:5900"   # Raw VNC
+    expose:
+      - "3080"        # Playwright MCP (internal only)
+    shm_size: 2gb     # Required for Chromium stability
+    networks:
+      - agent_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_limit: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ─── PostgreSQL (optional shared DB for multi-agent coordination) ──────────
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: ${AGENT_NAME:-agent-1}-postgres
+    restart: unless-stopped
+    profiles:
+      - postgres   # Only started with: docker compose --profile postgres up
+    environment:
+      POSTGRES_DB: agentdb
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - agent_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agentdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 1g
+
+volumes:
+  agent_data:
+  postgres_data:
+
+networks:
+  agent_net:
+    driver: bridge
