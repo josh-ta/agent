@@ -83,7 +83,7 @@ shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, 
 - `gh` CLI is pre-authenticated via GH_TOKEN env var — NEVER run `gh auth login`.
 - If `gh auth status` exits 0, you ARE authenticated — proceed directly to `gh pr create`.
 - Create PRs with: `gh pr create --title "..." --body "..." --base main --repo owner/repo`
-- SSH key is at /data/ssh/id_ed25519 (or id_rsa). SSH config at ~/.ssh/config already points to it.
+- SSH key is at /data/ssh/id_ed25519 (or id_rsa). GIT_SSH_COMMAND env var is pre-configured — plain `git clone git@github.com:...` just works.
 - Always set git user inside cloned repos: `git config user.name "bob-agent" && git config user.email "bob@agent.local"`
 
 {skills}

@@ -32,7 +32,7 @@ if [[ -d /root/.ssh ]]; then
 
     mkdir -p "$SSH_DEST"
     cp -r /root/.ssh/. "$SSH_DEST/"
-    chmod 700 "$SSH_DEST"
+    chmod 700 "$SSH_DEST" 2>/dev/null || true
     chmod 600 "$SSH_DEST"/* 2>/dev/null || true
 
     # Prefer agent_ed25519, fall back to id_ed25519 or id_rsa (server's own key)
@@ -48,9 +48,10 @@ if [[ -d /root/.ssh ]]; then
     done
 
     if [[ -n "$KEY" ]]; then
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        cat > ~/.ssh/config <<EOF
+        # Write SSH config to a writable location (not the read-only bind mount)
+        mkdir -p /root/.ssh_rw
+        chmod 700 /root/.ssh_rw
+        cat > /root/.ssh_rw/config <<EOF
 Host github.com
     IdentityFile ${KEY}
     StrictHostKeyChecking accept-new
@@ -60,8 +61,12 @@ Host *
     StrictHostKeyChecking accept-new
     AddKeysToAgent no
 EOF
-        chmod 600 ~/.ssh/config
-        ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+        chmod 600 /root/.ssh_rw/config
+        # Copy known_hosts from read-only mount if present, then add github
+        cp /root/.ssh/known_hosts /root/.ssh_rw/known_hosts 2>/dev/null || true
+        ssh-keyscan -t ed25519 github.com >> /root/.ssh_rw/known_hosts 2>/dev/null || true
+        # Point SSH at this writable config dir
+        export GIT_SSH_COMMAND="ssh -F /root/.ssh_rw/config -o UserKnownHostsFile=/root/.ssh_rw/known_hosts"
     fi
 fi
 
