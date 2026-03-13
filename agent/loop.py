@@ -137,9 +137,6 @@ class AgentLoop:
         # Per-channel, per-tier message history — keyed by (channel_id, tier)
         # Histories are never shared across tiers to avoid tool_use_id mismatches
         self._histories: dict[tuple[int, str], list[Any]] = {}
-        # Per-channel plain-text conversation thread (last N turns).
-        # Shared across all tiers so cross-tier follow-ups have context.
-        self._threads: dict[int, list[str]] = {}
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -233,11 +230,8 @@ class AgentLoop:
             except Exception:
                 pass
 
-        # Build prompt — prepend cross-tier conversation thread then lessons
-        thread = self._threads.get(task.channel_id, [])
+        # Build prompt — prepend lessons context if available
         parts: list[str] = []
-        if thread:
-            parts.append("## Conversation so far\n" + "\n".join(thread[-10:]))
         if lessons_context:
             parts.append(lessons_context)
         parts.append(task.content)
@@ -258,13 +252,6 @@ class AgentLoop:
             # Update rolling history — keyed by (channel, tier) so histories
             # are never shared across model tiers (avoids tool_use_id mismatches)
             self._histories[(task.channel_id, tier)] = list(result.all_messages())[-10:]
-
-            # Update shared plain-text thread so cross-tier follow-ups have context
-            thread = self._threads.setdefault(task.channel_id, [])
-            thread.append(f"{task.author}: {task.content[:300]}")
-            thread.append(f"assistant ({tier}): {output[:300]}")
-            # Keep last 20 lines (10 turns)
-            self._threads[task.channel_id] = thread[-20:]
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.info(

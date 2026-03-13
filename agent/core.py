@@ -65,14 +65,15 @@ def build_system_prompt() -> str:
 {identity}
 
 ## Tools
-shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, discord_send, discord_read, edit_skill, edit_identity, self_restart, memory_save, lesson_search, read_skill
+shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, discord_send, read_discord, read_channel(name), edit_skill, edit_identity, self_restart, memory_save, lesson_search, skill_read
 
 ## Rules
 1. Think before acting. Use shell for system tasks.
 2. Read files before writing. Ask if unsure.
 3. After failures: call lesson_save(kind="mistake"). Before complex tasks: call lesson_search.
 4. Use read_skill <name> to load a skill's full procedure before following it.
-5. Each mistake happens only once — record it and move on.
+5. Use read_channel('private') to catch up on recent conversation history when context is needed.
+6. Each mistake happens only once — record it and move on.
 
 {skills}
 """

@@ -57,7 +57,7 @@ async def discord_send(channel_id: int, message: str) -> str:
 
 async def discord_read(channel_id: int, limit: int = 20) -> str:
     """
-    Read recent messages from a Discord channel.
+    Read recent messages from a Discord channel by ID.
 
     Args:
         channel_id: Numeric Discord channel ID.
@@ -84,3 +84,25 @@ async def discord_read(channel_id: int, limit: int = 20) -> str:
         return "\n".join(messages) if messages else "(no messages)"
     except Exception as exc:
         return f"[ERROR: {exc}]"
+
+
+async def discord_read_named(name: str, limit: int = 20) -> str:
+    """
+    Read recent messages from a named channel: 'private', 'bus', or 'comms'.
+
+    Args:
+        name: One of 'private' (this agent's channel), 'bus' (#agent-bus),
+              or 'comms' (#agent-comms).
+        limit: Number of recent messages to fetch (max 50).
+    """
+    from agent.config import settings
+
+    channel_map = {
+        "private": settings.discord_agent_channel_id,
+        "bus": settings.discord_bus_channel_id,
+        "comms": settings.discord_comms_channel_id,
+    }
+    channel_id = channel_map.get(name.lower())
+    if not channel_id:
+        return f"[ERROR: unknown channel name '{name}'. Use: private, bus, comms]"
+    return await discord_read(channel_id, limit)

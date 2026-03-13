@@ -15,7 +15,7 @@ from pydantic_ai import Agent, RunContext
 
 from agent.config import settings
 from agent.tools import filesystem, self_edit, shell
-from agent.tools.discord_tools import discord_read, discord_send
+from agent.tools.discord_tools import discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
     from agent.memory.sqlite_store import SQLiteStore
@@ -111,8 +111,17 @@ class ToolRegistry:
 
         @agent.tool_plain
         async def read_discord(channel_id: int, limit: int = 20) -> str:
-            """Read recent messages from a Discord channel."""
+            """Read recent messages from a Discord channel by numeric ID."""
             return await discord_read(channel_id, limit)
+
+        @agent.tool_plain
+        async def read_channel(name: str, limit: int = 20) -> str:
+            """
+            Read recent messages from a named channel.
+            name: 'private' (your channel), 'bus' (#agent-bus), 'comms' (#agent-comms).
+            Use this to catch up on conversation history or check what other agents said.
+            """
+            return await discord_read_named(name, limit)
 
         # ── Memory search ─────────────────────────────────────────────────────
         if sqlite:
