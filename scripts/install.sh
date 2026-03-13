@@ -269,6 +269,37 @@ configure_env() {
         "Best tier — complex reasoning, architecture" \
         "$(current_val MODEL_BEST)"
 
+    # ── GitHub ───────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── GitHub (optional) ─────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Required for the agent to push code, open PRs, or use gh CLI."
+    prompt_var "GITHUB_TOKEN" \
+        "Personal access token — github.com/settings/tokens (scopes: repo, read:org)" \
+        "$(current_val GITHUB_TOKEN)" 1
+    prompt_var "GITHUB_USERNAME" \
+        "GitHub username (for git commit identity inside the container)" \
+        "$(current_val GITHUB_USERNAME)"
+
+    # ── PostgreSQL ───────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── PostgreSQL (optional) ─────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Enables persistent memory, semantic search (pgvector), and"
+    echo -e "       multi-agent coordination. Runs as a sidecar container."
+    echo -ne "  Enable PostgreSQL? [y/N] "
+    read -r use_postgres
+    if [[ "${use_postgres,,}" == "y" ]]; then
+        current_pg_pass="$(current_val POSTGRES_PASSWORD)"
+        prompt_var "POSTGRES_PASSWORD" \
+            "Password for the local Postgres container (anything works here)" \
+            "${current_pg_pass:-changeme}" 1
+        # Derive POSTGRES_URL from the password that was just set
+        pg_pass="$(current_val POSTGRES_PASSWORD)"
+        set_var "POSTGRES_URL" "postgresql+asyncpg://agent:${pg_pass}@postgres/agentdb"
+        set_var "ENABLE_POSTGRES" "true"
+    else
+        set_var "ENABLE_POSTGRES" "false"
+    fi
+
     # ── Discord ──────────────────────────────────────────────────────────────
     echo ""
     echo -e "${CYAN}── Discord ───────────────────────────────────────────${NC}"
@@ -321,8 +352,11 @@ chmod 755 workspace
 
 # ── 4. Build + start ───────────────────────────────────────────────────────────
 info "Building and starting containers (this takes ~2 min on first run)..."
+COMPOSE_PROFILES=""
+[[ "$(current_val ENABLE_POSTGRES)" == "true" ]] && COMPOSE_PROFILES="--profile postgres"
 docker compose build --no-cache
-docker compose up -d
+# shellcheck disable=SC2086
+docker compose $COMPOSE_PROFILES up -d
 
 # ── 5. Wait for healthy ────────────────────────────────────────────────────────
 info "Waiting for services to be healthy (up to 120s)..."
