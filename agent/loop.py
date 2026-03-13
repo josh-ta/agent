@@ -226,8 +226,29 @@ class AgentLoop:
             except Exception:
                 pass
 
-        # Build prompt — prepend lessons context if available
+        # Inject recent channel history as plain text so the agent has context.
+        # We fetch this directly (not via a tool call) so it's always present
+        # without Bob needing to remember to ask for it.
+        channel_context = ""
+        if task.source == "discord" and task.channel_id:
+            try:
+                from agent.tools.discord_tools import discord_read
+                # Fetch last 15 messages; exclude the triggering message itself
+                # (it will be in the prompt as task.content already)
+                raw = await discord_read(task.channel_id, limit=16)
+                lines = raw.splitlines()
+                # Drop the last line — that's the message we're currently processing
+                if lines:
+                    lines = lines[:-1]
+                if lines:
+                    channel_context = "## Recent conversation history\n" + "\n".join(lines)
+            except Exception:
+                pass
+
+        # Build prompt — prepend channel context and lessons if available
         parts: list[str] = []
+        if channel_context:
+            parts.append(channel_context)
         if lessons_context:
             parts.append(lessons_context)
         parts.append(task.content)
