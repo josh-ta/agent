@@ -134,8 +134,9 @@ class AgentLoop:
         self._running = False
         self._task_count = 0
         self._success_count = 0
-        # Per-channel message history for multi-turn conversations
-        self._histories: dict[int, list[Any]] = {}
+        # Per-channel, per-tier message history — keyed by (channel_id, tier)
+        # Histories are never shared across tiers to avoid tool_use_id mismatches
+        self._histories: dict[tuple[int, str], list[Any]] = {}
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -226,7 +227,7 @@ class AgentLoop:
             prompt = f"{lessons_context}\n\n---\n\n{task.content}"
 
         try:
-            history = self._histories.get(task.channel_id, [])
+            history = self._histories.get((task.channel_id, tier), [])
 
             async with agent.run_mcp_servers():
                 result = await agent.run(
@@ -237,8 +238,9 @@ class AgentLoop:
             output = str(result.output)
             tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
 
-            # Update rolling history for this channel (keep last 10 messages)
-            self._histories[task.channel_id] = list(result.all_messages())[-10:]
+            # Update rolling history — keyed by (channel, tier) so histories
+            # are never shared across model tiers (avoids tool_use_id mismatches)
+            self._histories[(task.channel_id, tier)] = list(result.all_messages())[-10:]
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.info(
