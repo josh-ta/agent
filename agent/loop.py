@@ -135,10 +135,6 @@ class AgentLoop:
         self._running = False
         self._task_count = 0
         self._success_count = 0
-        # Per-channel, per-tier message history — keyed by (channel_id, tier)
-        # Histories are never shared across tiers to avoid tool_use_id mismatches
-        self._histories: dict[tuple[int, str], list[Any]] = {}
-
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
         """Default agent (smart tier) — used by reflection passes."""
@@ -194,9 +190,8 @@ class AgentLoop:
         content, forced_tier = _parse_override(task.content)
 
         if forced_tier:
-            # User explicitly chose a tier — use it and clear stale history
+            # User explicitly chose a tier — use it
             tier = forced_tier
-            self._histories.pop((task.channel_id, tier), None)
         else:
             # Classify fresh on every new task
             tier = _classify_tier(content)
@@ -239,13 +234,8 @@ class AgentLoop:
         prompt = "\n\n---\n\n".join(parts)
 
         try:
-            history = self._histories.get((task.channel_id, tier), [])
-
             async with agent.run_mcp_servers():
-                result = await agent.run(
-                    prompt,
-                    message_history=history if history else None,
-                )
+                result = await agent.run(prompt)
 
             output = str(result.output)
 
@@ -260,9 +250,9 @@ class AgentLoop:
 
             tool_calls = len([m for m in result.new_messages() if hasattr(m, "parts")])
 
-            # Update rolling history — keyed by (channel, tier) so histories
-            # are never shared across model tiers (avoids tool_use_id mismatches)
-            self._histories[(task.channel_id, tier)] = list(result.all_messages())[-10:]
+            # Don't store message_history — pydantic-ai message objects with
+            # tool_use/tool_result pairs cause Anthropic 400 errors when reused
+            # across requests. Context is retrieved on demand via read_channel().
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.info(
