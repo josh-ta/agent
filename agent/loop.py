@@ -266,10 +266,26 @@ class AgentLoop:
         prompt = "\n\n---\n\n".join(parts)
 
         try:
-            async with agent.run_mcp_servers():
-                result = await agent.run(prompt)
-
-            output = str(result.output)
+            # Retry on 429 rate-limit errors with exponential backoff
+            _max_retries = 4
+            _delay = 5.0
+            for _attempt in range(_max_retries):
+                try:
+                    async with agent.run_mcp_servers():
+                        result = await agent.run(prompt)
+                    break
+                except Exception as _exc:
+                    if "429" in str(_exc) and _attempt < _max_retries - 1:
+                        log.warning(
+                            "rate_limit_retry",
+                            attempt=_attempt + 1,
+                            wait_s=_delay,
+                            tier=tier,
+                        )
+                        await asyncio.sleep(_delay)
+                        _delay *= 2
+                    else:
+                        raise
 
             # Check if the agent called send_discord during this task.
             # If so, the bot should NOT send an additional reply — it would duplicate.

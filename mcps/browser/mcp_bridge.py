@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import sys
 import threading
 import traceback
@@ -32,6 +33,12 @@ try:
 except ImportError:
     HAS_STARLETTE = False
 
+try:
+    from markdownify import markdownify as _md
+    HAS_MARKDOWNIFY = True
+except ImportError:
+    HAS_MARKDOWNIFY = False
+
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
@@ -39,7 +46,51 @@ from playwright.async_api import async_playwright
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3080
 
-print(f"[mcp_bridge] Starting on port {PORT} (starlette={'yes' if HAS_STARLETTE else 'no'})", flush=True)
+print(f"[mcp_bridge] Starting on port {PORT} (starlette={'yes' if HAS_STARLETTE else 'no'}, markdownify={'yes' if HAS_MARKDOWNIFY else 'no'})", flush=True)
+
+# ── HTML → Markdown conversion ─────────────────────────────────────────────────
+# Tags that add zero information when converted — strip them entirely before md
+_STRIP_TAGS = ["script", "style", "noscript", "iframe", "svg", "head"]
+_STRIP_RE = re.compile(
+    r"<(" + "|".join(_STRIP_TAGS) + r")[\s>].*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+# Caps — tuned to stay well under 8k tokens even for dense pages
+_MD_CHAR_CAP = 12_000   # ~3k tokens after conversion
+_HTML_CHAR_CAP = 80_000  # pre-strip cap to avoid huge regex on multi-MB pages
+
+
+def _html_to_markdown(html: str) -> str:
+    """Strip boilerplate and convert HTML to compact Markdown."""
+    if len(html) > _HTML_CHAR_CAP:
+        html = html[:_HTML_CHAR_CAP]
+
+    # Remove script/style/svg noise before any conversion
+    html = _STRIP_RE.sub("", html)
+
+    if HAS_MARKDOWNIFY:
+        md = _md(
+            html,
+            heading_style="ATX",
+            bullets="-",
+            strip=["a"],        # drop hyperlinks — keep link text, lose URLs
+            convert=["p", "h1", "h2", "h3", "h4", "h5", "h6",
+                     "li", "ul", "ol", "table", "tr", "td", "th",
+                     "strong", "em", "br", "hr"],
+        )
+    else:
+        # Minimal fallback: strip all remaining tags
+        md = re.sub(r"<[^>]+>", " ", html)
+
+    # Collapse runs of whitespace / blank lines
+    md = _BLANK_LINES_RE.sub("\n\n", md).strip()
+
+    if len(md) > _MD_CHAR_CAP:
+        md = md[:_MD_CHAR_CAP] + "\n\n... [page truncated]"
+
+    return md
 
 # ── Playwright singleton ───────────────────────────────────────────────────────
 
@@ -88,7 +139,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="browser_content",
-            description="Get the full HTML of the current page",
+            description="Get the page content as clean Markdown (scripts/styles stripped). Much more token-efficient than raw HTML. Use this to read page text, listings, tables, etc.",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
@@ -144,9 +195,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "browser_content":
             html = await page.content()
-            if len(html) > 50_000:
-                html = html[:50_000] + "\n... [truncated]"
-            return [TextContent(type="text", text=html)]
+            md = _html_to_markdown(html)
+            return [TextContent(type="text", text=md)]
 
         elif name == "browser_click":
             await page.click(arguments["selector"], timeout=10000)

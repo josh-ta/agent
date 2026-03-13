@@ -33,6 +33,7 @@ RUN pip install --no-cache-dir \
     "mcp[cli]" \
     "uvicorn[standard]" \
     "starlette" \
+    "markdownify>=0.13" \
     && python -m playwright install chromium \
     && python -m playwright install-deps chromium \
     && python -c "import playwright, uvicorn, starlette, mcp; print('deps ok')"
