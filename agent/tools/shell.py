@@ -20,7 +20,7 @@ from agent.config import settings
 
 log = structlog.get_logger()
 
-MAX_OUTPUT_BYTES = 8 * 1024  # 8 KB
+MAX_OUTPUT_BYTES = 2 * 1024  # 2 KB — use read_file for large files, not cat
 
 
 async def shell_run(
@@ -69,9 +69,9 @@ async def shell_run(
 
         output = stdout.decode("utf-8", errors="replace")
 
-        # Truncate if too large
+        # Truncate if too large — use read_file tool for reading large files
         if len(output) > MAX_OUTPUT_BYTES:
-            output = output[:MAX_OUTPUT_BYTES] + f"\n... [truncated, total {len(output)} bytes]"
+            output = output[:MAX_OUTPUT_BYTES] + f"\n... [truncated at 2KB, total {len(output)} bytes — use read_file for large files]"
 
         result = f"{output}\n[exit code: {proc.returncode}]"
         log.info("shell_done", exit_code=proc.returncode, output_len=len(output))

@@ -280,7 +280,9 @@ class SQLiteStore:
         for row in rows:
             ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
             lines.append(f"- [{row['kind'].upper()} {ts_str}] {row['summary']}")
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        # Hard cap — lessons context must not blow the prompt budget
+        return result[:500]
 
     async def get_recent_lessons(self, limit: int = 20) -> str:
         """Return the most recent lessons for MEMORY.md updates."""

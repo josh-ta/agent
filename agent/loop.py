@@ -218,11 +218,11 @@ class AgentLoop:
             content=task.content[:120],
         )
 
-        # Surface relevant past lessons before processing
+        # Surface top-3 relevant past lessons — capped to avoid bloating prompt
         lessons_context = ""
         if self.memory and hasattr(self.memory, "search_lessons"):
             try:
-                lessons_context = await self.memory.search_lessons(task.content[:200])
+                lessons_context = await self.memory.search_lessons(task.content[:200], limit=3)
             except Exception:
                 pass
 
@@ -366,21 +366,16 @@ class AgentLoop:
                 reflection = await self.agent.run(reflection_prompt)
             lesson = str(reflection.output).strip()
 
-            # Save to lessons table
+            # Save to SQLite — this is the durable append-only log
             await self.memory.save_lesson(
                 summary=lesson,
                 kind="mistake",
                 context=task.content[:300],
             )
 
-            # Append to MEMORY.md
-            memory_path = settings.identity_path / "MEMORY.md"
-            if memory_path.exists():
-                existing = memory_path.read_text(encoding="utf-8")
-                from datetime import date
-                today = date.today().isoformat()
-                updated = existing.rstrip() + f"\n\n### Mistake — {today}\n{lesson}\n"
-                memory_path.write_text(updated, encoding="utf-8")
+            # Update MEMORY.md as a rolling summary (not a raw append)
+            # SQLite is the log; MEMORY.md is the distilled snapshot
+            await self._update_memory_md()
 
             log.info("lesson_saved", kind="mistake", lesson=lesson[:100])
 

@@ -121,12 +121,20 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
         except Exception as exc:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
+    # No static system_prompt here — we register a dynamic one below so it's
+    # re-evaluated on every run, picking up MEMORY.md changes mid-session.
     agent: Agent = Agent(  # type: ignore[type-arg]
         model=model_string,
-        system_prompt=build_system_prompt(),
         mcp_servers=mcp_servers,
         retries=2,
     )
+
+    # Dynamic system prompt: re-read identity files on every task so MEMORY.md
+    # updates (and the 4k cap) are always reflected without a container restart.
+    @agent.system_prompt(dynamic=True)
+    def _system_prompt() -> str:
+        return build_system_prompt()
+
     registry.attach_to_agent(agent)
     return agent
 
