@@ -32,6 +32,11 @@ x11vnc \
     &
 
 echo "[browser] Starting noVNC websockify on port ${NOVNC_PORT}"
+# noVNC static files live at /usr/share/novnc; the entry point is vnc.html.
+# Create a symlink so that hitting / redirects to vnc.html automatically.
+if [[ ! -f /usr/share/novnc/index.html ]]; then
+    ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html
+fi
 websockify \
     --web /usr/share/novnc \
     "${NOVNC_PORT}" \

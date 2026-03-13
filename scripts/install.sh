@@ -397,7 +397,7 @@ success "═══════════════════════�
 echo ""
 docker compose ps
 echo ""
-info "Live browser:  http://$(hostname -I | awk '{print $1}'):6080"
+info "Live browser:  http://$(hostname -I | awk '{print $1}'):6080/vnc.html"
 info "Logs:          docker compose logs -f agent"
 info "Stop:          docker compose down"
 echo ""
