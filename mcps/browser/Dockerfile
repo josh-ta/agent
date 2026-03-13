@@ -10,8 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Playwright MCP server
-RUN pip install --no-cache-dir "mcp[cli]" "playwright-mcp>=0.0.6" 2>/dev/null || \
-    pip install --no-cache-dir "mcp[cli]"
+# --break-system-packages needed on Ubuntu Noble (apt-installed packages conflict with pip)
+RUN pip install --no-cache-dir --break-system-packages \
+    "mcp[cli]" "playwright-mcp>=0.0.6" 2>/dev/null || \
+    pip install --no-cache-dir --break-system-packages "mcp[cli]"
 
 # Startup script
 COPY start.sh /start.sh
