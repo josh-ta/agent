@@ -72,6 +72,68 @@ class ToolRegistry:
             """Delete a file (not directories)."""
             return filesystem.delete_file(path)
 
+        # ── Task journal (checkpointing for long tasks) ───────────────────────
+        _journal_path = settings.workspace_path / ".task_journal.md"
+
+        @agent.tool_plain
+        def task_note(note: str) -> str:
+            """
+            Write a progress note to the persistent task journal.
+
+            Call this frequently during long tasks — after each major step,
+            discovery, or decision. If the task is interrupted (rate limit,
+            restart, error), you can call task_resume() to read back all notes
+            and pick up exactly where you left off without losing any work.
+
+            note: what you just did, what you found, and what the next step is.
+            """
+            from datetime import datetime as _dt
+            ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            entry = f"\n### [{ts}]\n{note.strip()}\n"
+            try:
+                _journal_path.parent.mkdir(parents=True, exist_ok=True)
+                with _journal_path.open("a", encoding="utf-8") as f:
+                    f.write(entry)
+                return f"Journal updated ({_journal_path})."
+            except Exception as exc:
+                return f"[journal write error: {exc}]"
+
+        @agent.tool_plain
+        def task_resume() -> str:
+            """
+            Read the task journal to resume an interrupted long task.
+
+            Returns all progress notes written by task_note(). Use this at the
+            start of a task if you suspect it was previously attempted, or
+            whenever you need to recall what has already been done.
+            """
+            try:
+                if not _journal_path.exists():
+                    return "(no task journal found — this is a fresh start)"
+                content = _journal_path.read_text(encoding="utf-8").strip()
+                if not content:
+                    return "(task journal is empty)"
+                # Cap to avoid flooding context
+                if len(content) > 8_000:
+                    content = "[...older entries truncated...]\n\n" + content[-8_000:]
+                return f"## Task Journal\n\n{content}"
+            except Exception as exc:
+                return f"[journal read error: {exc}]"
+
+        @agent.tool_plain
+        def task_journal_clear() -> str:
+            """
+            Clear the task journal once a task is fully complete.
+            Call this after successfully finishing a long task so the next
+            task starts with a clean journal.
+            """
+            try:
+                if _journal_path.exists():
+                    _journal_path.unlink()
+                return "Task journal cleared."
+            except Exception as exc:
+                return f"[journal clear error: {exc}]"
+
         # ── Self-edit ─────────────────────────────────────────────────────────
         @agent.tool_plain
         def skill_list() -> str:

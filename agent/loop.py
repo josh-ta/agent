@@ -327,6 +327,26 @@ class AgentLoop:
         except Exception as exc:
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.error("task_failed", error=str(exc), exc=traceback.format_exc())
+
+            # If this was a rate-limit failure, write a recovery note to the
+            # task journal so the next run can resume from the last checkpoint.
+            if "429" in str(exc):
+                try:
+                    from datetime import datetime as _dt
+                    journal = settings.workspace_path / ".task_journal.md"
+                    ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                    note = (
+                        f"\n### [{ts}] — INTERRUPTED BY RATE LIMIT\n"
+                        f"Task: {task.content[:300]}\n"
+                        f"Error: {str(exc)[:200]}\n"
+                        f"Resume this task by calling task_resume() to see progress so far.\n"
+                    )
+                    journal.parent.mkdir(parents=True, exist_ok=True)
+                    with journal.open("a", encoding="utf-8") as f:
+                        f.write(note)
+                except Exception:
+                    pass
+
             return TaskResult(
                 task=task,
                 output=f"Error: {exc}",

@@ -90,6 +90,14 @@ shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, 
 9. If the same approach fails twice, STOP and report what you tried and what's blocking you. Do not keep retrying variations of the same broken approach.
 10. For long-running commands (docker build, npm install, git clone large repos), pass timeout=3600 or higher to run_shell — there is no task-level timeout.
 
+## Long tasks — checkpointing (IMPORTANT)
+For any task with more than ~5 tool calls, use the task journal to avoid losing work:
+- Call task_resume() FIRST — check if this task was previously attempted.
+- Call task_note(note) after EVERY significant step: what you did, what you found, what comes next.
+- Write notes as if explaining to yourself after an interruption: "Checked CI run 23057002906. Jobs: backend=failed, security=failed. Root cause: PYTHONPATH missing. Fixed ci-cd.yml line 186. Next: fix security-scan permissions."
+- Call task_journal_clear() only after the task is fully and successfully complete.
+- If you hit a rate limit or error mid-task, your next run should start with task_resume() to pick up from the last note.
+
 ## Git / GitHub
 - Clone repos to /workspace/<repo-name> (NOT /tmp).
 - `gh` CLI is pre-authenticated via GH_TOKEN env var — NEVER run `gh auth login`.
