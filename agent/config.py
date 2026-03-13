@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     agent_model: str = Field(default="claude-haiku-4-5", alias="AGENT_MODEL")
+    # Embedding model used for semantic memory search (requires OPENAI_API_KEY)
+    embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
     # Model tiers for dynamic routing (override with env vars)
     model_fast: str = Field(default="claude-haiku-4-5", alias="MODEL_FAST")
     model_smart: str = Field(default="claude-sonnet-4-5", alias="MODEL_SMART")
@@ -87,6 +89,11 @@ class Settings(BaseSettings):
     @property
     def has_postgres(self) -> bool:
         return bool(self.postgres_url)
+
+    @property
+    def has_embeddings(self) -> bool:
+        """True when we can generate embeddings (needs OpenAI key)."""
+        return bool(self.openai_api_key)
 
 
 # Singleton

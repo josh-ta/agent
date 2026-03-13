@@ -5,13 +5,17 @@ Optional — only used when POSTGRES_URL is set.
 Uses asyncpg for async, non-blocking access.
 Tables are created automatically on init() via CREATE TABLE IF NOT EXISTS.
 pgvector/pg_trgm extensions are attempted but not required.
+
+When pgvector is available AND an OpenAI API key is configured, share_memory()
+generates embeddings via text-embedding-3-small and stores them in the
+`embedding` column. search_shared_memory() then uses cosine distance (<=>)
+for semantic similarity search, falling back to ILIKE keyword search otherwise.
 """
 
 from __future__ import annotations
 
 import json
-import time
-from datetime import datetime, timezone
+from typing import Any
 
 import asyncpg
 import structlog
@@ -19,6 +23,26 @@ import structlog
 from agent.config import settings
 
 log = structlog.get_logger()
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+
+async def _embed(text: str) -> list[float] | None:
+    """Generate an embedding vector via OpenAI.  Returns None on any failure."""
+    if not settings.has_embeddings:
+        return None
+    try:
+        from openai import AsyncOpenAI  # soft import — already a dep via pydantic-ai
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        resp = await client.embeddings.create(
+            model=settings.embedding_model,
+            input=text,
+            encoding_format="float",
+        )
+        return resp.data[0].embedding
+    except Exception as exc:
+        log.warning("embedding_failed", error=str(exc))
+        return None
+
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 # pgvector / pg_trgm are optional; we try to enable them but continue without.
@@ -103,6 +127,7 @@ class PostgresStore:
         )
         self._pool: asyncpg.Pool | None = None  # type: ignore[type-arg]
         self._has_vector: bool = False
+        self._has_embeddings: bool = False  # True when vector + OpenAI key both available
 
     async def init(self) -> None:
         """Create connection pool and ensure schema exists."""
@@ -131,10 +156,16 @@ class PostgresStore:
             if self._has_vector:
                 try:
                     await conn.execute(_ADD_VECTOR_COLUMN)
+                    self._has_embeddings = settings.has_embeddings
                 except Exception as exc:
                     log.warning("postgres_vector_index_skipped", reason=str(exc))
 
-        log.info("postgres_schema_ready", vector=self._has_vector)
+        log.info(
+            "postgres_schema_ready",
+            vector=self._has_vector,
+            embeddings=self._has_embeddings,
+            embedding_model=settings.embedding_model if self._has_embeddings else "n/a",
+        )
 
     async def close(self) -> None:
         if self._pool:
@@ -273,21 +304,61 @@ class PostgresStore:
     async def share_memory(self, content: str, metadata: dict | None = None) -> str:
         """Write a fact to shared memory — visible to all agents."""
         assert self._pool
+        embedding = await _embed(content) if self._has_embeddings else None
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """INSERT INTO shared_memory (agent_id, content, metadata)
-                   VALUES ($1, $2, $3) RETURNING id""",
-                settings.agent_name,
-                content,
-                json.dumps(metadata or {}),
-            )
+            if embedding is not None:
+                # pgvector expects the literal string '[x,y,z,...]' cast to vector
+                vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
+                row = await conn.fetchrow(
+                    """INSERT INTO shared_memory (agent_id, content, metadata, embedding)
+                       VALUES ($1, $2, $3, $4::vector) RETURNING id""",
+                    settings.agent_name,
+                    content,
+                    json.dumps(metadata or {}),
+                    vec_str,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """INSERT INTO shared_memory (agent_id, content, metadata)
+                       VALUES ($1, $2, $3) RETURNING id""",
+                    settings.agent_name,
+                    content,
+                    json.dumps(metadata or {}),
+                )
         mem_id = row["id"][:8] if row else "unknown"
         return f"Shared memory saved [{mem_id}]: {content[:80]}"
 
     async def search_shared_memory(self, query: str, limit: int = 5) -> str:
-        """Search shared memory by keyword (case-insensitive)."""
+        """Search shared memory.
+
+        Uses cosine similarity (pgvector <=> operator) when embeddings are
+        available, otherwise falls back to case-insensitive keyword search.
+        """
         assert self._pool
         async with self._pool.acquire() as conn:
+            if self._has_embeddings:
+                query_vec = await _embed(query)
+                if query_vec is not None:
+                    vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
+                    rows = await conn.fetch(
+                        """SELECT agent_id, content, created_at,
+                                  1 - (embedding <=> $1::vector) AS similarity
+                           FROM shared_memory
+                           WHERE embedding IS NOT NULL
+                           ORDER BY embedding <=> $1::vector
+                           LIMIT $2""",
+                        vec_str,
+                        limit,
+                    )
+                    if rows:
+                        lines = [f"Shared memory — semantic search for '{query}':", ""]
+                        for r in rows:
+                            ts = r["created_at"].strftime("%Y-%m-%d %H:%M")
+                            sim = f"{r['similarity']:.2f}"
+                            lines.append(f"  [{ts}] {r['agent_id']} (sim={sim}): {r['content']}")
+                        return "\n".join(lines)
+
+            # Fallback: keyword search
             rows = await conn.fetch(
                 """SELECT agent_id, content, created_at FROM shared_memory
                    WHERE content ILIKE $1
