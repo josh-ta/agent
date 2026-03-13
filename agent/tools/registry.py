@@ -157,21 +157,65 @@ class ToolRegistry:
                 """Show the most recent lessons and mistakes."""
                 return await sqlite.get_recent_lessons(limit)
 
-        # ── Postgres (multi-agent) ────────────────────────────────────────────
+        # ── Collaboration API (Postgres — multi-agent) ───────────────────────
         if postgres:
+            # -- Agent registry --
+
             @agent.tool_plain
             async def list_agents() -> str:
-                """List all agents registered in the shared database."""
+                """List all agents registered in the shared database with their status."""
                 return await postgres.list_agents()
+
+            # -- Task queue --
 
             @agent.tool_plain
             async def create_shared_task(to_agent: str, description: str) -> str:
-                """Create a task for another agent in the shared task queue."""
+                """Assign a task to another agent in the shared task queue."""
                 return await postgres.create_task(to_agent, description)
 
             @agent.tool_plain
             async def my_tasks() -> str:
-                """List tasks assigned to this agent from the shared queue."""
+                """List pending tasks assigned to this agent from the shared queue."""
                 return await postgres.get_my_tasks()
+
+            @agent.tool_plain
+            async def complete_task(task_id: str, result: str) -> str:
+                """
+                Mark a shared task as done.
+                task_id: the full task UUID (from my_tasks output).
+                result: summary of what was accomplished.
+                """
+                return await postgres.complete_task(task_id, result)
+
+            # -- Broadcasts --
+
+            @agent.tool_plain
+            async def broadcast_message(message: str) -> str:
+                """
+                Broadcast a message to all agents via the shared audit log.
+                Use this to announce discoveries, status updates, or requests
+                that any agent should be able to see.
+                """
+                return await postgres.broadcast_message(message)
+
+            @agent.tool_plain
+            async def read_broadcasts(limit: int = 20) -> str:
+                """Read recent broadcast messages from all agents."""
+                return await postgres.read_broadcasts(limit)
+
+            # -- Shared memory --
+
+            @agent.tool_plain
+            async def share_memory(content: str) -> str:
+                """
+                Write a fact or insight to shared memory — visible to all agents.
+                Use this to share knowledge that other agents should be able to find.
+                """
+                return await postgres.share_memory(content)
+
+            @agent.tool_plain
+            async def search_shared_memory(query: str, limit: int = 5) -> str:
+                """Search shared memory from all agents by keyword."""
+                return await postgres.search_shared_memory(query, limit)
 
         log.info("tools_attached_to_agent")
