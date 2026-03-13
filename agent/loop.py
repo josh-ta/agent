@@ -23,27 +23,25 @@ Users can override per-message with a prefix:
   /smart <task>   force sonnet
   /best  <task>   force opus
 
+Streaming
+---------
+Uses agent.run_stream_events() for a single flat async stream of all events
+across the entire run (multiple model turns + all tool calls). This gives us:
+  - ThinkingPartDelta  → 🧠 thinking blocks streamed to Discord in real time
+  - TextPartDelta      → 💭 intermediate reasoning turns (not the final reply)
+  - FunctionToolCallEvent → 🔧 tool call notifications
+  - FinalResultEvent   → marks the last text block (suppressed — sent as reply)
+
 Context management
 ------------------
-When a task's accumulated tool call history exceeds the model's context window
-(~200k tokens for Claude), the loop catches the 400 "prompt is too long" error,
-asks the fast agent to compress all progress into a brief summary, saves it to
-the task journal, then retries with that compressed context instead of raw history.
-This mirrors how Cursor/Claude Code handle long tasks: periodic summarization.
+When the context window overflows (400 "prompt is too long"), the loop asks
+the fast agent to compress history into a brief summary, saves it, and retries.
 
-Progress updates
-----------------
-For Discord tasks, the loop sends an immediate acknowledgment when the task
-starts, periodic "still working" pings every 60 s, and a note whenever the
-agent calls task_note() (forwarded from the journal write hook).
-
-Zipper-merge injection (Option C)
-----------------------------------
-While the agent is mid-task, new messages from the user are held in
-Task.inject_queue. Between each tool-call round-trip (after CallToolsNode
-completes, before ModelRequestNode sends its next request), the loop drains
-inject_queue and appends the messages as a UserPromptPart so the model sees
-them at exactly the right moment — between thoughts, not before or after.
+Zipper-merge injection
+-----------------------
+New messages arriving while the agent is running are held in Task.inject_queue.
+After each run completes, the queue is drained and a follow-up run is issued
+with the injected messages appended so the model incorporates them.
 """
 
 from __future__ import annotations
@@ -57,8 +55,15 @@ from typing import Any, Callable, Awaitable
 
 import structlog
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelRequest, UserPromptPart
-from pydantic_ai import FinalResultEvent, PartDeltaEvent, PartEndEvent, TextPartDelta, ThinkingPartDelta
+from pydantic_ai.messages import (
+    FinalResultEvent,
+    PartDeltaEvent,
+    PartEndEvent,
+    TextPartDelta,
+    ThinkingPartDelta,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+)
 
 from agent.config import settings
 
@@ -272,12 +277,17 @@ class AgentLoop:
 
     async def _process(self, task: Task) -> TaskResult:
         """
-        Core observe→think→act cycle using agent.iter() for step-by-step control.
+        Core observe→think→act cycle using agent.run_stream_events() for full streaming.
 
-        Drives the pydantic-ai graph node-by-node so we can:
-          - Inject queued user messages between tool-call rounds (zipper merge)
-          - Detect context overflow at each ModelRequestNode and compress
-          - Forward task_note tool calls to Discord as they happen (not post-hoc)
+        run_stream_events() gives a single flat async iterator over the entire run
+        (multiple model turns + all tool calls), including:
+          - ThinkingPartDelta  → streamed to Discord as 🧠 blocks
+          - TextPartDelta      → intermediate turns sent as 💭, final reply suppressed
+          - FunctionToolCallEvent → tool call notifications + task_note forwarding
+          - FinalResultEvent   → marks the final answer (sent as Discord reply)
+
+        After the run, inject_queue is drained; if messages arrived mid-task they
+        are appended and a follow-up run is issued (zipper-merge).
         """
         self._task_count += 1
         start = asyncio.get_event_loop().time()
@@ -287,7 +297,7 @@ class AgentLoop:
         tier = forced_tier or _classify_tier(content)
         agent = self.agents.get(tier, self.agent)
 
-        # Preserve progress_callback and inject_queue across the Task rebuild
+        # Rebuild task with cleaned content
         task = Task(
             content=content,
             source=task.source,
@@ -351,228 +361,46 @@ class AgentLoop:
             parts.append(lessons_context)
         parts.append(task.content)
         base_prompt = "\n\n---\n\n".join(parts)
-        prompt = base_prompt
 
-        # Progress ticker
+        # Progress ticker — fires every PROGRESS_PING_INTERVAL if task is still running
         ticker: asyncio.Task | None = None  # type: ignore[type-arg]
         if task.progress_callback:
             ticker = asyncio.create_task(self._progress_ticker(task, start))
 
         try:
-            _context_retries = 0
-            _max_context_retries = 2
-            _rate_retries = 0
-            _max_rate_retries = 3
-            _rate_delay = 5.0
-
-            while True:  # outer retry loop for context overflow + rate limits
-                discord_replied = False
-                tool_calls = 0
-
-                try:
-                    async with agent.run_mcp_servers():
-                        async with agent.iter(prompt) as agent_run:
-                            node = agent_run.next_node
-
-                            while not Agent.is_end_node(node):
-
-                                # ── ModelRequestNode: stream reasoning to Discord ──
-                                if Agent.is_model_request_node(node):
-                                    async with node.stream(agent_run.ctx) as request_stream:
-                                        thinking_buf: list[str] = []
-                                        text_buf: list[str] = []
-                                        is_final = False
-                                        async for event in request_stream:
-                                            if isinstance(event, PartDeltaEvent):
-                                                if isinstance(event.delta, ThinkingPartDelta):
-                                                    thinking_buf.append(event.delta.content_delta)
-                                                elif isinstance(event.delta, TextPartDelta):
-                                                    text_buf.append(event.delta.content_delta)
-                                            elif isinstance(event, FinalResultEvent):
-                                                # Mark final *before* PartEndEvent so the flush
-                                                # below correctly suppresses the last text block
-                                                # (that block becomes the Discord reply).
-                                                is_final = True
-                                            elif isinstance(event, PartEndEvent):
-                                                # Flush completed thinking block immediately
-                                                if thinking_buf:
-                                                    _thinking = "".join(thinking_buf).strip()
-                                                    if _thinking:
-                                                        await self._send_progress(
-                                                            task, f"🧠 *{_thinking[:1800]}*"
-                                                        )
-                                                    thinking_buf = []
-                                                # Flush completed intermediate text turns.
-                                                # Skip the final answer — it's sent as the reply.
-                                                elif text_buf and not is_final:
-                                                    _text = "".join(text_buf).strip()
-                                                    if _text:
-                                                        await self._send_progress(
-                                                            task, f"💭 {_text[:1800]}"
-                                                        )
-                                                    text_buf = []
-
-                                # Drive the node forward
-                                next_node = await agent_run.next(node)
-
-                                # ── After CallToolsNode finishes: inspect results ──
-                                if Agent.is_call_tools_node(node):
-                                    tool_calls += 1
-
-                                    # Scan the model response parts for tool calls
-                                    # we care about (send_discord, task_note)
-                                    for part in getattr(node.model_response, "parts", []):
-                                        tool_name = getattr(part, "tool_name", None)
-                                        if tool_name == "send_discord":
-                                            discord_replied = True
-                                        elif tool_name == "task_note":
-                                            args = getattr(part, "args", {})
-                                            note = (
-                                                args.get("note", "")
-                                                if isinstance(args, dict)
-                                                else str(args)
-                                            )
-                                            if note:
-                                                # Strip JSON wrapper if agent passed a JSON string
-                                                import json as _json
-                                                try:
-                                                    parsed = _json.loads(note)
-                                                    if isinstance(parsed, dict):
-                                                        note = parsed.get("note", note)
-                                                    elif isinstance(parsed, str):
-                                                        note = parsed
-                                                except Exception:
-                                                    pass
-                                                await self._send_progress(
-                                                    task, f"📝 **Checkpoint:** {note[:400]}"
-                                                )
-
-                                    # Drain inject_queue and fold pending messages
-                                    # into the run's message history as a UserPromptPart
-                                    if task.inject_queue and not task.inject_queue.empty():
-                                        injected: list[str] = []
-                                        while not task.inject_queue.empty():
-                                            try:
-                                                injected.append(task.inject_queue.get_nowait())
-                                            except asyncio.QueueEmpty:
-                                                break
-
-                                        if injected:
-                                            combined = "\n".join(
-                                                f"[{i+1}] {m}" for i, m in enumerate(injected)
-                                            )
-                                            injection_text = (
-                                                f"\n\n---\n## New instructions received while working:\n"
-                                                f"{combined}\n"
-                                                f"Please incorporate these into your ongoing work."
-                                            )
-                                            log.info(
-                                                "messages_injected",
-                                                count=len(injected),
-                                                chars=len(injection_text),
-                                            )
-                                            await self._send_progress(
-                                                task,
-                                                f"💬 Got your message"
-                                                f"{' (×'+str(len(injected))+')' if len(injected) > 1 else ''}"
-                                                f" — incorporating into current work.",
-                                            )
-                                            # Append as a user-turn message so the model
-                                            # sees it on its next request
-                                            agent_run.ctx.state.message_history.append(
-                                                ModelRequest(parts=[
-                                                    UserPromptPart(content=injection_text)
-                                                ])
-                                            )
-
-                                node = next_node
-
-                            # Ran to End — grab result
-                            result_output = str(agent_run.result.output) if agent_run.result else ""
-                            break  # success, exit outer retry loop
-
-                except Exception as _exc:
-                    exc_str = str(_exc)
-                    is_context_overflow = (
-                        "prompt is too long" in exc_str
-                        or ("400" in exc_str and "maximum" in exc_str)
-                    )
-                    is_rate_limit = "429" in exc_str
-
-                    if is_context_overflow and _context_retries < _max_context_retries:
-                        _context_retries += 1
-                        log.warning(
-                            "context_overflow",
-                            context_retry=_context_retries,
-                            tier=tier,
-                        )
-                        await self._send_progress(
-                            task,
-                            f"📦 Context window full — compressing progress and continuing… "
-                            f"(attempt {_context_retries}/{_max_context_retries})",
-                        )
-                        summary = await self._summarize_context(task, prompt)
-                        try:
-                            journal = settings.workspace_path / ".task_journal.md"
-                            from datetime import datetime as _dt
-                            ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                            journal.parent.mkdir(parents=True, exist_ok=True)
-                            with journal.open("a", encoding="utf-8") as f:
-                                f.write(
-                                    f"\n### [{ts}] — CONTEXT COMPRESSED (retry {_context_retries})\n"
-                                    f"{summary}\n"
-                                )
-                        except Exception:
-                            pass
-                        prompt = (
-                            f"{base_prompt}\n\n"
-                            f"## Progress so far (summarized — context was compressed):\n{summary}"
-                        )
-                        continue  # retry outer loop with compressed prompt
-
-                    elif is_rate_limit and _rate_retries < _max_rate_retries:
-                        _rate_retries += 1
-                        log.warning(
-                            "rate_limit_retry",
-                            attempt=_rate_retries,
-                            wait_s=_rate_delay,
-                            tier=tier,
-                        )
-                        await self._send_progress(
-                            task, f"⏸️ Rate limited — retrying in {int(_rate_delay)}s…"
-                        )
-                        await asyncio.sleep(_rate_delay)
-                        _rate_delay *= 2
-                        continue  # retry outer loop
-
-                    else:
-                        raise
+            result_output = await self._run_with_streaming(
+                task=task,
+                agent=agent,
+                base_prompt=base_prompt,
+                tier=tier,
+            )
 
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
+            discord_replied = getattr(result_output, "_discord_replied", False)
+            tool_calls = getattr(result_output, "_tool_calls", 0)
+            output_str = result_output if isinstance(result_output, str) else str(result_output)
+
             log.info(
                 "task_done",
                 n=self._task_count,
                 tier=tier,
                 elapsed_ms=round(elapsed_ms),
-                output_len=len(result_output),
-                discord_replied=discord_replied,
-                tool_calls=tool_calls,
+                output_len=len(output_str),
             )
 
             self._success_count += 1
             return TaskResult(
                 task=task,
-                output=result_output,
-                discord_replied=discord_replied,
+                output=output_str,
+                discord_replied=False,
                 success=True,
                 elapsed_ms=elapsed_ms,
-                tool_calls=tool_calls,
+                tool_calls=0,
             )
 
         except Exception as exc:
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.error("task_failed", error=str(exc), exc=traceback.format_exc())
-
             await self._send_progress(task, f"❌ Task failed: {str(exc)[:200]}")
 
             if "429" in str(exc):
@@ -606,6 +434,185 @@ class AgentLoop:
                     await ticker
                 except asyncio.CancelledError:
                     pass
+
+    async def _run_with_streaming(
+        self,
+        task: Task,
+        agent: Agent,  # type: ignore[type-arg]
+        base_prompt: str,
+        tier: str,
+        message_history: list | None = None,
+    ) -> str:
+        """
+        Run the agent with full event streaming, returning the final output string.
+
+        Handles context overflow and rate-limit retries. After the run, drains
+        inject_queue and recursively issues a follow-up run if messages arrived.
+        """
+        import json as _json
+
+        prompt = base_prompt
+        _context_retries = 0
+        _max_context_retries = 2
+        _rate_retries = 0
+        _max_rate_retries = 3
+        _rate_delay = 5.0
+
+        while True:  # retry loop for context overflow and rate limits
+            discord_replied = False
+            tool_calls = 0
+            result_output = ""
+
+            try:
+                async with agent.run_mcp_servers():
+                    # Streaming: one flat event stream for the entire run
+                    thinking_buf: list[str] = []
+                    text_buf: list[str] = []
+                    is_final = False
+
+                    async for event in agent.run_stream_events(
+                        prompt,
+                        message_history=message_history or [],
+                    ):
+                        # ── Thinking delta — buffer until PartEndEvent ──────────
+                        if isinstance(event, PartDeltaEvent) and isinstance(
+                            event.delta, ThinkingPartDelta
+                        ):
+                            thinking_buf.append(event.delta.content_delta)
+
+                        # ── Text delta — buffer until PartEndEvent ──────────────
+                        elif isinstance(event, PartDeltaEvent) and isinstance(
+                            event.delta, TextPartDelta
+                        ):
+                            text_buf.append(event.delta.content_delta)
+
+                        # ── Final result marker — suppress last text block ───────
+                        elif isinstance(event, FinalResultEvent):
+                            is_final = True
+                            result_output = str(event.output) if hasattr(event, "output") else ""
+
+                        # ── Part ended — flush buffers ──────────────────────────
+                        elif isinstance(event, PartEndEvent):
+                            if thinking_buf:
+                                _thinking = "".join(thinking_buf).strip()
+                                thinking_buf = []
+                                if _thinking:
+                                    # Send each thinking block as its own message
+                                    await self._send_progress(task, f"🧠 *{_thinking[:1900]}*")
+                            elif text_buf:
+                                _text = "".join(text_buf).strip()
+                                text_buf = []
+                                if _text and not is_final:
+                                    # Intermediate reasoning turn — send as 💭
+                                    await self._send_progress(task, f"💭 {_text[:1900]}")
+                                # If is_final, this is the reply — discord_bot sends it
+
+                        # ── Tool call started ───────────────────────────────────
+                        elif isinstance(event, FunctionToolCallEvent):
+                            tool_name = event.part.tool_name
+                            tool_calls += 1
+                            if tool_name == "send_discord":
+                                discord_replied = True
+                            elif tool_name == "task_note":
+                                # Forward task_note to Discord immediately
+                                raw_args = event.part.args
+                                note = ""
+                                if isinstance(raw_args, dict):
+                                    note = raw_args.get("note", "")
+                                elif isinstance(raw_args, str):
+                                    try:
+                                        parsed = _json.loads(raw_args)
+                                        note = parsed.get("note", raw_args) if isinstance(parsed, dict) else raw_args
+                                    except Exception:
+                                        note = raw_args
+                                if note:
+                                    await self._send_progress(task, f"📝 **Checkpoint:** {note[:400]}")
+
+                # ── Drain inject_queue: zipper-merge ────────────────────────────
+                if task.inject_queue and not task.inject_queue.empty():
+                    injected: list[str] = []
+                    while not task.inject_queue.empty():
+                        try:
+                            injected.append(task.inject_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+
+                    if injected:
+                        count = len(injected)
+                        combined = "\n".join(f"[{i+1}] {m}" for i, m in enumerate(injected))
+                        injection_text = (
+                            f"## New message{'s' if count > 1 else ''} received while you were working:\n"
+                            f"{combined}\n\n"
+                            f"Please incorporate {'these' if count > 1 else 'this'} into your work "
+                            f"and continue."
+                        )
+                        log.info("messages_injected", count=count)
+                        await self._send_progress(
+                            task,
+                            f"💬 Got {'your messages' if count > 1 else 'your message'} — "
+                            f"{'folding them' if count > 1 else 'folding it'} in now.",
+                        )
+                        # Recursively run with the injected messages as the next prompt.
+                        # Pass current result as context so the model knows what was done.
+                        followup_prompt = injection_text
+                        followup_history = None  # run_stream_events builds history internally
+                        result_output = await self._run_with_streaming(
+                            task=task,
+                            agent=agent,
+                            base_prompt=followup_prompt,
+                            tier=tier,
+                            message_history=followup_history,
+                        )
+
+                return result_output
+
+            except Exception as _exc:
+                exc_str = str(_exc)
+                is_context_overflow = (
+                    "prompt is too long" in exc_str
+                    or ("400" in exc_str and "maximum" in exc_str)
+                )
+                is_rate_limit = "429" in exc_str
+
+                if is_context_overflow and _context_retries < _max_context_retries:
+                    _context_retries += 1
+                    log.warning("context_overflow", context_retry=_context_retries, tier=tier)
+                    await self._send_progress(
+                        task,
+                        f"📦 Context window full — compressing and continuing… "
+                        f"(attempt {_context_retries}/{_max_context_retries})",
+                    )
+                    summary = await self._summarize_context(task, prompt)
+                    try:
+                        journal = settings.workspace_path / ".task_journal.md"
+                        from datetime import datetime as _dt
+                        ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                        journal.parent.mkdir(parents=True, exist_ok=True)
+                        with journal.open("a", encoding="utf-8") as f:
+                            f.write(
+                                f"\n### [{ts}] — CONTEXT COMPRESSED (retry {_context_retries})\n"
+                                f"{summary}\n"
+                            )
+                    except Exception:
+                        pass
+                    prompt = (
+                        f"{base_prompt}\n\n"
+                        f"## Progress so far (summarized — context was compressed):\n{summary}"
+                    )
+                    continue
+
+                elif is_rate_limit and _rate_retries < _max_rate_retries:
+                    _rate_retries += 1
+                    log.warning("rate_limit_retry", attempt=_rate_retries, wait_s=_rate_delay)
+                    await self._send_progress(
+                        task, f"⏸️ Rate limited — retrying in {int(_rate_delay)}s…"
+                    )
+                    await asyncio.sleep(_rate_delay)
+                    _rate_delay *= 2
+                    continue
+
+                else:
+                    raise
 
     async def _reflect(self, task: Task, result: TaskResult) -> None:
         """
