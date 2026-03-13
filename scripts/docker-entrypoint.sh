@@ -47,5 +47,12 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
     export GH_TOKEN="${GITHUB_TOKEN}"
 fi
 
-# ── Start agent ────────────────────────────────────────────────────────────────
+# ── Patch identity files with runtime agent name ───────────────────────────────
+# IDENTITY.md uses ${AGENT_NAME} as a placeholder — substitute it now
+IDENTITY_FILE="/app/agent/identity/IDENTITY.md"
+if [[ -f "$IDENTITY_FILE" ]]; then
+    sed -i "s|\${AGENT_NAME}|${AGENT_NAME:-agent}|g" "$IDENTITY_FILE"
+fi
+
+
 exec python -m agent.main start "$@"

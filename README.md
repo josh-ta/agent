@@ -1,148 +1,152 @@
 # Agent Platform
 
-A fully autonomous, self-modifying AI agent that runs in Docker. Each agent has:
+A fully autonomous, self-modifying AI agent that runs in Docker. Give it a name, connect it to Discord, and chat with it. It can browse the web, run shell commands, write code, manage files, and improve itself over time.
 
-- Full shell + filesystem access
-- Browser automation (Playwright + noVNC for human observation)
-- Discord integration for agent-to-agent communication
-- SQLite local memory + optional PostgreSQL for multi-agent coordination
-- A skill system: agents learn and evolve by editing their own `.md` skill files
-- Self-modification: the agent can edit its own skills, identity, and code
+---
 
-## Quick Start
+## Deploy in 5 steps
 
-### 1. Prerequisites
+### 1. Create a VPS on Hetzner
 
-- Docker + Docker Compose
-- A Discord bot token ([create one here](https://discord.com/developers/applications))
-- An Anthropic API key
-
-### 2. Install on a VPS / server
+1. Go to [hetzner.com/cloud](https://www.hetzner.com/cloud) → **New Project** → **Add Server**
+2. Choose:
+   - **Location**: closest to you
+   - **Image**: Ubuntu 24.04
+   - **Type**: CX22 (2 vCPU, 4 GB RAM) or larger
+   - **SSH key**: add yours so you can log in
+3. Click **Create & Buy** — note the server's IP address
 
 ```bash
-git clone <this-repo> agent && cd agent
+ssh root@<your-server-ip>
+```
+
+---
+
+### 2. Create a Discord bot
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application** → name it after your agent (e.g. `bob`)
+2. Open **Bot** → enable all three **Privileged Gateway Intents** (especially **Message Content Intent**)
+3. Click **Reset Token** → copy it (your `DISCORD_BOT_TOKEN`)
+4. Copy your **Application ID** from General Information (your `CLIENT_ID`)
+5. Invite the bot to your server by opening this URL in a browser:
+   ```
+   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8515702525261888&scope=bot
+   ```
+
+**Create these channels in your Discord server:**
+
+| Channel | Purpose |
+|---|---|
+| `#<agent-name>` (e.g. `#bob`) | Chat directly with the agent |
+| `#agent-bus` | Broadcast channel — `@mention` the bot to get a response |
+| `#agent-comms` | Structured JSON messages between agents |
+
+**Get channel and server IDs:** In Discord → User Settings → Advanced → enable **Developer Mode**, then right-click any channel or server name → **Copy ID**.
+
+---
+
+### 3. Install
+
+On your server:
+
+```bash
+git clone https://github.com/josh-ta/agent.git bob && cd bob
 bash scripts/install.sh
 ```
 
-Or manually:
+The wizard will ask for:
+- Agent name
+- LLM provider (Anthropic or OpenAI) and API key
+- Discord bot token and channel IDs
+
+Everything is saved to `.env`. The wizard then builds and starts the containers automatically.
+
+---
+
+### 4. Talk to your agent
+
+Send a message in your agent's private Discord channel (e.g. `#bob`). The agent responds to every message there. In `#agent-bus` you must `@mention` it.
+
+Watch it work live at `http://<your-server-ip>:6080` (browser via noVNC).
+
+---
+
+### 5. Staying up to date
+
+If you want to pull template updates:
 
 ```bash
-cp .env.example .env
-# Edit .env with your keys
-docker compose up -d
+git remote add template https://github.com/josh-ta/agent.git
+git fetch template
+git merge template/main --allow-unrelated-histories  # first time only
+# subsequent updates:
+git fetch template && git merge template/main
+docker compose up --build -d
 ```
 
-### 3. Watch the agent in action
-
-Visit `http://<your-server>:6080` to see the live browser (noVNC).
-
-Check logs:
-```bash
-docker compose logs -f agent
-```
+---
 
 ## Configuration
 
-All configuration is in `.env`. Key variables:
+All settings live in `.env`. Re-run the wizard any time:
+
+```bash
+bash scripts/install.sh
+```
+
+Key variables:
 
 | Variable | Description |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude API key (required) |
-| `AGENT_NAME` | Unique name for this agent instance |
-| `DISCORD_BOT_TOKEN` | Discord bot token |
-| `DISCORD_AGENT_CHANNEL_ID` | Channel ID for this agent's private channel |
-| `DISCORD_BUS_CHANNEL_ID` | Shared `#agent-bus` channel for all agents |
-| `POSTGRES_URL` | Optional shared PostgreSQL for multi-agent coordination |
+| `AGENT_NAME` | Agent's name — used as Docker container name and identity |
+| `ANTHROPIC_API_KEY` | Claude API key |
+| `OPENAI_API_KEY` | OpenAI API key (alternative) |
+| `AGENT_MODEL` | Model string, e.g. `claude-sonnet-4-5` or `gpt-4o` |
+| `DISCORD_BOT_TOKEN` | Bot token from Discord Developer Portal |
+| `DISCORD_GUILD_ID` | Your Discord server ID |
+| `DISCORD_AGENT_CHANNEL_ID` | This agent's private channel ID |
+| `DISCORD_BUS_CHANNEL_ID` | `#agent-bus` channel ID |
+| `DISCORD_COMMS_CHANNEL_ID` | `#agent-comms` channel ID |
 
-## Discord Bot Setup
+---
 
-### 1. Create the bot
-
-1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application** → give it your agent's name
-2. Open **Bot** in the left sidebar → **Add Bot**
-3. Under **Privileged Gateway Intents**, enable all three:
-   - Presence Intent
-   - Server Members Intent
-   - **Message Content Intent** ← required to read messages
-4. Click **Reset Token** and copy it — this is your `DISCORD_BOT_TOKEN`
-
-### 2. Invite the bot to your server
-
-Replace `YOUR_CLIENT_ID` with the value from the **General Information** page:
-
-```
-https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8515702525261888&scope=bot
-```
-
-Open the URL in your browser, select your server, and authorize.
-
-### 3. Create the required channels
-
-In your Discord server, create:
-
-| Channel | Purpose | How to talk to the agent |
-|---|---|---|
-| `#<agent-name>` (e.g. `#bob`) | Private channel for this agent | Send any message — agent always responds |
-| `#agent-bus` | Broadcast visible to all agents | Must `@mention` the bot to get a response |
-| `#agent-comms` | Structured agent-to-agent JSON | Post raw JSON `{"from":"you","to":"bob","task":"..."}` |
-
-### 4. Get your IDs
-
-In Discord, go to **User Settings → Advanced** and enable **Developer Mode**, then:
-
-- Right-click your **server name** → Copy Server ID → `DISCORD_GUILD_ID`
-- Right-click `#<agent-name>` → Copy Channel ID → `DISCORD_AGENT_CHANNEL_ID`
-- Right-click `#agent-bus` → Copy Channel ID → `DISCORD_BUS_CHANNEL_ID`
-- Right-click `#agent-comms` → Copy Channel ID → `DISCORD_COMMS_CHANNEL_ID`
-
-### 5. Update .env and restart
+## Useful commands
 
 ```bash
-nano .env
-# Set DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, and the four channel IDs
-docker compose up -d
+docker compose logs -f agent        # live agent logs
+docker compose logs -f browser      # browser sidecar logs
+docker compose down                 # stop everything
+docker compose up --build -d        # rebuild and restart
 ```
 
-The agent will post an online announcement to `#agent-bus` on startup to confirm it connected.
+---
 
-## Skills
+## Multi-agent setup
 
-Skills live in `agent/skills/`. Each is a Markdown file describing a procedure the agent can follow. The agent can create and edit skills — changes persist across restarts since the directory is bind-mounted.
+Each agent runs on its own server. They share the same Discord server.
 
-To add a skill, create a `.md` file in `agent/skills/` and restart the agent (or the agent will pick it up on its next heartbeat).
+1. Clone and run `install.sh` on each server — give each a unique `AGENT_NAME`
+2. All agents share the same `DISCORD_BUS_CHANNEL_ID` and `DISCORD_COMMS_CHANNEL_ID`
+3. Each gets its own private Discord channel and `DISCORD_AGENT_CHANNEL_ID`
 
-## Multi-Agent Setup
-
-1. Clone this repo on each server/VPS
-2. Each gets a unique `AGENT_NAME` and `DISCORD_AGENT_CHANNEL_ID`
-3. All share the same `DISCORD_BUS_CHANNEL_ID` and `DISCORD_COMMS_CHANNEL_ID`
-4. Optionally share a single `POSTGRES_URL` for coordination
-
-Agents communicate by posting structured JSON to `#agent-comms`:
+Agents talk to each other by posting JSON in `#agent-comms`:
 ```json
-{"from": "agent-1", "to": "agent-2", "task": "research X", "payload": "..."}
+{"from": "bob", "to": "alice", "task": "research X and report back"}
 ```
+
+---
 
 ## Architecture
 
 ```
-Docker Host
-├── agent container        ← Python agent (Claude + tools)
-│   ├── Shell tool         ← run any command
-│   ├── Filesystem tool    ← read/write /workspace
-│   ├── Browser tool       ← Playwright via MCP
-│   ├── Discord tool       ← send/read messages
-│   └── Self-edit tool     ← modify own skills/identity
-├── browser container      ← Playwright MCP + noVNC :6080
-└── postgres container     ← optional, profile: postgres
+VPS (Docker host)
+├── agent container        ← Python + Claude (or GPT-4o)
+│   ├── shell tool         ← run commands
+│   ├── filesystem tool    ← read/write /workspace
+│   ├── browser tool       ← Playwright via MCP sidecar
+│   ├── discord tool       ← send/read Discord messages
+│   └── self-edit tool     ← update own skills and identity
+└── browser container      ← Playwright + noVNC (view at :6080)
 ```
 
-## Updating
-
-```bash
-bash scripts/update-agent.sh
-```
-
-## Self-modification
-
-The agent can edit its own `agent/skills/` and `agent/identity/` files at runtime. For code-level changes, it commits to git and triggers a container restart via the Docker socket.
+Skills live in `agent/skills/` as Markdown files. The agent can create and edit them — changes persist across restarts because the directory is bind-mounted from the host.
