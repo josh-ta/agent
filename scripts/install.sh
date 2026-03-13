@@ -43,21 +43,145 @@ fi
 info "Setting up environment..."
 cd "$ROOT_DIR"
 
+# Read a value for a .env variable interactively.
+# Usage: prompt_var VAR_NAME "Description" "default_value" secret
+#   secret=1  → input is hidden (for API keys/tokens)
+prompt_var() {
+    local var="$1"
+    local desc="$2"
+    local default="$3"
+    local secret="${4:-0}"
+
+    echo ""
+    echo -e "  ${CYAN}${var}${NC}"
+    echo -e "  ${desc}"
+    if [[ -n "$default" ]]; then
+        if [[ "$secret" == "1" ]]; then
+            echo -e "  Current/default: ${YELLOW}(set)${NC}"
+        else
+            echo -e "  Current/default: ${YELLOW}${default}${NC}"
+        fi
+        local prompt_str="  New value (Enter to keep): "
+    else
+        local prompt_str="  Value: "
+    fi
+
+    if [[ "$secret" == "1" ]]; then
+        read -rsp "$prompt_str" input
+        echo ""   # newline after hidden input
+    else
+        read -rp "$prompt_str" input
+    fi
+
+    # Use new value if provided, otherwise keep default
+    local value="${input:-$default}"
+
+    # Write/update the variable in .env
+    if grep -q "^${var}=" .env 2>/dev/null; then
+        # Replace existing line (macOS + Linux compatible)
+        sed -i.bak "s|^${var}=.*|${var}=${value}|" .env && rm -f .env.bak
+    else
+        echo "${var}=${value}" >> .env
+    fi
+}
+
+# Helper: read current value from .env (strips inline comments)
+current_val() {
+    local var="$1"
+    grep "^${var}=" .env 2>/dev/null \
+        | head -1 \
+        | sed "s/^${var}=//" \
+        | sed 's/[[:space:]]*#.*//' \
+        | tr -d '"' \
+        || true
+}
+
+configure_env() {
+    echo ""
+    echo -e "${CYAN}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│        Agent Configuration Wizard               │${NC}"
+    echo -e "${CYAN}│  Press Enter to accept defaults / current value │${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────┘${NC}"
+
+    # ── LLM ─────────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── LLM Provider ──────────────────────────────────────${NC}"
+
+    prompt_var "ANTHROPIC_API_KEY" \
+        "Anthropic Claude API key (required). Get one at https://console.anthropic.com" \
+        "$(current_val ANTHROPIC_API_KEY)" 1
+
+    prompt_var "AGENT_MODEL" \
+        "Model to use (e.g. claude-opus-4-5, claude-sonnet-4-5, gpt-4o)" \
+        "$(current_val AGENT_MODEL)"
+
+    prompt_var "OPENAI_API_KEY" \
+        "OpenAI API key (optional fallback model support)" \
+        "$(current_val OPENAI_API_KEY)" 1
+
+    # ── Agent Identity ───────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── Agent Identity ────────────────────────────────────${NC}"
+
+    prompt_var "AGENT_NAME" \
+        "Unique name for this agent instance (e.g. agent-1, researcher, coder)" \
+        "$(current_val AGENT_NAME)"
+
+    # ── Discord ──────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── Discord ───────────────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Enable Developer Mode in Discord → right-click any channel/server to copy IDs."
+
+    prompt_var "DISCORD_BOT_TOKEN" \
+        "Discord bot token. Create a bot at https://discord.com/developers/applications" \
+        "$(current_val DISCORD_BOT_TOKEN)" 1
+
+    prompt_var "DISCORD_GUILD_ID" \
+        "Your Discord server (guild) numeric ID" \
+        "$(current_val DISCORD_GUILD_ID)"
+
+    prompt_var "DISCORD_AGENT_CHANNEL_ID" \
+        "Channel ID for THIS agent's private channel (e.g. #agent-${AGENT_NAME:-1})" \
+        "$(current_val DISCORD_AGENT_CHANNEL_ID)"
+
+    prompt_var "DISCORD_BUS_CHANNEL_ID" \
+        "Channel ID for #agent-bus (shared broadcast channel, all agents)" \
+        "$(current_val DISCORD_BUS_CHANNEL_ID)"
+
+    prompt_var "DISCORD_COMMS_CHANNEL_ID" \
+        "Channel ID for #agent-comms (structured A2A JSON messages)" \
+        "$(current_val DISCORD_COMMS_CHANNEL_ID)"
+
+    # ── Databases ────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── Databases ─────────────────────────────────────────${NC}"
+
+    prompt_var "POSTGRES_URL" \
+        "Shared PostgreSQL URL for multi-agent coordination (optional, leave blank to skip)" \
+        "$(current_val POSTGRES_URL)"
+
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── Container ─────────────────────────────────────────${NC}"
+
+    prompt_var "AGENT_CONTAINER_NAME" \
+        "Docker container name for self-restart (should match AGENT_NAME)" \
+        "$(current_val AGENT_CONTAINER_NAME)"
+
+    echo ""
+    success "Configuration saved to .env"
+}
+
 if [[ ! -f .env ]]; then
     cp .env.example .env
-    warn ".env created from .env.example — PLEASE EDIT IT with your API keys!"
-    warn ""
-    warn "  Required:"
-    warn "    ANTHROPIC_API_KEY  — your Claude API key"
-    warn "    DISCORD_BOT_TOKEN  — your Discord bot token"
-    warn "    DISCORD_AGENT_CHANNEL_ID"
-    warn "    DISCORD_BUS_CHANNEL_ID"
-    warn ""
-    warn "Press Enter to open .env in nano, or Ctrl+C to edit manually later."
-    read -r
-    nano .env
+    configure_env
 else
-    info ".env already exists — skipping."
+    info ".env already exists."
+    echo -ne "  ${YELLOW}Reconfigure interactively?${NC} [y/N] "
+    read -r reconfigure
+    if [[ "${reconfigure,,}" == "y" ]]; then
+        configure_env
+    fi
 fi
 
 # ── 3. Set up git ──────────────────────────────────────────────────────────────
