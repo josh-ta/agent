@@ -127,6 +127,27 @@ class ToolRegistry:
                 await sqlite.save_memory_fact(content)
                 return f"Saved to memory: {content[:80]}"
 
+            @agent.tool_plain
+            async def lesson_save(summary: str, kind: str = "lesson") -> str:
+                """
+                Record a lesson, mistake, or insight so it is never forgotten.
+                kind: 'lesson' | 'mistake' | 'insight' | 'pattern'
+                Use 'mistake' when recording something that went wrong.
+                """
+                await sqlite.save_lesson(summary, kind=kind)
+                return f"Lesson recorded [{kind}]: {summary[:80]}"
+
+            @agent.tool_plain
+            async def lesson_search(query: str, limit: int = 5) -> str:
+                """Search past lessons and mistakes relevant to a topic."""
+                result = await sqlite.search_lessons(query, limit)
+                return result or f"(no lessons found for: {query})"
+
+            @agent.tool_plain
+            async def lessons_recent(limit: int = 10) -> str:
+                """Show the most recent lessons and mistakes."""
+                return await sqlite.get_recent_lessons(limit)
+
         # ── Postgres (multi-agent) ────────────────────────────────────────────
         if postgres:
             @agent.tool_plain

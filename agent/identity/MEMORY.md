@@ -1,19 +1,28 @@
 # Memory
 
-_This file is updated by the agent to record long-term insights, preferences, and learned facts._
+_This file is maintained by the agent. It is rewritten periodically to reflect current knowledge, lessons, and preferences. The agent appends mistakes and insights here automatically._
 
-## Setup Notes
+## Setup
 
-- First deployed: (update when first run)
-- Operator contact: (update with Discord username)
-- Workspace location: `/workspace`
-
-## Learned Facts
-
-_(The agent appends facts here over time)_
+- First deployed: (agent updates this on first run)
+- Operator contact: (agent updates with Discord username of owner)
+- Workspace: `/workspace`
+- Skills directory: `/app/agent/skills`
 
 ## Preferences
 
 - Preferred shell: `/bin/bash`
-- Text editor tool: `write_file` (always read before writing)
-- Commit style: conventional commits (`type: description`)
+- Always read a file before writing it
+- Commit style: conventional commits (`type(scope): description`)
+- Test Python files with `python -m py_compile <file>` before committing
+
+## Known Environment Details
+
+- Docker container name matches `AGENT_NAME` env var
+- SSH key for GitHub is at `/tmp/agent_ssh/agent_ed25519` (mounted from host `.ssh/`)
+- noVNC browser viewer available at port 6080
+- Playwright MCP server at `http://browser:3080`
+
+## Recent Lessons
+
+_(Automatically populated by the agent after each task cycle)_

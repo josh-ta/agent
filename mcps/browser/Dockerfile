@@ -24,9 +24,7 @@ RUN chmod +x /start.sh
 
 EXPOSE 3080 5900 6080
 
-HEALTHCHECK --interval=15s --timeout=10s --start-period=60s --retries=8 \
-    CMD curl -sf http://localhost:3080/health || \
-        curl -sf http://localhost:3080/ || \
-        bash -c 'echo > /dev/tcp/localhost/3080' 2>/dev/null || exit 1
+HEALTHCHECK --interval=20s --timeout=5s --start-period=90s --retries=6 \
+    CMD python3 -c "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost',3080)); s.close()" || exit 1
 
 CMD ["/start.sh"]

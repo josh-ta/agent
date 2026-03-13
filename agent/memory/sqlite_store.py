@@ -76,6 +76,32 @@ CREATE TRIGGER IF NOT EXISTS memory_facts_au AFTER UPDATE ON memory_facts BEGIN
     VALUES ('delete', old.id, old.content);
     INSERT INTO memory_fts(rowid, content) VALUES (new.id, new.content);
 END;
+
+-- Lessons learned from failures and observations
+CREATE TABLE IF NOT EXISTS lessons (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL DEFAULT 'lesson',  -- lesson|mistake|insight|pattern
+    summary     TEXT NOT NULL,
+    context     TEXT DEFAULT '',                 -- what triggered it
+    applied     INTEGER NOT NULL DEFAULT 0,      -- how many times retrieved/used
+    ts          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lessons_ts ON lessons (ts DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS lessons_fts USING fts5(
+    summary,
+    context,
+    content='lessons',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS lessons_ai AFTER INSERT ON lessons BEGIN
+    INSERT INTO lessons_fts(rowid, summary, context) VALUES (new.id, new.summary, new.context);
+END;
+CREATE TRIGGER IF NOT EXISTS lessons_ad AFTER DELETE ON lessons BEGIN
+    INSERT INTO lessons_fts(lessons_fts, rowid, summary, context)
+    VALUES ('delete', old.id, old.summary, old.context);
+END;
 """
 
 PRAGMAS = """
@@ -206,6 +232,84 @@ class SQLiteStore:
             ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
             lines.append(f"[{ts_str}] {row['content']}")
         return "\n".join(lines)
+
+    # ── Lessons ───────────────────────────────────────────────────────────────
+
+    async def save_lesson(
+        self,
+        summary: str,
+        kind: str = "lesson",
+        context: str = "",
+    ) -> int:
+        """Record a lesson, mistake, or insight for future reference."""
+        assert self._db
+        cur = await self._db.execute(
+            "INSERT INTO lessons (kind, summary, context, ts) VALUES (?,?,?,?)",
+            (kind, summary, context, time.time()),
+        )
+        await self._db.commit()
+        return cur.lastrowid or 0
+
+    async def search_lessons(self, query: str, limit: int = 5) -> str:
+        """Search lessons relevant to a query — surfaced before each task."""
+        assert self._db
+        safe_query = query.replace('"', '""')
+        try:
+            async with self._db.execute(
+                """SELECT l.kind, l.summary, l.ts
+                   FROM lessons_fts
+                   JOIN lessons l ON lessons_fts.rowid = l.id
+                   WHERE lessons_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (f'"{safe_query}"', limit),
+            ) as cur:
+                rows = await cur.fetchall()
+        except Exception:
+            async with self._db.execute(
+                "SELECT kind, summary, ts FROM lessons WHERE summary LIKE ? ORDER BY ts DESC LIMIT ?",
+                (f"%{query}%", limit),
+            ) as cur:
+                rows = await cur.fetchall()
+
+        if not rows:
+            return ""
+
+        import datetime
+        lines = ["## Relevant past lessons:"]
+        for row in rows:
+            ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
+            lines.append(f"- [{row['kind'].upper()} {ts_str}] {row['summary']}")
+        return "\n".join(lines)
+
+    async def get_recent_lessons(self, limit: int = 20) -> str:
+        """Return the most recent lessons for MEMORY.md updates."""
+        assert self._db
+        async with self._db.execute(
+            "SELECT kind, summary, ts FROM lessons ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        if not rows:
+            return "(no lessons recorded yet)"
+
+        import datetime
+        lines = []
+        for row in rows:
+            ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
+            lines.append(f"- [{row['kind'].upper()} {ts_str}] {row['summary']}")
+        return "\n".join(lines)
+
+    async def get_failed_tasks(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Return recent failed tasks for post-task reflection."""
+        assert self._db
+        async with self._db.execute(
+            "SELECT content, result, ts FROM tasks WHERE success=0 ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
