@@ -20,19 +20,25 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 
-def _load_skills(skills_path: Path) -> str:
-    """Load all .md skill files and return them as a combined system prompt section."""
+def _load_skills_compact(skills_path: Path) -> str:
+    """Return a compact skill index — just names and one-line descriptions."""
     if not skills_path.exists():
         return ""
 
-    parts: list[str] = ["## Available Skills\n"]
+    lines = ["## Skills (use read_skill <name> to load full content)"]
     for skill_file in sorted(skills_path.glob("*.md")):
         if skill_file.name.startswith("_"):
             continue
-        content = skill_file.read_text(encoding="utf-8").strip()
-        parts.append(f"### Skill: {skill_file.stem}\n{content}\n")
+        # Grab first non-empty, non-heading line as description
+        desc = ""
+        for line in skill_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                desc = line[:80]
+                break
+        lines.append(f"- **{skill_file.stem}**: {desc}")
 
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
 def _load_identity(identity_path: Path) -> str:
@@ -50,68 +56,63 @@ def _load_identity(identity_path: Path) -> str:
 
 
 def build_system_prompt() -> str:
-    """Compose the full system prompt from identity + skills."""
+    """Compose a compact system prompt from identity + skill index."""
     identity = _load_identity(settings.identity_path)
-    skills = _load_skills(settings.skills_path)
+    skills = _load_skills_compact(settings.skills_path)
 
-    base = f"""You are {settings.agent_name}, an autonomous AI agent running in a Docker container.
+    base = f"""You are {settings.agent_name}, an autonomous AI agent.
 
 {identity}
 
-## Capabilities
-You have access to the following tools:
-- **shell**: Execute any shell command on the host system
-- **read_file** / **write_file** / **list_dir**: Read and write files in your workspace
-- **browser**: Control a real browser (navigate, click, fill forms, screenshot)
-- **discord_send**: Send messages to Discord channels
-- **discord_read**: Read recent messages from a Discord channel
-- **edit_skill**: Create or update a skill file (self-improvement)
-- **edit_identity**: Update your IDENTITY.md, GOALS.md, or MEMORY.md
-- **self_restart**: Restart your own container after code-level changes
+## Tools
+shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, discord_send, discord_read, edit_skill, edit_identity, self_restart, memory_save, lesson_search, read_skill
 
-## Behaviour Guidelines
-1. Think step by step before acting.
-2. Use the shell for any system tasks; prefer small, safe commands.
-3. Always read a file before writing it.
-4. **Learn from every task**: after failures, call `lesson_save` with kind='mistake' and explain what to do differently. After successes, save any reusable insight.
-5. **Before starting a complex task**, call `lesson_search` with relevant keywords to check if you've encountered this before.
-6. Record significant learnings in MEMORY.md and update skills when procedures are wrong.
-7. Communicate clearly in Discord: mention @agent-name when addressing a specific agent.
-8. When given a task, break it into steps and execute them sequentially.
-9. If unsure, ask the user via Discord rather than guessing.
-10. You are expected to improve over time — each mistake should only happen once.
+## Rules
+1. Think before acting. Use shell for system tasks.
+2. Read files before writing. Ask if unsure.
+3. After failures: call lesson_save(kind="mistake"). Before complex tasks: call lesson_search.
+4. Use read_skill <name> to load a skill's full procedure before following it.
+5. Each mistake happens only once — record it and move on.
 
 {skills}
 """
     return base.strip()
 
 
-def create_agent(registry: "ToolRegistry") -> Agent:  # type: ignore[type-arg]
-    """Create and return the configured Pydantic AI agent."""
+def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type: ignore[type-arg]
+    """Create a single agent for the given model string."""
     mcp_servers = []
-
-    # Browser MCP sidecar
     if settings.browser_mcp_url:
         try:
             mcp_servers.append(MCPServerHTTP(url=settings.browser_mcp_url))
-            log.info("browser_mcp_registered", url=settings.browser_mcp_url)
         except Exception as exc:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
     agent: Agent = Agent(  # type: ignore[type-arg]
-        model=settings.model_string,
+        model=model_string,
         system_prompt=build_system_prompt(),
         mcp_servers=mcp_servers,
-        retries=3,
+        retries=2,
     )
-
-    # Register all tools from the registry
     registry.attach_to_agent(agent)
-
-    log.info(
-        "agent_created",
-        name=settings.agent_name,
-        model=settings.model_string,
-        mcp_count=len(mcp_servers),
-    )
     return agent
+
+
+def create_agents(registry: "ToolRegistry") -> dict[str, "Agent"]:  # type: ignore[type-arg]
+    """Create fast/smart/best agent tiers, reusing the same MCP + tool registry."""
+    tiers = {
+        "fast": settings.model_string_for("fast"),
+        "smart": settings.model_string_for("smart"),
+        "best": settings.model_string_for("best"),
+    }
+
+    # Deduplicate — if tiers point to the same model, share the Agent instance
+    seen: dict[str, Agent] = {}  # type: ignore[type-arg]
+    agents: dict[str, Agent] = {}  # type: ignore[type-arg]
+    for tier, model_str in tiers.items():
+        if model_str not in seen:
+            seen[model_str] = create_agent(registry, model_str)
+            log.info("agent_created", tier=tier, model=model_str)
+        agents[tier] = seen[model_str]
+
+    return agents

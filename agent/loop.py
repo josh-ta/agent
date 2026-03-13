@@ -10,11 +10,24 @@ After every task the agent runs a brief reflection pass:
   - On failure: diagnoses what went wrong, saves a lesson, updates MEMORY.md
   - On success with tool calls: extracts any reusable insight
   - Periodically: rewrites MEMORY.md with latest lessons summary
+
+Model routing
+-------------
+Tasks are classified into three tiers before execution:
+  fast  → haiku   (simple Q&A, greetings, status checks)
+  smart → sonnet  (code, research, multi-step tasks)
+  best  → opus    (architecture, complex reasoning, long tasks)
+
+Users can override per-message with a prefix:
+  /fast  <task>   force haiku
+  /smart <task>   force sonnet
+  /best  <task>   force opus
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,10 +38,55 @@ from pydantic_ai import Agent
 
 from agent.config import settings
 
-log = structlog.get_logger()
 
-# Reflect on MEMORY.md every N successful tasks
-MEMORY_UPDATE_INTERVAL = 10
+# ── Model routing ──────────────────────────────────────────────────────────────
+
+# User override prefixes (case-insensitive)
+_OVERRIDE_RE = re.compile(r"^/(fast|smart|best)\s+", re.IGNORECASE)
+
+# Keywords that signal a complex task needing a smarter model
+_BEST_KEYWORDS = re.compile(
+    r"\b(architect|design|refactor|review|audit|security|"
+    r"production|deploy|pipeline|ci/cd|complex|analysis|"
+    r"deep\s+dive|explain\s+why|compare\s+tradeoffs)\b",
+    re.IGNORECASE,
+)
+_SMART_KEYWORDS = re.compile(
+    r"\b(code|implement|write|create|fix|debug|test|pr|"
+    r"pull\s+request|commit|clone|install|setup|configure|"
+    r"research|summarize|search|find|build|run|script|sql)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_override(content: str) -> tuple[str, str | None]:
+    """
+    Strip a /fast|/smart|/best prefix from the message.
+    Returns (cleaned_content, tier_override | None).
+    """
+    m = _OVERRIDE_RE.match(content)
+    if m:
+        tier = m.group(1).lower()
+        return content[m.end():].strip(), tier
+    return content, None
+
+
+def _classify_tier(content: str) -> str:
+    """
+    Classify task complexity into fast | smart | best.
+    Simple heuristic based on length and keyword matching.
+    """
+    words = len(content.split())
+    if words < 8 and not _SMART_KEYWORDS.search(content):
+        return "fast"
+    if _BEST_KEYWORDS.search(content):
+        return "best"
+    if _SMART_KEYWORDS.search(content) or words > 40:
+        return "smart"
+    return "fast"
+
+
+
 
 
 @dataclass
@@ -57,10 +115,15 @@ class AgentLoop:
     """
     Async loop that processes tasks using the Pydantic AI agent.
     Maintains conversation history per Discord channel (or context window).
+    Dynamically routes each task to the appropriate model tier.
     """
 
-    def __init__(self, agent: Agent, memory_store: Any = None) -> None:  # type: ignore[type-arg]
-        self.agent = agent
+    def __init__(self, agents: dict[str, Agent], memory_store: Any = None) -> None:  # type: ignore[type-arg]
+        # agents dict: {"fast": Agent, "smart": Agent, "best": Agent}
+        self.agents = agents
+        # Fallback: if only one agent passed (legacy), use it for all tiers
+        if isinstance(agents, Agent):  # type: ignore[arg-type]
+            self.agents = {"fast": agents, "smart": agents, "best": agents}
         self.memory = memory_store
         self.queue: asyncio.Queue[Task] = asyncio.Queue()
         self._running = False
@@ -68,6 +131,11 @@ class AgentLoop:
         self._success_count = 0
         # Per-channel message history for multi-turn conversations
         self._histories: dict[int, list[Any]] = {}
+
+    @property
+    def agent(self) -> Agent:  # type: ignore[type-arg]
+        """Default agent (smart tier) — used by reflection passes."""
+        return self.agents.get("smart") or next(iter(self.agents.values()))
 
     async def enqueue(self, task: Task) -> None:
         """Add a task to the processing queue."""
@@ -115,9 +183,26 @@ class AgentLoop:
         self._task_count += 1
         start = asyncio.get_event_loop().time()
 
+        # Parse user model override (/fast, /smart, /best) and classify tier
+        content, forced_tier = _parse_override(task.content)
+        tier = forced_tier or _classify_tier(content)
+        agent = self.agents.get(tier, self.agent)
+        # Update task content if prefix was stripped
+        task = Task(
+            content=content,
+            source=task.source,
+            author=task.author,
+            channel_id=task.channel_id,
+            message_id=task.message_id,
+            metadata=task.metadata,
+            created_at=task.created_at,
+        )
+
         log.info(
             "task_start",
             n=self._task_count,
+            tier=tier,
+            forced=forced_tier is not None,
             source=task.source,
             author=task.author,
             content=task.content[:120],
@@ -138,8 +223,8 @@ class AgentLoop:
         try:
             history = self._histories.get(task.channel_id, [])
 
-            async with self.agent.run_mcp_servers():
-                result = await self.agent.run(
+            async with agent.run_mcp_servers():
+                result = await agent.run(
                     prompt,
                     message_history=history if history else None,
                 )
@@ -154,6 +239,7 @@ class AgentLoop:
             log.info(
                 "task_done",
                 n=self._task_count,
+                tier=tier,
                 elapsed_ms=round(elapsed_ms),
                 output_len=len(output),
             )

@@ -52,11 +52,11 @@ async def _start() -> None:
     from agent.memory.sqlite_store import SQLiteStore
     from agent.memory.postgres_store import PostgresStore
     from agent.tools.registry import ToolRegistry
-    from agent.core import create_agent
+    from agent.core import create_agents
     from agent.loop import AgentLoop
     from agent.communication.discord_bot import DiscordBot
 
-    log.info("agent_starting", name=settings.agent_name, model=settings.model_string)
+    log.info("agent_starting", name=settings.agent_name, model=settings.agent_model)
 
     # Memory
     sqlite = SQLiteStore(settings.sqlite_path)
@@ -68,12 +68,12 @@ async def _start() -> None:
         await postgres.init()
         await postgres.register_agent()
 
-    # Tools + Agent
+    # Tools + Agents (one per model tier)
     registry = ToolRegistry()
     registry.register_all(sqlite, postgres)
 
-    agent = create_agent(registry)
-    loop = AgentLoop(agent, memory_store=sqlite)
+    agents = create_agents(registry)
+    loop = AgentLoop(agents, memory_store=sqlite)
 
     if settings.has_discord:
         bot = DiscordBot(loop)
@@ -90,7 +90,7 @@ async def _start() -> None:
 async def _run_once(task: str) -> None:
     from agent.memory.sqlite_store import SQLiteStore
     from agent.tools.registry import ToolRegistry
-    from agent.core import create_agent
+    from agent.core import create_agents
     from agent.loop import AgentLoop
 
     sqlite = SQLiteStore(settings.sqlite_path)
@@ -99,8 +99,8 @@ async def _run_once(task: str) -> None:
     registry = ToolRegistry()
     registry.register_all(sqlite, None)
 
-    agent = create_agent(registry)
-    loop = AgentLoop(agent, memory_store=sqlite)
+    agents = create_agents(registry)
+    loop = AgentLoop(agents, memory_store=sqlite)
 
     result = await loop.run_once(task)
     print(result.output)

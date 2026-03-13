@@ -18,7 +18,11 @@ class Settings(BaseSettings):
     # ── LLM ───────────────────────────────────────────────────────────────────
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    agent_model: str = Field(default="claude-opus-4-5", alias="AGENT_MODEL")
+    agent_model: str = Field(default="claude-haiku-4-5", alias="AGENT_MODEL")
+    # Model tiers for dynamic routing (override with env vars)
+    model_fast: str = Field(default="claude-haiku-4-5", alias="MODEL_FAST")
+    model_smart: str = Field(default="claude-sonnet-4-5", alias="MODEL_SMART")
+    model_best: str = Field(default="claude-opus-4-5", alias="MODEL_BEST")
 
     # ── Identity ──────────────────────────────────────────────────────────────
     agent_name: str = Field(default="agent-1", alias="AGENT_NAME")
@@ -61,12 +65,20 @@ class Settings(BaseSettings):
 
     @property
     def model_string(self) -> str:
-        """Return the pydantic-ai model string."""
-        if self.agent_model.startswith("claude"):
-            return f"anthropic:{self.agent_model}"
-        if self.agent_model.startswith("gpt") or self.agent_model.startswith("o"):
-            return f"openai:{self.agent_model}"
-        return self.agent_model
+        """Return the pydantic-ai model string for the default model."""
+        return self._to_model_string(self.agent_model)
+
+    def _to_model_string(self, model: str) -> str:
+        if model.startswith("claude"):
+            return f"anthropic:{model}"
+        if model.startswith("gpt") or model.startswith("o"):
+            return f"openai:{model}"
+        return model
+
+    def model_string_for(self, tier: str) -> str:
+        """Return pydantic-ai model string for a named tier: fast | smart | best."""
+        tier_map = {"fast": self.model_fast, "smart": self.model_smart, "best": self.model_best}
+        return self._to_model_string(tier_map.get(tier, self.agent_model))
 
     @property
     def has_discord(self) -> bool:
