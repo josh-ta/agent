@@ -10,12 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright MCP server
+# Install MCP server dependencies
 # --ignore-installed needed because Ubuntu Noble's apt-installed packages
 # have no pip RECORD file and block normal upgrades
 RUN pip install --no-cache-dir --break-system-packages --ignore-installed \
-    "mcp[cli]" "uvicorn" "starlette" 2>/dev/null || \
-    pip install --no-cache-dir --break-system-packages --ignore-installed "mcp[cli]" "uvicorn" "starlette"
+    "mcp[cli]" "uvicorn[standard]" "starlette" \
+    && python -c "import uvicorn, starlette, mcp; print('deps ok')"
 
 # Startup script + fallback MCP bridge
 COPY start.sh /start.sh

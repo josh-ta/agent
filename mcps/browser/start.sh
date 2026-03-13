@@ -39,7 +39,16 @@ websockify \
     &
 
 echo "[browser] Starting MCP HTTP bridge on port ${MCP_PORT}"
-python /mcp_bridge.py "${MCP_PORT}" &
+python /mcp_bridge.py "${MCP_PORT}" 2>&1 &
+MCP_PID=$!
+
+# Give the bridge a moment to start and verify it bound the port
+sleep 3
+if ! kill -0 $MCP_PID 2>/dev/null; then
+    echo "[browser] ERROR: mcp_bridge.py exited immediately — check logs above"
+else
+    echo "[browser] MCP bridge running (pid=$MCP_PID)"
+fi
 
 echo "[browser] All services started. VNC=${VNC_PORT} noVNC=${NOVNC_PORT} MCP=${MCP_PORT}"
 
