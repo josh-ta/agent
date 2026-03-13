@@ -234,21 +234,13 @@ class AgentLoop:
         Sleeps first, then fires — so the first ping only appears if the task is genuinely slow.
         start is the asyncio loop time when the task began, used to compute real elapsed time.
         """
-        ping_num = 0
         while True:
             await asyncio.sleep(PROGRESS_PING_INTERVAL)
-            ping_num += 1
             elapsed_s = asyncio.get_event_loop().time() - start
             mins = int(elapsed_s // 60)
             secs = int(elapsed_s % 60)
             time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            messages = [
-                f"⏳ Still running ({time_str})…",
-                f"⏳ Still working ({time_str})… model is thinking or waiting on a tool.",
-                f"⏳ Long task in progress ({time_str})… will reply when done.",
-            ]
-            msg = messages[min(ping_num - 1, len(messages) - 1)]
-            await self._send_progress(task, msg)
+            await self._send_progress(task, f"⏳ Still working… ({time_str} elapsed)")
 
     async def _summarize_context(self, task: Task, accumulated_prompt: str) -> str:
         """
@@ -396,26 +388,29 @@ class AgentLoop:
                                                     thinking_buf.append(event.delta.content_delta)
                                                 elif isinstance(event.delta, TextPartDelta):
                                                     text_buf.append(event.delta.content_delta)
+                                            elif isinstance(event, FinalResultEvent):
+                                                # Mark final *before* PartEndEvent so the flush
+                                                # below correctly suppresses the last text block
+                                                # (that block becomes the Discord reply).
+                                                is_final = True
                                             elif isinstance(event, PartEndEvent):
                                                 # Flush completed thinking block immediately
                                                 if thinking_buf:
-                                                    content = "".join(thinking_buf).strip()
-                                                    if content:
+                                                    _thinking = "".join(thinking_buf).strip()
+                                                    if _thinking:
                                                         await self._send_progress(
-                                                            task, f"🧠 *{content[:1800]}*"
+                                                            task, f"🧠 *{_thinking[:1800]}*"
                                                         )
                                                     thinking_buf = []
-                                                # Flush completed text turn if it's not the
-                                                # final answer (final answer is sent as reply)
+                                                # Flush completed intermediate text turns.
+                                                # Skip the final answer — it's sent as the reply.
                                                 elif text_buf and not is_final:
-                                                    content = "".join(text_buf).strip()
-                                                    if content:
+                                                    _text = "".join(text_buf).strip()
+                                                    if _text:
                                                         await self._send_progress(
-                                                            task, f"💭 {content[:1800]}"
+                                                            task, f"💭 {_text[:1800]}"
                                                         )
                                                     text_buf = []
-                                            elif isinstance(event, FinalResultEvent):
-                                                is_final = True
 
                                 # Drive the node forward
                                 next_node = await agent_run.next(node)
@@ -438,8 +433,18 @@ class AgentLoop:
                                                 else str(args)
                                             )
                                             if note:
+                                                # Strip JSON wrapper if agent passed a JSON string
+                                                import json as _json
+                                                try:
+                                                    parsed = _json.loads(note)
+                                                    if isinstance(parsed, dict):
+                                                        note = parsed.get("note", note)
+                                                    elif isinstance(parsed, str):
+                                                        note = parsed
+                                                except Exception:
+                                                    pass
                                                 await self._send_progress(
-                                                    task, f"📝 **Checkpoint:** {note[:300]}"
+                                                    task, f"📝 **Checkpoint:** {note[:400]}"
                                                 )
 
                                     # Drain inject_queue and fold pending messages

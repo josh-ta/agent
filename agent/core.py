@@ -94,7 +94,8 @@ shell, read_file, write_file, list_dir, browser_navigate/screenshot/click/type, 
 For any task with more than ~5 tool calls, use the task journal to avoid losing work:
 - Call task_resume() FIRST — check if this task was previously attempted.
 - Call task_note(note) after EVERY significant step: what you did, what you found, what comes next.
-- Write notes as if explaining to yourself after an interruption: "Checked CI run 23057002906. Jobs: backend=failed, security=failed. Root cause: PYTHONPATH missing. Fixed ci-cd.yml line 186. Next: fix security-scan permissions."
+- Write notes in plain English, NOT JSON. Example: "Checked CI run 23057002906. Backend and security jobs failed — root cause is PYTHONPATH missing in ci-cd.yml line 186. Fixed that. Next: fix security-scan permissions."
+- NEVER pass a JSON object or dict as the note — just write a sentence or two.
 - Call task_journal_clear() only after the task is fully and successfully complete.
 - If you hit a rate limit or error mid-task, your next run should start with task_resume() to pick up from the last note.
 
