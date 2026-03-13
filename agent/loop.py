@@ -265,13 +265,9 @@ class AgentLoop:
         parts.append(task.content)
         prompt = "\n\n---\n\n".join(parts)
 
-        # Hard timeout: long enough for real work (e.g. cloning + building) but short
-        # enough to prevent infinite loops or waiting on interactive stdin.
-        TASK_TIMEOUT = 600  # 10 minutes
-
         try:
             async with agent.run_mcp_servers():
-                result = await asyncio.wait_for(agent.run(prompt), timeout=TASK_TIMEOUT)
+                result = await agent.run(prompt)
 
             output = str(result.output)
 
@@ -310,15 +306,6 @@ class AgentLoop:
                 tool_calls=tool_calls,
             )
 
-        except asyncio.TimeoutError:
-            elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
-            log.error("task_timeout", elapsed_ms=round(elapsed_ms))
-            return TaskResult(
-                task=task,
-                output="Task timed out after 10 minutes. Please break this into smaller steps.",
-                success=False,
-                elapsed_ms=elapsed_ms,
-            )
         except Exception as exc:
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             log.error("task_failed", error=str(exc), exc=traceback.format_exc())

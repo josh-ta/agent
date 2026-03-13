@@ -4,8 +4,9 @@ Shell tool: run arbitrary commands on the host system.
 Security notes:
 - Commands run as the container user (non-root by default)
 - Working directory defaults to WORKSPACE_PATH
-- Output is capped at 8 KB to avoid flooding the context window
-- Timeout defaults to 30 s; agent can override per call
+- Output is capped at 2 KB to avoid flooding the context window; use read_file for large files
+- Timeout defaults to 120 s; agent can pass a higher value for long-running commands
+  (e.g. timeout=3600 for docker build, npm install, etc.) — there is no upper limit
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ MAX_OUTPUT_BYTES = 2 * 1024  # 2 KB — use read_file for large files, not cat
 async def shell_run(
     command: str,
     working_dir: str | None = None,
-    timeout: int = 30,
+    timeout: int = 120,
 ) -> str:
     """
     Execute a shell command and return combined stdout + stderr.
@@ -34,7 +35,9 @@ async def shell_run(
     Args:
         command: The shell command to run (passed to bash -c).
         working_dir: Directory to run in. Defaults to /workspace.
-        timeout: Max seconds to wait. Defaults to 30.
+        timeout: Max seconds to wait. Defaults to 120. Pass a higher value
+                 for long-running commands (docker build, npm install, etc.).
+                 There is no upper limit — the agent controls this.
 
     Returns:
         Combined output string with exit code appended.
