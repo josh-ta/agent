@@ -44,6 +44,13 @@ services:
       - NOVNC_PORT=6080
       - MCP_PORT=3080
       - PROXY_URL=${PROXY_URL:-}
+      - PROXY_SERVER=${PROXY_SERVER:-}
+      - PROXY_USERNAME=${PROXY_USERNAME:-}
+      - PROXY_PASSWORD=${PROXY_PASSWORD:-}
+      - BROWSER_LOCALE=${BROWSER_LOCALE:-en-US}
+      - BROWSER_TIMEZONE=${BROWSER_TIMEZONE:-America/New_York}
+      - BROWSER_GEO_LAT=${BROWSER_GEO_LAT:-40.7128}
+      - BROWSER_GEO_LON=${BROWSER_GEO_LON:--74.0060}
     ports:
       - "6080:6080"   # noVNC web viewer (human observation)
       - "5900:5900"   # Raw VNC

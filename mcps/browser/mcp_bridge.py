@@ -46,17 +46,48 @@ from playwright.async_api import async_playwright
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3080
 
-# Optional proxy — set PROXY_URL env var to route all browser traffic through it.
-# Format: http://user:pass@host:port  or  socks5://user:pass@host:port
+# ── Proxy + browser identity config ───────────────────────────────────────────
 import os as _os
-_PROXY_URL = _os.environ.get("PROXY_URL", "").strip()
-_PROXY_SETTINGS: dict | None = {"server": _PROXY_URL} if _PROXY_URL else None
+
+_PROXY_URL     = _os.environ.get("PROXY_URL", "").strip()
+_PROXY_SERVER  = _os.environ.get("PROXY_SERVER", "").strip()   # host:port (alt form)
+_PROXY_USER    = _os.environ.get("PROXY_USERNAME", "").strip()
+_PROXY_PASS    = _os.environ.get("PROXY_PASSWORD", "").strip()
+
+# Build Playwright proxy dict.  Supports two forms:
+#   PROXY_URL=http://user:pass@host:port   (single env var, parsed by Playwright)
+#   PROXY_SERVER=host:port + PROXY_USERNAME + PROXY_PASSWORD  (split form)
+_PROXY_SETTINGS: dict | None = None
+if _PROXY_URL:
+    _PROXY_SETTINGS = {"server": _PROXY_URL}
+elif _PROXY_SERVER:
+    _PROXY_SETTINGS = {"server": _PROXY_SERVER}
+    if _PROXY_USER:
+        _PROXY_SETTINGS["username"] = _PROXY_USER
+    if _PROXY_PASS:
+        _PROXY_SETTINGS["password"] = _PROXY_PASS
+
+# Browser identity — override locale, timezone, geolocation to match proxy country.
+# Defaults match a common US residential browser profile.
+_LOCALE    = _os.environ.get("BROWSER_LOCALE",   "en-US")
+_TIMEZONE  = _os.environ.get("BROWSER_TIMEZONE", "America/New_York")
+_LAT       = float(_os.environ.get("BROWSER_GEO_LAT",  "40.7128"))   # New York
+_LON       = float(_os.environ.get("BROWSER_GEO_LON",  "-74.0060"))
+
+# Realistic desktop viewport + UA (reduces bot fingerprint)
+_VIEWPORT  = {"width": 1920, "height": 1080}
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 print(
     f"[mcp_bridge] Starting on port {PORT} "
     f"(starlette={'yes' if HAS_STARLETTE else 'no'}, "
     f"markdownify={'yes' if HAS_MARKDOWNIFY else 'no'}, "
-    f"proxy={'yes' if _PROXY_SETTINGS else 'no'})",
+    f"proxy={'yes' if _PROXY_SETTINGS else 'no'}, "
+    f"locale={_LOCALE}, tz={_TIMEZONE})",
     flush=True,
 )
 
@@ -107,23 +138,62 @@ def _html_to_markdown(html: str) -> str:
 # ── Playwright singleton ───────────────────────────────────────────────────────
 
 _browser = None
-_page = None
-_pw = None
+_context = None
+_page    = None
+_pw      = None
 
 
 async def get_page():
-    global _browser, _page, _pw
+    global _browser, _context, _page, _pw
     try:
         if _pw is None:
             _pw = await async_playwright().start()
+
         if _browser is None or not _browser.is_connected():
             _browser = await _pw.chromium.launch(
                 headless=False,
                 proxy=_PROXY_SETTINGS,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
             )
-            _page = await _browser.new_page()
-        elif _page is None:
-            _page = await _browser.new_page()
+            _context = None
+            _page = None
+
+        if _context is None:
+            _context = await _browser.new_context(
+                # Proxy auth at context level (handles authenticated proxies)
+                proxy=_PROXY_SETTINGS,
+                # Locale / language headers
+                locale=_LOCALE,
+                timezone_id=_TIMEZONE,
+                # Geolocation spoofing
+                geolocation={"latitude": _LAT, "longitude": _LON},
+                permissions=["geolocation"],
+                # Viewport + UA that look like a real desktop Chrome
+                viewport=_VIEWPORT,
+                user_agent=_USER_AGENT,
+                # Colour scheme / platform hints
+                color_scheme="light",
+                extra_http_headers={
+                    "Accept-Language": f"{_LOCALE},{_LOCALE.split('-')[0]};q=0.9,en;q=0.8",
+                },
+            )
+            _page = None
+
+        if _page is None:
+            _page = await _context.new_page()
+            # Mask navigator.webdriver so automation is not detectable
+            await _page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['""" + _LOCALE + """', '""" + _LOCALE.split("-")[0] + """']
+                });
+            """)
+
         return _page
     except Exception as e:
         print(f"[mcp_bridge] get_page error: {e}", flush=True)

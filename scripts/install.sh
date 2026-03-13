@@ -314,13 +314,51 @@ configure_env() {
 
     # ── Proxy ────────────────────────────────────────────────────────────────
     echo ""
-    echo -e "${CYAN}── Proxy (optional) ──────────────────────────────────${NC}"
-    echo -e "  ${YELLOW}Tip:${NC} Routes all browser traffic through a residential or ISP proxy"
-    echo -e "       to avoid datacenter IP blocks (Ticketmaster, Cloudflare, etc.)."
-    echo -e "       Format: http://user:pass@host:port  or  socks5://user:pass@host:port"
-    prompt_var "PROXY_URL" \
-        "Proxy URL (leave blank to skip)" \
-        "$(current_val PROXY_URL)"
+    echo -e "${CYAN}── Proxy & Browser Identity (optional) ──────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Routes browser traffic through a residential/ISP proxy so the"
+    echo -e "       agent appears to come from your target country, not a datacenter."
+    echo -ne "  Configure a proxy? [y/N] "
+    read -r use_proxy
+    if [[ "${use_proxy,,}" == "y" ]]; then
+        echo ""
+        echo -e "  ${YELLOW}Option A${NC} — single URL (recommended for most providers):"
+        echo -e "    Format: http://user:pass@host:port  or  socks5://user:pass@host:port"
+        prompt_var "PROXY_URL" \
+            "Full proxy URL (leave blank to use split fields below)" \
+            "$(current_val PROXY_URL)"
+
+        current_proxy_url="$(current_val PROXY_URL)"
+        if [[ -z "$current_proxy_url" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}Option B${NC} — split fields (some providers supply these separately):"
+            prompt_var "PROXY_SERVER" \
+                "Proxy host:port (e.g. proxy.example.com:8080)" \
+                "$(current_val PROXY_SERVER)"
+            prompt_var "PROXY_USERNAME" \
+                "Proxy username" \
+                "$(current_val PROXY_USERNAME)"
+            prompt_var "PROXY_PASSWORD" \
+                "Proxy password" \
+                "$(current_val PROXY_PASSWORD)" 1
+        fi
+
+        echo ""
+        echo -e "  ${CYAN}── Browser locale / geolocation ──────────────────────${NC}"
+        echo -e "  ${YELLOW}Tip:${NC} Should match your proxy's exit country so locale, timezone,"
+        echo -e "       and geolocation all agree with the IP address."
+        prompt_var "BROWSER_LOCALE" \
+            "Browser locale (e.g. en-US, en-GB, de-DE)" \
+            "$(current_val BROWSER_LOCALE)"
+        prompt_var "BROWSER_TIMEZONE" \
+            "Browser timezone (e.g. America/New_York, Europe/London)" \
+            "$(current_val BROWSER_TIMEZONE)"
+        prompt_var "BROWSER_GEO_LAT" \
+            "Geolocation latitude  (e.g. 40.7128 for New York)" \
+            "$(current_val BROWSER_GEO_LAT)"
+        prompt_var "BROWSER_GEO_LON" \
+            "Geolocation longitude (e.g. -74.0060 for New York)" \
+            "$(current_val BROWSER_GEO_LON)"
+    fi
 
     # ── Discord ──────────────────────────────────────────────────────────────
     echo ""
