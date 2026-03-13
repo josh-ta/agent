@@ -37,7 +37,8 @@ COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 # Non-root user for safety (still has docker group access via mounted socket)
-RUN groupadd -r agentuser && useradd -r -g agentuser -G root agentuser \
+# -m creates the home directory so git config --global has somewhere to write
+RUN groupadd -r agentuser && useradd -r -m -g agentuser -G root agentuser \
     && chown -R agentuser:agentuser /app /data /workspace
 
 USER agentuser
