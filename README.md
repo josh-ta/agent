@@ -54,16 +54,56 @@ All configuration is in `.env`. Key variables:
 | `DISCORD_BUS_CHANNEL_ID` | Shared `#agent-bus` channel for all agents |
 | `POSTGRES_URL` | Optional shared PostgreSQL for multi-agent coordination |
 
-## Discord Channel Setup
+## Discord Bot Setup
 
-Create the following channels in your Discord server:
+### 1. Create the bot
 
-- `#agent-bus` — broadcast channel all agents monitor
-- `#agent-comms` — structured JSON A2A messages
-- `#agent-<name>` — one per agent (private task/log channel)
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application** → give it your agent's name
+2. Open **Bot** in the left sidebar → **Add Bot**
+3. Under **Privileged Gateway Intents**, enable all three:
+   - Presence Intent
+   - Server Members Intent
+   - **Message Content Intent** ← required to read messages
+4. Click **Reset Token** and copy it — this is your `DISCORD_BOT_TOKEN`
 
-Invite the bot to the server with scopes: `bot`, `applications.commands`  
-Bot permissions: `Send Messages`, `Read Message History`, `View Channels`
+### 2. Invite the bot to your server
+
+Replace `YOUR_CLIENT_ID` with the value from the **General Information** page:
+
+```
+https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8515702525261888&scope=bot
+```
+
+Open the URL in your browser, select your server, and authorize.
+
+### 3. Create the required channels
+
+In your Discord server, create:
+
+| Channel | Purpose | How to talk to the agent |
+|---|---|---|
+| `#<agent-name>` (e.g. `#bob`) | Private channel for this agent | Send any message — agent always responds |
+| `#agent-bus` | Broadcast visible to all agents | Must `@mention` the bot to get a response |
+| `#agent-comms` | Structured agent-to-agent JSON | Post raw JSON `{"from":"you","to":"bob","task":"..."}` |
+
+### 4. Get your IDs
+
+In Discord, go to **User Settings → Advanced** and enable **Developer Mode**, then:
+
+- Right-click your **server name** → Copy Server ID → `DISCORD_GUILD_ID`
+- Right-click `#<agent-name>` → Copy Channel ID → `DISCORD_AGENT_CHANNEL_ID`
+- Right-click `#agent-bus` → Copy Channel ID → `DISCORD_BUS_CHANNEL_ID`
+- Right-click `#agent-comms` → Copy Channel ID → `DISCORD_COMMS_CHANNEL_ID`
+
+### 5. Update .env and restart
+
+```bash
+nano .env
+# Set DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, and the four channel IDs
+docker compose up -d
+```
+
+The agent will post an online announcement to `#agent-bus` on startup to confirm it connected.
 
 ## Skills
 

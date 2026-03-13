@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --ignore-installed needed because Ubuntu Noble's apt-installed packages
 # have no pip RECORD file and block normal upgrades
 RUN pip install --no-cache-dir --break-system-packages --ignore-installed \
-    "mcp[cli]" "playwright-mcp>=0.0.6" 2>/dev/null || \
-    pip install --no-cache-dir --break-system-packages --ignore-installed "mcp[cli]"
+    "mcp[cli]" "uvicorn" "starlette" 2>/dev/null || \
+    pip install --no-cache-dir --break-system-packages --ignore-installed "mcp[cli]" "uvicorn" "starlette"
 
 # Startup script + fallback MCP bridge
 COPY start.sh /start.sh
