@@ -48,10 +48,18 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
 fi
 
 # ── Patch identity files with runtime agent name ───────────────────────────────
-# IDENTITY.md uses ${AGENT_NAME} as a placeholder — substitute it now
+# IDENTITY.md uses ${AGENT_NAME} as a placeholder — substitute it now.
+# Uses Python to avoid sed -i needing a writable temp file in the same directory
+# (bind-mounted directories may not allow temp file creation).
 IDENTITY_FILE="/app/agent/identity/IDENTITY.md"
 if [[ -f "$IDENTITY_FILE" ]]; then
-    sed -i "s|\${AGENT_NAME}|${AGENT_NAME:-agent}|g" "$IDENTITY_FILE"
+    python3 - "$IDENTITY_FILE" "${AGENT_NAME:-agent}" <<'PYEOF'
+import sys, pathlib
+path, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+text = path.read_text()
+if '${AGENT_NAME}' in text:
+    path.write_text(text.replace('${AGENT_NAME}', name))
+PYEOF
 fi
 
 
