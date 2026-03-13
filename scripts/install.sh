@@ -168,6 +168,20 @@ configure_env() {
         "Docker container name for self-restart (should match AGENT_NAME)" \
         "$(current_val AGENT_CONTAINER_NAME)"
 
+    # ── GitHub ───────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}── GitHub (optional) ─────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}Tip:${NC} Create a fine-grained PAT at https://github.com/settings/tokens"
+    echo -e "       Scopes needed: Contents (read/write), Pull requests, Issues"
+
+    prompt_var "GITHUB_TOKEN" \
+        "GitHub personal access token (enables gh CLI + private repo access)" \
+        "$(current_val GITHUB_TOKEN)" 1
+
+    prompt_var "GITHUB_USERNAME" \
+        "Your GitHub username (used for git commit authorship)" \
+        "$(current_val GITHUB_USERNAME)"
+
     echo ""
     success "Configuration saved to .env"
 }

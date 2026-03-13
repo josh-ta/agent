@@ -1,12 +1,26 @@
 FROM python:3.12-slim
 
-# System dependencies: git, curl, docker CLI (for self-restart)
+# System dependencies: git, gh CLI, curl, docker CLI (for self-restart)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
     docker.io \
+    gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
+
+# Configure git to use GITHUB_TOKEN for HTTPS auth automatically
+# (injected at runtime via .env; the credential helper reads it from the env)
+RUN git config --global credential.helper \
+    '!f() { echo username=x-token; echo "password=${GITHUB_TOKEN}"; }; f' \
+    && git config --global url."https://github.com/".insteadOf "git@github.com:"
 
 WORKDIR /app
 
@@ -23,6 +37,10 @@ RUN pip install --no-cache-dir -e .
 # Create data directory for SQLite
 RUN mkdir -p /data /workspace
 
+# Entrypoint wrapper: configures git identity + gh auth at runtime from env vars
+COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
 # Non-root user for safety (still has docker group access via mounted socket)
 RUN groupadd -r agentuser && useradd -r -g agentuser -G root agentuser \
     && chown -R agentuser:agentuser /app /data /workspace
@@ -32,4 +50,4 @@ USER agentuser
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import agent; print('ok')" || exit 1
 
-ENTRYPOINT ["python", "-m", "agent.main"]
+ENTRYPOINT ["/docker-entrypoint.sh"]
