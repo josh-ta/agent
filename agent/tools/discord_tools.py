@@ -116,7 +116,6 @@ async def ask_user(question: str, timeout: int = 300) -> str:
     # Record the message ID we're about to send so we only read replies after it
     try:
         sent = await channel.send(f"❓ {question}")  # type: ignore[union-attr]
-        sent_id = sent.id
         log.info("ask_user_sent", channel=channel_id, question=question[:80])
     except Exception as exc:
         return f"[ERROR sending question: {exc}]"
@@ -138,6 +137,9 @@ async def ask_user(question: str, timeout: int = 300) -> str:
 
     log.warning("ask_user_timeout", timeout=timeout, question=question[:80])
     return f"[No reply received after {timeout}s — proceeding with best judgment]"
+
+
+async def discord_read_named(name: str, limit: int = 20) -> str:
     """
     Read recent messages from a named channel: 'private', 'bus', or 'comms'.
 
