@@ -52,7 +52,6 @@ async def _start() -> None:
     from agent.memory.sqlite_store import SQLiteStore
     from agent.memory.postgres_store import PostgresStore
     from agent.tools.registry import ToolRegistry
-    from agent.core import create_agents
     from agent.loop import AgentLoop
     from agent.communication.discord_bot import DiscordBot
 
@@ -71,6 +70,11 @@ async def _start() -> None:
     # Tools + Agents (one per model tier)
     registry = ToolRegistry()
     registry.register_all(sqlite, postgres)
+
+    # Wire Postgres into core.py so the dynamic system prompt can list peer agents
+    from agent.core import create_agents, set_postgres
+    if postgres is not None:
+        set_postgres(postgres)
 
     agents = create_agents(registry)
     loop = AgentLoop(agents, memory_store=sqlite)

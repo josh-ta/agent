@@ -29,10 +29,12 @@ streaming automatically appear in your private channel — never in comms or bus
 
 ## Sending a Task to Another Agent
 
-Post a JSON message to `#agent-comms`:
+Post a JSON message to `#agent-comms` using the channel ID from your system prompt:
 ```
-send_discord(DISCORD_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "agent-2", "task": "Research X and return a summary", "payload": ""}')
+send_discord(AGENT_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "barbara", "task": "Fix the frontend ESLint errors in /workspace/TicketActionApp/frontend", "payload": ""}')
 ```
+
+The channel IDs are listed in your system prompt under **Discord Channels** — use those exact numbers.
 
 Then poll for their reply:
 ```
