@@ -464,8 +464,15 @@ class DiscordBot:
             return
 
         try:
+            from importlib.metadata import version as _pkg_version
+            agent_version = _pkg_version("agent")
+        except Exception:
+            agent_version = "unknown"
+
+        try:
             await channel.send(  # type: ignore[union-attr]
-                f"**{settings.agent_name}** is online. Model: `{settings.agent_model}`. "
+                f"**{settings.agent_name}** v{agent_version} is online. "
+                f"Model: `{settings.agent_model}`. "
                 f"Type `@{settings.agent_name} <task>` to assign work."
             )
         except discord.HTTPException as exc:

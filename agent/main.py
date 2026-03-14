@@ -55,8 +55,10 @@ async def _start() -> None:
     from agent.tools.registry import ToolRegistry
     from agent.loop import AgentLoop
     from agent.communication.discord_bot import DiscordBot
+    from importlib.metadata import version as _pkg_version
+    _agent_version = _pkg_version("agent")
 
-    log.info("agent_starting", name=settings.agent_name, model=settings.agent_model)
+    log.info("agent_starting", name=settings.agent_name, model=settings.agent_model, version=_agent_version)
 
     # Memory
     sqlite = SQLiteStore(settings.sqlite_path)
