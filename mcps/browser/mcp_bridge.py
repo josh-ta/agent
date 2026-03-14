@@ -21,6 +21,7 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
 # ── Attempt to import optional deps ───────────────────────────────────────────
 try:
@@ -55,11 +56,26 @@ _PROXY_USER    = _os.environ.get("PROXY_USERNAME", "").strip()
 _PROXY_PASS    = _os.environ.get("PROXY_PASSWORD", "").strip()
 
 # Build Playwright proxy dict.  Supports two forms:
-#   PROXY_URL=http://user:pass@host:port   (single env var, parsed by Playwright)
+#   PROXY_URL=http://user:pass@host:port   (single env var — credentials parsed out explicitly)
 #   PROXY_SERVER=host:port + PROXY_USERNAME + PROXY_PASSWORD  (split form)
+#
+# Playwright does NOT parse credentials from the server URL string — they must
+# be supplied as separate username/password keys in the proxy dict.
 _PROXY_SETTINGS: dict | None = None
 if _PROXY_URL:
-    _PROXY_SETTINGS = {"server": _PROXY_URL}
+    _parsed = urlparse(_PROXY_URL)
+    # Rebuild server URL without embedded credentials
+    _server_url = _PROXY_URL
+    if _parsed.username or _parsed.password:
+        _netloc_no_auth = _parsed.hostname
+        if _parsed.port:
+            _netloc_no_auth += f":{_parsed.port}"
+        _server_url = _parsed._replace(netloc=_netloc_no_auth).geturl()
+    _PROXY_SETTINGS = {"server": _server_url}
+    if _parsed.username:
+        _PROXY_SETTINGS["username"] = _parsed.username
+    if _parsed.password:
+        _PROXY_SETTINGS["password"] = _parsed.password
 elif _PROXY_SERVER:
     _PROXY_SETTINGS = {"server": _PROXY_SERVER}
     if _PROXY_USER:
@@ -257,6 +273,51 @@ async def list_tools() -> list[Tool]:
                 "required": ["script"],
             },
         ),
+        Tool(
+            name="browser_snapshot",
+            description=(
+                "Return a compact accessibility tree of the current page — element roles, "
+                "names, and ref IDs. Much cheaper than screenshots for understanding page "
+                "structure before interacting with it. Use this instead of browser_screenshot "
+                "when you need to find selectors or understand layout."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="browser_fill",
+            description="Clear a form field and type new text into it (by CSS selector). Equivalent to clearing then typing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["selector", "value"],
+            },
+        ),
+        Tool(
+            name="browser_scroll",
+            description="Scroll the page or a specific element. Use direction='down'/'up'/'left'/'right' and amount in pixels, or supply a selector to scroll an element into view.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["down", "up", "left", "right"],
+                        "default": "down",
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "description": "Pixels to scroll",
+                        "default": 500,
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector — scroll this element into view instead",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -294,6 +355,48 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "browser_evaluate":
             result = await page.evaluate(arguments["script"])
             return [TextContent(type="text", text=str(result))]
+
+        elif name == "browser_snapshot":
+            snapshot = await page.accessibility.snapshot()
+            if snapshot is None:
+                return [TextContent(type="text", text="(accessibility tree is empty)")]
+            import json as _json
+
+            def _compact(node: dict, depth: int = 0) -> str:
+                indent = "  " * depth
+                role = node.get("role", "")
+                name = node.get("name", "")
+                label = f"{role}: {name}" if name else role
+                lines = [f"{indent}{label}"]
+                for child in node.get("children", []):
+                    lines.append(_compact(child, depth + 1))
+                return "\n".join(lines)
+
+            tree = _compact(snapshot)
+            if len(tree) > 8000:
+                tree = tree[:8000] + "\n... [truncated]"
+            return [TextContent(type="text", text=tree)]
+
+        elif name == "browser_fill":
+            selector = arguments["selector"]
+            value = arguments.get("value", "")
+            await page.fill(selector, value, timeout=10000)
+            return [TextContent(type="text", text=f"Filled '{selector}' with provided value")]
+
+        elif name == "browser_scroll":
+            selector = arguments.get("selector", "")
+            if selector:
+                await page.eval_on_selector(
+                    selector,
+                    "el => el.scrollIntoView({behavior: 'smooth', block: 'center'})",
+                )
+                return [TextContent(type="text", text=f"Scrolled '{selector}' into view")]
+            direction = arguments.get("direction", "down")
+            amount = int(arguments.get("amount", 500))
+            axis_map = {"down": (0, amount), "up": (0, -amount), "right": (amount, 0), "left": (-amount, 0)}
+            dx, dy = axis_map.get(direction, (0, amount))
+            await page.evaluate(f"window.scrollBy({dx}, {dy})")
+            return [TextContent(type="text", text=f"Scrolled {direction} by {amount}px")]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

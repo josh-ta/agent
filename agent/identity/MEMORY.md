@@ -19,9 +19,9 @@ _This file is maintained by the agent. It is rewritten periodically to reflect c
 ## Known Environment Details
 
 - Docker container name matches `AGENT_NAME` env var
-- SSH key for GitHub is at `/tmp/agent_ssh/agent_ed25519` (mounted from host `.ssh/`)
-- noVNC browser viewer available at port 6080
-- Playwright MCP server at `http://browser:3080`
+- SSH key for GitHub: the entrypoint copies `~/.ssh` to `/data/ssh` (or `/tmp/agent_ssh` as fallback). Check `$SSH_DEST` or look for keys in `/data/ssh/` first, then `/tmp/agent_ssh/`. Key candidates: `agent_ed25519`, `id_ed25519`, `id_rsa`.
+- noVNC browser viewer available at port 6080 (human-visible only — agent controls browser via Playwright MCP at `http://browser:3080`)
+- Playwright MCP server at `http://browser:3080/sse`
 
 ## Recent Lessons
 

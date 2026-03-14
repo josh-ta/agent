@@ -65,7 +65,9 @@ END$$;
 -- Indexes
 CREATE INDEX IF NOT EXISTS audit_log_agent_ts_idx    ON audit_log (agent_id, ts DESC);
 CREATE INDEX IF NOT EXISTS audit_log_type_ts_idx     ON audit_log (event_type, ts DESC);
+CREATE INDEX IF NOT EXISTS audit_log_ts_idx          ON audit_log (ts DESC);  -- for age-based cleanup
 CREATE INDEX IF NOT EXISTS shared_tasks_to_agent_idx ON shared_tasks (to_agent, status);
+CREATE INDEX IF NOT EXISTS shared_tasks_updated_idx  ON shared_tasks (updated_at DESC);  -- for cleanup
 CREATE INDEX IF NOT EXISTS shared_memory_agent_idx   ON shared_memory (agent_id, created_at DESC);
 
 -- Vector index (only if the embedding column exists)

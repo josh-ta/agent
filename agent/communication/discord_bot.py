@@ -64,9 +64,20 @@ log = structlog.get_logger()
 MAX_REPLY_LEN = 1990  # Discord limit minus a small buffer
 _SILENT_TOOLS = frozenset({
     "read_file", "list_dir", "memory_save", "lesson_search",
-    "task_resume", "task_journal_clear", "memory_search",
+    "task_resume", "task_journal_clear", "task_note", "memory_search",
     "lessons_recent", "lesson_save", "read_channel", "read_discord",
+    "identity_read", "skill_list", "skill_read", "db_stats",
 })
+
+
+def _escape_md_italics(text: str) -> str:
+    """Escape bare asterisks so they don't break Discord italic/bold markdown."""
+    return text.replace("*", "\\*")
+
+
+def _escape_codeblock(text: str) -> str:
+    """Prevent triple-backtick sequences inside a code block from breaking it."""
+    return text.replace("```", "`` `")
 
 
 def _fmt_args(args: object) -> str:
@@ -386,7 +397,7 @@ class DiscordBot:
                     for i in range(0, len(event.text), chunk_size):
                         chunk = event.text[i:i+chunk_size].strip()
                         if chunk:
-                            await _send(f"🧠 *{chunk}*")
+                            await _send(f"🧠 *{_escape_md_italics(chunk)}*")
 
             elif isinstance(event, TextTurnEndEvent):
                 if not event.is_final and event.text:
@@ -414,7 +425,7 @@ class DiscordBot:
                 shell_lines = []
                 status = f"exit {event.exit_code} ({event.elapsed_s:.1f}s)"
                 if output:
-                    display = output[-1400:]  # tail — most relevant part
+                    display = _escape_codeblock(output[-1400:])  # tail — most relevant part
                     combined = f"```\n{display}\n```\n{status}"
                     try:
                         if shell_msg is not None:

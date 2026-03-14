@@ -119,6 +119,9 @@ CREATE INDEX IF NOT EXISTS shared_memory_embedding_idx
 """
 
 
+_PG_CLEANUP_INTERVAL_S = 3600  # run cleanup at most once per hour
+
+
 class PostgresStore:
     def __init__(self, url: str) -> None:
         # asyncpg uses postgres:// or postgresql:// — strip the +asyncpg driver hint
@@ -128,6 +131,7 @@ class PostgresStore:
         self._pool: asyncpg.Pool | None = None  # type: ignore[type-arg]
         self._has_vector: bool = False
         self._has_embeddings: bool = False  # True when vector + OpenAI key both available
+        self._last_cleanup_ts: float = 0.0
 
     async def init(self) -> None:
         """Create connection pool and ensure schema exists."""
@@ -229,7 +233,7 @@ class PostgresStore:
         return f"Task {task_id} created for {to_agent}."
 
     async def get_my_tasks(self) -> str:
-        """Get pending tasks assigned to this agent."""
+        """Get pending tasks assigned to this agent (formatted for tool output)."""
         assert self._pool
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -246,6 +250,31 @@ class PostgresStore:
             ts = r["created_at"].strftime("%Y-%m-%d %H:%M")
             lines.append(f"  [{r['id'][:8]}] from={r['from_agent']} at={ts}: {r['description']}")
         return "\n".join(lines)
+
+    async def get_pending_task_rows(self) -> list[dict]:
+        """Fetch pending tasks for the heartbeat A2A poller (returns raw dicts)."""
+        if not self._pool:
+            return []
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, from_agent, description
+                   FROM shared_tasks
+                   WHERE to_agent=$1 AND status='pending'
+                   ORDER BY created_at ASC
+                   LIMIT 5""",
+                settings.agent_name,
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_task_running(self, task_id: str) -> None:
+        """Mark a shared task as running so it's not picked up twice."""
+        if not self._pool:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE shared_tasks SET status='running', updated_at=NOW() WHERE id=$1",
+                task_id,
+            )
 
     async def complete_task(self, task_id: str, result: str) -> str:
         """Mark a shared task as done with a result."""
@@ -386,10 +415,37 @@ class PostgresStore:
                 json.dumps(payload),
             )
 
+    async def log_task_start(self, task_content: str, source: str, tier: str) -> None:
+        """Auto-write a task_start event to the shared audit log."""
+        if not self._pool:
+            return
+        try:
+            await self.log_event("task_start", {
+                "content": task_content[:300],
+                "source": source,
+                "tier": tier,
+            })
+        except Exception as exc:
+            log.warning("audit_log_task_start_failed", error=str(exc))
+
+    async def log_task_done(self, task_content: str, success: bool, elapsed_ms: float, tool_calls: int) -> None:
+        """Auto-write a task_done event to the shared audit log."""
+        if not self._pool:
+            return
+        try:
+            await self.log_event("task_done", {
+                "content": task_content[:300],
+                "success": success,
+                "elapsed_ms": round(elapsed_ms),
+                "tool_calls": tool_calls,
+            })
+        except Exception as exc:
+            log.warning("audit_log_task_done_failed", error=str(exc))
+
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def heartbeat(self) -> None:
-        """Update last_seen timestamp."""
+        """Update last_seen timestamp and run cleanup if due."""
         if self._pool:
             try:
                 async with self._pool.acquire() as conn:
@@ -399,3 +455,66 @@ class PostgresStore:
                     )
             except Exception as exc:
                 log.warning("postgres_heartbeat_failed", error=str(exc))
+
+        now_ts = __import__("time").time()
+        if now_ts - self._last_cleanup_ts >= _PG_CLEANUP_INTERVAL_S:
+            try:
+                await self._cleanup()
+            except Exception as exc:
+                log.warning("postgres_cleanup_error", error=str(exc))
+
+    async def _cleanup(self) -> None:
+        """Prune Postgres tables to their retention limits. Runs at most once per hour."""
+        if not self._pool:
+            return
+        log.info("postgres_cleanup_start")
+        import time as _time
+        now_ts = _time.time()
+
+        async with self._pool.acquire() as conn:
+            # audit_log: keep last RETENTION_AUDIT_LOG_DAYS
+            await conn.execute(
+                "DELETE FROM audit_log WHERE ts < NOW() - ($1 || ' days')::interval",
+                str(settings.retention_audit_log_days),
+            )
+
+            # shared_tasks: keep completed/failed for RETENTION_SHARED_TASKS_DAYS
+            await conn.execute(
+                """DELETE FROM shared_tasks
+                   WHERE status IN ('done','failed')
+                     AND updated_at < NOW() - ($1 || ' days')::interval""",
+                str(settings.retention_shared_tasks_days),
+            )
+
+            # shared_memory: keep newest RETENTION_SHARED_MEMORY_MAX rows per agent
+            max_rows = settings.retention_shared_memory_max
+            await conn.execute(
+                """DELETE FROM shared_memory
+                   WHERE id NOT IN (
+                       SELECT id FROM shared_memory
+                       WHERE agent_id = $1
+                       ORDER BY created_at DESC
+                       LIMIT $2
+                   ) AND agent_id = $1""",
+                settings.agent_name,
+                max_rows,
+            )
+
+        self._last_cleanup_ts = now_ts
+        log.info("postgres_cleanup_done")
+
+    async def get_stats(self) -> dict:
+        """Return row counts for diagnostics."""
+        if not self._pool:
+            return {}
+        stats: dict = {}
+        async with self._pool.acquire() as conn:
+            for table in ("agents", "shared_tasks", "audit_log", "shared_memory"):
+                row = await conn.fetchrow(f"SELECT COUNT(*) as n FROM {table}")
+                stats[table] = row["n"] if row else 0
+        import time as _time
+        stats["last_cleanup"] = (
+            _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(self._last_cleanup_ts))
+            if self._last_cleanup_ts else "never"
+        )
+        return stats

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 import sys
 
 import structlog
@@ -77,15 +78,50 @@ async def _start() -> None:
         set_postgres(postgres)
 
     agents = create_agents(registry)
-    loop = AgentLoop(agents, memory_store=sqlite)
+    loop = AgentLoop(agents, memory_store=sqlite, postgres_store=postgres)
 
+    # ── Graceful shutdown ──────────────────────────────────────────────────────
+    ev_loop = asyncio.get_event_loop()
+    main_task: asyncio.Task | None = None
+
+    async def _shutdown(sig_name: str) -> None:
+        log.info("shutdown_signal", signal=sig_name)
+        # Mark agent offline in Postgres before disconnecting
+        if postgres is not None:
+            try:
+                await postgres.set_offline()
+                log.info("postgres_set_offline")
+            except Exception:
+                pass
+        # Flush SQLite WAL
+        try:
+            await sqlite.close()
+        except Exception:
+            pass
+        loop.stop()
+        if main_task is not None:
+            main_task.cancel()
+
+    def _handle_signal(sig_name: str) -> None:
+        ev_loop.create_task(_shutdown(sig_name))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            ev_loop.add_signal_handler(sig, lambda s=sig.name: _handle_signal(s))
+        except NotImplementedError:
+            pass  # Windows — signal handlers not supported on event loop
+
+    # ── Run ───────────────────────────────────────────────────────────────────
     if settings.has_discord:
         bot = DiscordBot(loop)
-        # Run bot + loop concurrently
-        await asyncio.gather(
+        main_task = asyncio.ensure_future(asyncio.gather(
             loop.run_forever(),
             bot.start_bot(),
-        )
+        ))
+        try:
+            await main_task
+        except asyncio.CancelledError:
+            pass
     else:
         log.warning("no_discord_token_running_headless")
         await loop.run_forever()

@@ -314,6 +314,42 @@ class ToolRegistry:
             """Re-trigger a CI run (or only its failed jobs)."""
             return await github.ci_rerun(run_id, failed_only, repo or None)
 
+        # ── Database stats + diagnostics ─────────────────────────────────────
+        if sqlite or postgres:
+            @agent.tool_plain
+            async def db_stats() -> str:
+                """
+                Show database row counts, file sizes, and last cleanup times.
+                Use this to check database health, see how many memories/lessons are stored,
+                or verify that cleanup is running.
+                """
+                lines = ["## Database Stats", ""]
+                if sqlite:
+                    try:
+                        s = await sqlite.get_stats()
+                        lines.append("**SQLite (local):**")
+                        lines.append(f"  conversations: {s.get('conversations', '?')} rows")
+                        lines.append(f"  tasks: {s.get('tasks', '?')} rows")
+                        lines.append(f"  memory_facts: {s.get('memory_facts', '?')} rows")
+                        lines.append(f"  lessons: {s.get('lessons', '?')} rows")
+                        lines.append(f"  db size: {s.get('db_size_mb', '?')} MB")
+                        lines.append(f"  vec search: {s.get('vec_enabled', False)}")
+                        lines.append(f"  last cleanup: {s.get('last_cleanup', 'never')}")
+                    except Exception as exc:
+                        lines.append(f"  SQLite error: {exc}")
+                if postgres:
+                    try:
+                        p = await postgres.get_stats()
+                        lines.append("\n**Postgres (shared):**")
+                        lines.append(f"  agents: {p.get('agents', '?')} rows")
+                        lines.append(f"  shared_tasks: {p.get('shared_tasks', '?')} rows")
+                        lines.append(f"  audit_log: {p.get('audit_log', '?')} rows")
+                        lines.append(f"  shared_memory: {p.get('shared_memory', '?')} rows")
+                        lines.append(f"  last cleanup: {p.get('last_cleanup', 'never')}")
+                    except Exception as exc:
+                        lines.append(f"  Postgres error: {exc}")
+                return "\n".join(lines)
+
         # ── Memory search ─────────────────────────────────────────────────────
         if sqlite:
             @agent.tool_plain

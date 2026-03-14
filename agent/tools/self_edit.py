@@ -25,7 +25,7 @@ _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]*$")
 
 def _resolve_skill_path(name: str) -> Path | None:
     """Return path for a skill file. Name must be slug-form (no .md extension needed)."""
-    clean = name.lower().rstrip(".md")
+    clean = name.lower().removesuffix(".md")
     if not _SKILL_NAME_RE.match(clean):
         return None
     return settings.skills_path / f"{clean}.md"

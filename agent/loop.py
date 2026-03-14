@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -168,13 +169,14 @@ class AgentLoop:
     has no knowledge of Discord or any other output channel.
     """
 
-    def __init__(self, agents: dict[str, Agent], memory_store: Any = None) -> None:  # type: ignore[type-arg]
+    def __init__(self, agents: dict[str, Agent], memory_store: Any = None, postgres_store: Any = None) -> None:  # type: ignore[type-arg]
         # agents dict: {"fast": Agent, "smart": Agent, "best": Agent}
         self.agents = agents
         # Fallback: if only one agent passed (legacy), use it for all tiers
         if isinstance(agents, Agent):  # type: ignore[arg-type]
             self.agents = {"fast": agents, "smart": agents, "best": agents}
         self.memory = memory_store
+        self._postgres = postgres_store
         self.queue: asyncio.Queue[Task] = asyncio.Queue()
         self._running = False
         self._task_count = 0
@@ -237,6 +239,9 @@ class AgentLoop:
         Ask the fast agent to compress accumulated tool-call history into a
         brief checkpoint summary. Called when the context window overflows.
         Returns the summary string (never raises).
+
+        NOTE: runs WITHOUT opening MCP servers — summarization is text-only
+        and we're already inside an outer run_mcp_servers() context.
         """
         log.warning("context_overflow_summarizing", task=task.content[:80])
         try:
@@ -250,8 +255,9 @@ class AgentLoop:
                 f"ACCUMULATED CONTEXT (truncated for summarization):\n{accumulated_prompt[-20_000:]}"
             )
             fast_agent = self.agents.get("fast", self.agent)
-            async with fast_agent.run_mcp_servers():
-                summary_result = await fast_agent.run(summarize_prompt)
+            # Run without MCP servers — summarization needs no browser tools
+            # and we're already inside an outer run_mcp_servers() context.
+            summary_result = await fast_agent.run(summarize_prompt)
             summary = str(summary_result.output).strip()
             log.info("context_summarized", summary_len=len(summary))
             return summary
@@ -296,7 +302,39 @@ class AgentLoop:
             content=task.content[:120],
         )
 
+        # Expire stale task journal — clear if last modified more than 2 hours ago
+        # to prevent old journal entries from contaminating a fresh unrelated task.
+        _journal_path = settings.workspace_path / ".task_journal.md"
+        try:
+            if _journal_path.exists():
+                import os as _os
+                age_s = time.time() - _journal_path.stat().st_mtime
+                if age_s > 7200:  # 2 hours
+                    _journal_path.unlink()
+                    log.info("task_journal_expired", age_s=round(age_s))
+        except Exception:
+            pass
+
         await bridge.emit(TaskStartEvent(content=task.content, tier=tier))
+
+        # Broadcast task start to Postgres audit log (shared agent activity stream)
+        if self._postgres is not None:
+            try:
+                await self._postgres.log_task_start(task.content, task.source, tier)
+            except Exception:
+                pass
+
+        # Save the incoming user message to conversation history
+        if self.memory and hasattr(self.memory, "save_message") and task.source == "discord":
+            try:
+                await self.memory.save_message(
+                    role="user",
+                    content=task.content,
+                    channel_id=task.channel_id,
+                    metadata={"author": task.author},
+                )
+            except Exception:
+                pass
 
         # Surface relevant past lessons
         lessons_context = ""
@@ -306,25 +344,45 @@ class AgentLoop:
             except Exception:
                 pass
 
-        # Inject recent channel history
+        # Inject recent channel history — use SQLite DB when available, else fall back to Discord API
         channel_context = ""
         if task.source == "discord" and task.channel_id:
             try:
-                from agent.tools.discord_tools import discord_read
-                raw = await discord_read(task.channel_id, limit=7)
-                lines = raw.splitlines()
-                if lines:
-                    lines = lines[:-1]
-                truncated = []
-                total_chars = 0
-                for line in lines:
-                    short = line[:300] + ("…" if len(line) > 300 else "")
-                    if total_chars + len(short) > 1500:
-                        break
-                    truncated.append(short)
-                    total_chars += len(short)
-                if truncated:
-                    channel_context = "## Recent conversation history\n" + "\n".join(truncated)
+                # Prefer structured DB history (already saved on each task)
+                if self.memory and hasattr(self.memory, "get_history"):
+                    history_rows = await self.memory.get_history(task.channel_id, limit=10)
+                    # Exclude the current message (last row) — already in task.content
+                    history_rows = history_rows[:-1] if history_rows else []
+                    if history_rows:
+                        lines = []
+                        total_chars = 0
+                        for row in history_rows:
+                            role_label = "You" if row["role"] == "assistant" else row["role"].capitalize()
+                            text = row["content"][:300] + ("…" if len(row["content"]) > 300 else "")
+                            line = f"{role_label}: {text}"
+                            if total_chars + len(line) > 1500:
+                                break
+                            lines.append(line)
+                            total_chars += len(line)
+                        if lines:
+                            channel_context = "## Recent conversation history\n" + "\n".join(lines)
+                else:
+                    # Fallback: live Discord read
+                    from agent.tools.discord_tools import discord_read
+                    raw = await discord_read(task.channel_id, limit=7)
+                    lines = raw.splitlines()
+                    if lines:
+                        lines = lines[:-1]
+                    truncated = []
+                    total_chars = 0
+                    for line in lines:
+                        short = line[:300] + ("…" if len(line) > 300 else "")
+                        if total_chars + len(short) > 1500:
+                            break
+                        truncated.append(short)
+                        total_chars += len(short)
+                    if truncated:
+                        channel_context = "## Recent conversation history\n" + "\n".join(truncated)
             except Exception:
                 pass
 
@@ -337,7 +395,7 @@ class AgentLoop:
         base_prompt = "\n\n---\n\n".join(parts)
 
         try:
-            result_output, tool_calls = await self._run_with_streaming(
+            result_output, tool_calls, discord_replied = await self._run_with_streaming(
                 task=task,
                 agent=agent,
                 base_prompt=base_prompt,
@@ -362,11 +420,30 @@ class AgentLoop:
                 tool_calls=tool_calls,
             ))
 
+            # Broadcast task done to Postgres audit log
+            if self._postgres is not None:
+                try:
+                    await self._postgres.log_task_done(task.content, True, elapsed_ms, tool_calls)
+                except Exception:
+                    pass
+
             self._success_count += 1
+
+            # Save the assistant's reply to conversation history
+            if self.memory and hasattr(self.memory, "save_message") and task.source == "discord":
+                try:
+                    await self.memory.save_message(
+                        role="assistant",
+                        content=result_output,
+                        channel_id=task.channel_id,
+                    )
+                except Exception:
+                    pass
+
             return TaskResult(
                 task=task,
                 output=result_output,
-                discord_replied=False,
+                discord_replied=discord_replied,
                 success=True,
                 elapsed_ms=elapsed_ms,
                 tool_calls=tool_calls,
@@ -412,11 +489,11 @@ class AgentLoop:
         base_prompt: str,
         tier: str,
         message_history: list | None = None,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, bool]:
         """
         Run the agent with full event streaming via the EventBridge.
 
-        Returns (final_output_str, tool_call_count).
+        Returns (final_output_str, tool_call_count, discord_replied).
 
         Translates raw pydantic-ai events into typed AgentEvents:
           - ThinkingPartDelta → ThinkingDeltaEvent (per token)
@@ -439,6 +516,7 @@ class AgentLoop:
         _rate_retries = 0
         _max_rate_retries = 3
         _rate_delay = 5.0
+        _tool_call_total = 0  # cumulative across retries for iteration cap
 
         while True:  # retry loop for context overflow and rate limits
             discord_replied = False
@@ -496,8 +574,16 @@ class AgentLoop:
                         elif isinstance(event, FunctionToolCallEvent):
                             tool_name = event.part.tool_name
                             tool_calls += 1
+                            _tool_call_total += 1
                             if tool_name == "send_discord":
                                 discord_replied = True
+
+                            # Guard against infinite tool-call loops
+                            if _tool_call_total > settings.max_loop_iterations:
+                                raise RuntimeError(
+                                    f"Tool call limit reached ({settings.max_loop_iterations}). "
+                                    "Task aborted to prevent infinite loop."
+                                )
 
                             # Parse args — may be dict or JSON string
                             raw_args = event.part.args
@@ -553,7 +639,7 @@ class AgentLoop:
                                 f"{'folding them' if count > 1 else 'folding it'} in now."
                             )
                         ))
-                        followup_output, followup_tool_calls = await self._run_with_streaming(
+                        followup_output, followup_tool_calls, followup_replied = await self._run_with_streaming(
                             task=task,
                             agent=agent,
                             base_prompt=injection_text,
@@ -562,8 +648,9 @@ class AgentLoop:
                         )
                         result_output = followup_output
                         tool_calls += followup_tool_calls
+                        discord_replied = discord_replied or followup_replied
 
-                return result_output, tool_calls
+                return result_output, tool_calls, discord_replied
 
             except Exception as _exc:
                 exc_str = str(_exc)
@@ -632,10 +719,11 @@ class AgentLoop:
 
     async def _reflect(self, task: Task, result: TaskResult) -> None:
         """
-        Post-task reflection: learn from failures and extract insights.
+        Post-task reflection: learn from failures and extract insights from successes.
 
         On failure  → ask the agent what went wrong + save a MISTAKE lesson
-        On success  → every MEMORY_UPDATE_INTERVAL tasks, update MEMORY.md
+        On success with >3 tool calls → extract a reusable pattern/insight
+        Every MEMORY_UPDATE_INTERVAL successes → rewrite MEMORY.md
         """
         if not self.memory:
             return
@@ -643,10 +731,43 @@ class AgentLoop:
         try:
             if not result.success:
                 await self._reflect_on_failure(task, result)
-            elif self._success_count % MEMORY_UPDATE_INTERVAL == 0:
-                await self._update_memory_md()
+            else:
+                # Extract insight from complex successful tasks (>3 tool calls)
+                if result.tool_calls > 3:
+                    await self._reflect_on_success(task, result)
+                if self._success_count % MEMORY_UPDATE_INTERVAL == 0:
+                    await self._update_memory_md()
         except Exception:
             log.warning("reflect_error", exc=traceback.format_exc())
+
+    async def _reflect_on_success(self, task: Task, result: TaskResult) -> None:
+        """Extract a reusable pattern or insight from a successful complex task."""
+        log.info("reflecting_on_success", task=task.content[:80], tool_calls=result.tool_calls)
+
+        reflection_prompt = (
+            f"You just successfully completed the following task using {result.tool_calls} tool calls.\n\n"
+            f"Task: {task.content}\n\n"
+            f"Result summary: {result.output[:500]}\n\n"
+            f"In one concise sentence (max 200 chars), extract ONE reusable pattern, shortcut, or insight "
+            f"from this task that would help you do similar tasks better or faster in the future. "
+            f"Focus on what was surprising, efficient, or non-obvious. "
+            f"If there is nothing genuinely useful to record, reply with exactly: NOTHING_TO_RECORD"
+        )
+
+        try:
+            fast_agent = self.agents.get("fast", self.agent)
+            insight_result = await fast_agent.run(reflection_prompt)
+            insight = str(insight_result.output).strip()
+
+            if insight and "NOTHING_TO_RECORD" not in insight:
+                await self.memory.save_lesson(
+                    summary=insight[:300],
+                    kind="pattern",
+                    context=task.content[:300],
+                )
+                log.info("pattern_saved", insight=insight[:100])
+        except Exception:
+            log.warning("reflect_on_success_error", exc=traceback.format_exc())
 
     async def _reflect_on_failure(self, task: Task, result: TaskResult) -> None:
         """Ask the agent to diagnose a failure and record the lesson."""
@@ -663,8 +784,8 @@ class AgentLoop:
         )
 
         try:
-            async with self.agent.run_mcp_servers():
-                reflection = await self.agent.run(reflection_prompt)
+            # Run without MCP servers — reflection is text+memory only, no browser needed
+            reflection = await self.agent.run(reflection_prompt)
             lesson = str(reflection.output).strip()
 
             await self.memory.save_lesson(
@@ -708,7 +829,29 @@ class AgentLoop:
             log.warning("update_memory_md_error", exc=traceback.format_exc())
 
     async def _heartbeat(self) -> None:
-        """Periodic background work: update Postgres presence, checkpoint SQLite."""
+        """Periodic background work: update Postgres presence, checkpoint SQLite, poll A2A tasks."""
         log.debug("heartbeat", agent=settings.agent_name, queue_size=self.queue.qsize())
         if self.memory and hasattr(self.memory, "heartbeat"):
             await self.memory.heartbeat()
+
+        # ── A2A task polling ────────────────────────────────────────────────────
+        # If Postgres is available, check for tasks delegated to us by other agents.
+        # Enqueue any pending tasks so they're processed without requiring a human ping.
+        if self._postgres is not None and not self.is_busy:
+            try:
+                rows = await self._postgres.get_pending_task_rows()
+                for row in rows:
+                    task_id = row["id"]
+                    description = row["description"]
+                    from_agent = row.get("from_agent", "unknown")
+                    log.info("a2a_task_received", id=task_id[:8], from_agent=from_agent)
+                    # Mark as running so we don't pick it up again
+                    await self._postgres.mark_task_running(task_id)
+                    await self.enqueue(Task(
+                        content=description,
+                        source="a2a",
+                        author=from_agent,
+                        metadata={"task_id": task_id, "from_agent": from_agent},
+                    ))
+            except Exception as exc:
+                log.warning("a2a_poll_error", error=str(exc))

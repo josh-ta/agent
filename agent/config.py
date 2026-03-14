@@ -77,6 +77,17 @@ class Settings(BaseSettings):
     heartbeat_seconds: int = Field(default=60, alias="HEARTBEAT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # ── Retention / cleanup ───────────────────────────────────────────────────
+    # SQLite
+    retention_conversations_days: int = Field(default=30, alias="RETENTION_CONVERSATIONS_DAYS")
+    retention_tasks_days: int = Field(default=90, alias="RETENTION_TASKS_DAYS")
+    retention_memory_facts_max: int = Field(default=500, alias="RETENTION_MEMORY_FACTS_MAX")
+    retention_lessons_max: int = Field(default=200, alias="RETENTION_LESSONS_MAX")
+    # Postgres
+    retention_audit_log_days: int = Field(default=30, alias="RETENTION_AUDIT_LOG_DAYS")
+    retention_shared_tasks_days: int = Field(default=14, alias="RETENTION_SHARED_TASKS_DAYS")
+    retention_shared_memory_max: int = Field(default=1000, alias="RETENTION_SHARED_MEMORY_MAX")
+
     @property
     def model_string(self) -> str:
         """Return the pydantic-ai model string for the default model."""

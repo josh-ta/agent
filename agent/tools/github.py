@@ -85,11 +85,18 @@ async def pr_review_with_comments(
     body:   top-level review summary
 
     Uses `gh api` so the agent doesn't need to manage auth headers.
+    The repo slug (owner/repo) is required for the API path.
     """
     if action not in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
         return "[error] action must be 'APPROVE', 'REQUEST_CHANGES', or 'COMMENT'"
 
-    # Build the review payload
+    if not repo:
+        # Attempt to detect current repo from git remote
+        detect = await shell_run("gh repo view --json nameWithOwner -q .nameWithOwner", timeout=10)
+        repo = detect.strip()
+        if not repo or repo.startswith("["):
+            return "[error] repo is required for inline review comments (e.g. 'owner/repo')"
+
     review_comments = [
         {"path": c["path"], "line": c["line"], "body": c["message"]}
         for c in comments
@@ -100,15 +107,24 @@ async def pr_review_with_comments(
         "comments": review_comments,
     })
 
-    repo_flag = f" --repo {repo}" if repo else ""
-    safe_payload = payload.replace("'", "'\\''")
-    cmd = (
-        f"gh api{repo_flag} "
-        f"repos/{{owner}}/{{repo}}/pulls/{pr}/reviews "
-        f"--method POST "
-        f"--input - <<< '{safe_payload}'"
-    )
-    return await shell_run(cmd, timeout=30)
+    # Write payload to a temp file to avoid shell quoting issues entirely
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+        tf.write(payload)
+        tmp_path = tf.name
+
+    try:
+        cmd = (
+            f"gh api repos/{repo}/pulls/{pr}/reviews "
+            f"--method POST "
+            f"--input {tmp_path}"
+        )
+        return await shell_run(cmd, timeout=30)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 async def pr_checks(pr: int | str, repo: str | None = None) -> str:
