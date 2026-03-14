@@ -389,7 +389,7 @@ class DiscordBot:
             nonlocal shell_lines, shell_msg
 
             if isinstance(event, TaskStartEvent):
-                await _send(f"🔍 *{event.content}*")
+                pass  # don't echo the task back — user already knows what they asked
 
             elif isinstance(event, ThinkingEndEvent):
                 if event.text:
