@@ -9,11 +9,6 @@ user's channel so they know you're working. The loop automatically forwards `tas
 calls to Discord, so **the best approach is to call `task_note()` frequently** — you get
 journal checkpointing AND Discord visibility in one call.
 
-For a proactive "started" message at the beginning:
-```
-send_discord(DISCORD_AGENT_CHANNEL_ID, "Working on X — checking CI logs now…")
-```
-
 For step-by-step notes (auto-forwarded to Discord AND saved to journal):
 ```
 task_note("Checked CI run 23065824301. Jobs: backend=failed. Root cause: PYTHONPATH missing. Next: fix ci-cd.yml.")
@@ -25,31 +20,67 @@ Do NOT call `send_discord` at the end to summarize — your final text response 
 
 | Channel | Purpose |
 |---|---|
-| `#agent-bus` | Announcements and informal broadcasts to all agents |
-| `#agent-comms` | Structured JSON task routing (machine-readable) |
-| `#agent-<name>` | Each agent's private channel for direct tasks and logs |
+| `#agent-<name>` | Each agent's private channel — streaming, reasoning, direct conversation |
+| `#agent-comms` | Structured JSON task routing between agents (machine-readable) |
+| `#agent-bus` | Brief status announcements to all agents |
+
+**Only post to agent-comms and agent-bus.** Your thinking, tool calls, and progress
+streaming automatically appear in your private channel — never in comms or bus.
 
 ## Sending a Task to Another Agent
 
 Post a JSON message to `#agent-comms`:
 ```
-send_discord(DISCORD_COMMS_CHANNEL_ID, '{"from": "agent-1", "to": "agent-2", "task": "Research X and return a summary", "payload": ""}')
+send_discord(DISCORD_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "agent-2", "task": "Research X and return a summary", "payload": ""}')
 ```
 
-The receiving agent will pick this up automatically and reply in its own channel or back to comms.
-
-## Monitoring the Bus
-
-Read recent messages from `#agent-bus`:
+Then poll for their reply:
 ```
-read_discord(DISCORD_BUS_CHANNEL_ID, limit=20)
+read_discord(DISCORD_COMMS_CHANNEL_ID, limit=10)
 ```
+Look for a message with `"from": "agent-2"` and `"task": "result"`. The `"payload"` field
+contains their answer.
+
+## Receiving an A2A Task (when another agent delegates to you)
+
+When you receive a task prefixed `[A2A from X]`, another agent has delegated work to you.
+
+1. Complete the task normally
+2. When done, send your result back to comms so the requesting agent can read it:
+
+```
+send_discord(DISCORD_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "X", "task": "result", "payload": "your answer here"}')
+```
+
+Do NOT reply with plain text to agent-comms — the other agent reads structured JSON.
+
+## Collaborating on a Shared Task
+
+When a user asks two agents to collaborate:
+
+**Agent 1 (coordinator):**
+1. Send a JSON task to agent-2 via comms
+2. Work on your portion
+3. Poll comms every few tool calls: `read_discord(DISCORD_COMMS_CHANNEL_ID, limit=10)`
+4. Incorporate agent-2's result into your final response
+
+**Agent 2 (worker):**
+1. Pick up the `[A2A from agent-1]` task automatically
+2. Complete your portion
+3. Send the result back to comms as JSON (see above)
 
 ## Broadcasting to All Agents
 
 Use `"to": "*"` in the JSON payload:
 ```json
 {"from": "agent-1", "to": "*", "task": "Update your GOALS.md with new objective: X"}
+```
+
+## Monitoring the Bus
+
+Read recent messages from `#agent-bus`:
+```
+read_discord(DISCORD_BUS_CHANNEL_ID, limit=20)
 ```
 
 ## Checking Agent Status
@@ -65,8 +96,8 @@ list_agents()
 {
   "from": "agent-name",
   "to": "target-agent-name or *",
-  "task": "Human-readable task description",
-  "payload": "Additional context or data (optional)"
+  "task": "what to do  (use 'result' when replying with output)",
+  "payload": "task details or result content (optional)"
 }
 ```
 
@@ -74,5 +105,5 @@ list_agents()
 
 - Keep messages concise — Discord has a 2,000 char limit.
 - For large payloads, write to a shared file in `/workspace` and reference the path.
-- Always check `my_tasks()` at startup to process any pending delegated tasks.
+- Always check `task_resume()` at startup to process any pending delegated tasks.
 - Be explicit in task descriptions: who should do what by when.

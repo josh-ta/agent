@@ -72,6 +72,12 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
                 return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
             except json.JSONDecodeError:
                 pass
+        # Non-JSON message in comms from a human — treat as a task so both agents act on it.
+        # Bot posts that are non-JSON (e.g. malformed JSON) remain IGNORE.
+        if not message.author.bot:
+            clean = re.sub(r"<@!?\d+>", "", content).strip()
+            if clean:
+                return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
 
     # Private channel for this agent → always a task
     if channel_id == settings.discord_agent_channel_id:

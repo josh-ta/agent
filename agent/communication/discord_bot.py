@@ -6,20 +6,34 @@ Uses discord.py with the following intents:
   - guilds
   - guild_messages
 
+Channel roles
+-------------
+  #bob / #barbara (DISCORD_AGENT_CHANNEL_ID)
+      The user's real-time window into the agent. ALL streaming — thinking,
+      tool calls, shell output, progress events — goes here regardless of
+      where the triggering message came from. Also used for direct user↔agent
+      conversation and full task replies.
+
+  #agent-comms (DISCORD_COMMS_CHANNEL_ID)
+      Machine channel. Structured JSON A2A task routing only. When an agent
+      finishes an A2A task, it posts the result back here as JSON so the
+      requesting agent can read it programmatically. No reasoning, no streaming.
+
+  #agent-bus (DISCORD_BUS_CHANNEL_ID)
+      Broadcast channel. Brief one-line status announcements only. No streaming.
+
 Event bridge integration
 ------------------------
-Instead of using Task.progress_callback, this bot registers a per-task sink on
-the module-level EventBridge (agent.events.bridge). The sink maps typed AgentEvent
-objects to Discord messages, giving the bot a clean, exhaustive view of everything
-the agent is doing — thinking, tool calls, shell output, checkpoints, errors.
-
-The sink is registered with a unique tag before the task starts and unregistered
-in the finally block so it never leaks across tasks.
+A per-task sink is registered on the EventBridge against the PRIVATE channel
+(DISCORD_AGENT_CHANNEL_ID), not the channel the triggering message came from.
+This ensures thinking/tool streaming always appears in the private channel,
+keeping agent-comms and agent-bus clean.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import traceback
 
 import discord
@@ -56,14 +70,12 @@ _SILENT_TOOLS = frozenset({
 })
 
 # How many shell output chunks to buffer before flushing to Discord.
-# We don't want one message per line — batch them into blocks.
 _SHELL_OUTPUT_BATCH = 20
 
 
 def _fmt_args(args: object) -> str:
     """Format tool args for display — truncate to keep Discord messages readable."""
     if isinstance(args, dict):
-        # Show key=value pairs, skip large values
         parts = []
         for k, v in args.items():
             vs = str(v)
@@ -77,8 +89,7 @@ class DiscordBot:
 
     def __init__(self, loop: AgentLoop) -> None:
         self._agent_loop = loop
-        # Per-channel inject queues: while a task is running, new messages for
-        # the same channel are pushed here instead of starting a new task.
+        # Per-channel inject queues for zipper-merge
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
         # The channel_id of the task currently running (0 if none)
         self._active_channel: int = 0
@@ -91,7 +102,6 @@ class DiscordBot:
         self._client = discord.Client(intents=intents)
         self._setup_events()
 
-        # Give tools access to the client for discord_send/discord_read
         set_discord_client(self._client)
 
     def _setup_events(self) -> None:
@@ -138,7 +148,7 @@ class DiscordBot:
             await self._client.close()
 
     async def _handle_message(self, message: discord.Message) -> None:
-        """Route a Discord message to the agent loop and reply with the result."""
+        """Route a Discord message to the agent loop and send replies."""
         assert self._client.user
 
         parsed = classify(message, self._client.user)
@@ -157,8 +167,11 @@ class DiscordBot:
         if not task_content.strip():
             return
 
-        channel = message.channel
+        # The private channel is ALWAYS used for streaming, regardless of where
+        # the message came from. This keeps agent-comms and agent-bus clean.
+        private_channel = self._client.get_channel(settings.discord_agent_channel_id)
 
+        # Zipper-merge: if agent is busy, inject into running task or queue
         if self._agent_loop.is_busy:
             if self._active_channel == parsed.channel_id:
                 inject_q = self._inject_queues.get(parsed.channel_id)
@@ -192,8 +205,8 @@ class DiscordBot:
                 pass
             return
 
-        # Agent is free — build inject queue and run directly
-        inject_q: asyncio.Queue[str] = asyncio.Queue()
+        # Agent is free — set up inject queue and run
+        inject_q = asyncio.Queue()
         self._inject_queues[parsed.channel_id] = inject_q
         self._active_channel = parsed.channel_id
 
@@ -206,14 +219,23 @@ class DiscordBot:
             inject_queue=inject_q,
         )
 
-        # Register a per-task Discord sink on the bridge
+        # Always register the EventBridge sink against the PRIVATE channel so
+        # that all thinking/tool/shell streaming goes there, never to comms/bus.
         sink_tag = f"discord_{parsed.channel_id}_{id(task)}"
-        discord_sink = self._make_discord_sink(channel)  # type: ignore[arg-type]
-        bridge.register(sink_tag, discord_sink)
+        if private_channel is not None:
+            discord_sink = self._make_discord_sink(private_channel)  # type: ignore[arg-type]
+            bridge.register(sink_tag, discord_sink)
+
+        # Show typing indicator in the private channel during processing
+        typing_ctx = (
+            private_channel.typing()  # type: ignore[union-attr]
+            if private_channel is not None
+            else message.channel.typing()  # type: ignore[union-attr]
+        )
 
         self._agent_loop.is_busy = True
         try:
-            async with channel.typing():  # type: ignore[union-attr]
+            async with typing_ctx:
                 result = await self._agent_loop._process(task)
         finally:
             self._agent_loop.is_busy = False
@@ -221,7 +243,6 @@ class DiscordBot:
             self._inject_queues.pop(parsed.channel_id, None)
             bridge.unregister(sink_tag)
 
-        # Don't send a second reply if the agent already called send_discord
         if result.discord_replied:
             return
 
@@ -229,35 +250,120 @@ class DiscordBot:
         if not reply:
             return
 
-        try:
-            chunks = [reply[i:i+MAX_REPLY_LEN] for i in range(0, len(reply), MAX_REPLY_LEN)]
-            await message.reply(chunks[0], mention_author=False)
-            for chunk in chunks[1:]:
-                await channel.send(chunk)  # type: ignore[union-attr]
-        except discord.HTTPException as exc:
-            log.error("discord_send_failed", error=str(exc))
+        await self._send_reply(parsed, result.output, message)
 
-    def _make_discord_sink(
+    async def _send_reply(
         self,
-        channel: discord.abc.Messageable,
-    ):
+        parsed: object,
+        output: str,
+        original_message: discord.Message,
+    ) -> None:
         """
-        Return an async sink function that maps typed AgentEvents to Discord messages.
+        Route the final task result to the appropriate channel(s).
 
-        Per-event mapping:
+          A2A task  → post structured JSON result back to agent-comms (so the
+                       requesting agent can read it) + brief status to agent-bus
+          Bus task  → post brief status to agent-bus; full result to private
+          Direct    → reply in the private channel
+        """
+        from agent.communication.message_router import ParsedMessage
+
+        # Narrow the type for attribute access
+        parsed_msg = parsed  # type: ignore[assignment]
+
+        is_a2a = (
+            hasattr(parsed_msg, "kind")
+            and parsed_msg.kind == MessageKind.A2A  # type: ignore[attr-defined]
+            and getattr(parsed_msg, "a2a_payload", None)
+        )
+        is_bus = (
+            hasattr(parsed_msg, "channel_id")
+            and parsed_msg.channel_id == settings.discord_bus_channel_id  # type: ignore[attr-defined]
+        )
+
+        if is_a2a:
+            from_agent = parsed_msg.a2a_payload.get("from", "")  # type: ignore[attr-defined]
+            # Post JSON result back to comms for the requesting agent to read
+            if from_agent and settings.discord_comms_channel_id:
+                comms = self._client.get_channel(settings.discord_comms_channel_id)
+                if comms is not None:
+                    reply_json = json.dumps({
+                        "from": settings.agent_name,
+                        "to": from_agent,
+                        "task": "result",
+                        "payload": output[:1800],
+                    })
+                    try:
+                        await comms.send(reply_json)  # type: ignore[union-attr]
+                    except discord.HTTPException as exc:
+                        log.warning("a2a_reply_failed", error=str(exc))
+            # Also post a brief status to the bus
+            await self._post_bus_status(
+                f"**{settings.agent_name}** completed task from {from_agent or 'unknown'}."
+            )
+
+        elif is_bus:
+            # Mentioned in bus — short status to bus, full result to private
+            await self._post_bus_status(f"**{settings.agent_name}**: {output[:300]}")
+            private_channel = self._client.get_channel(settings.discord_agent_channel_id)
+            if private_channel is not None:
+                await self._send_chunked(private_channel, output)  # type: ignore[arg-type]
+
+        else:
+            # Direct private-channel task — reply in private
+            private_channel = self._client.get_channel(settings.discord_agent_channel_id)
+            target = private_channel or original_message.channel
+            try:
+                chunks = [output[i:i+MAX_REPLY_LEN] for i in range(0, len(output), MAX_REPLY_LEN)]
+                # Use message.reply only if the original message was in the private channel
+                if (
+                    original_message.channel.id == settings.discord_agent_channel_id
+                    and chunks
+                ):
+                    await original_message.reply(chunks[0], mention_author=False)
+                    for chunk in chunks[1:]:
+                        await target.send(chunk)  # type: ignore[union-attr]
+                else:
+                    await self._send_chunked(target, output)  # type: ignore[arg-type]
+            except discord.HTTPException as exc:
+                log.error("discord_send_failed", error=str(exc))
+
+    async def _send_chunked(self, channel: discord.abc.Messageable, text: str) -> None:
+        """Send a long text to a channel, splitting into chunks as needed."""
+        chunks = [text[i:i+MAX_REPLY_LEN] for i in range(0, len(text), MAX_REPLY_LEN)]
+        for chunk in chunks:
+            try:
+                await channel.send(chunk)
+            except discord.HTTPException as exc:
+                log.warning("send_chunked_failed", error=str(exc))
+
+    async def _post_bus_status(self, message: str) -> None:
+        """Post a brief status message to agent-bus. Silent if not configured."""
+        if not settings.discord_bus_channel_id:
+            return
+        bus = self._client.get_channel(settings.discord_bus_channel_id)
+        if bus is None:
+            return
+        try:
+            await bus.send(message[:MAX_REPLY_LEN])  # type: ignore[union-attr]
+        except discord.HTTPException as exc:
+            log.warning("bus_status_failed", error=str(exc))
+
+    def _make_discord_sink(self, channel: discord.abc.Messageable):  # type: ignore[return]
+        """
+        Return an async sink function bound to the given channel (always private).
+
+        Event → Discord mapping:
           TaskStartEvent      → 🔍 Working on: *<content>*
           ThinkingEndEvent    → 🧠 *<thinking>*
-          TextTurnEndEvent    → 💭 <text>  (intermediate only; final is sent as reply)
-          ToolCallStartEvent  → 🔧 `tool_name(args)`  (skip noisy read/memory tools)
+          TextTurnEndEvent    → 💭 <text>  (intermediate turns only)
+          ToolCallStartEvent  → 🔧 `tool_name(args)`  (silent for read/memory tools)
           ShellStartEvent     → $ `command`
-          ShellOutputEvent    → batched into code blocks (flushed every N lines or on done)
+          ShellOutputEvent    → batched into code blocks
           ShellDoneEvent      → exit N (X.Xs)
-          ProgressEvent       → message as-is  (ticker, rate-limit, inject acks, etc.)
+          ProgressEvent       → message as-is
           TaskErrorEvent      → ❌ error
-          TaskDoneEvent       → (silent — the final reply is sent by _handle_message)
-          ToolResultEvent     → (silent — too verbose; surface via ThinkingEndEvent)
-          TextDeltaEvent      → (silent — individual tokens, too noisy for Discord)
-          ThinkingDeltaEvent  → (silent — individual tokens, too noisy for Discord)
+          (all others silent)
         """
         shell_output_buf: list[str] = []
 
@@ -274,7 +380,6 @@ class DiscordBot:
                 return
             combined = "".join(shell_output_buf)
             shell_output_buf.clear()
-            # Wrap in a code block for readability; truncate if huge
             display = combined[:1800]
             await _send(f"```\n{display}\n```")
 
@@ -289,12 +394,10 @@ class DiscordBot:
                     await _send(f"🧠 *{event.text[:1900]}*")
 
             elif isinstance(event, TextTurnEndEvent):
-                # is_final=True → this is the reply, sent by _handle_message; skip here
                 if not event.is_final and event.text:
                     await _send(f"💭 {event.text[:1900]}")
 
             elif isinstance(event, ToolCallStartEvent):
-                # Skip noisy tools that don't add value in the chat
                 if event.tool_name not in _SILENT_TOOLS:
                     await _send(f"🔧 `{event.tool_name}({_fmt_args(event.args)})`")
 
@@ -316,9 +419,6 @@ class DiscordBot:
 
             elif isinstance(event, TaskErrorEvent):
                 await _send(f"❌ {event.error[:400]}")
-
-            # TaskDoneEvent, ToolResultEvent, TextDeltaEvent,
-            # ThinkingDeltaEvent — intentionally silent in Discord
 
         return sink
 
