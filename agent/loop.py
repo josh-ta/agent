@@ -303,14 +303,14 @@ class AgentLoop:
             content=task.content[:120],
         )
 
-        # Expire stale task journal — clear if last modified more than 2 hours ago
-        # to prevent old journal entries from contaminating a fresh unrelated task.
+        # Expire stale task journal — clear if last modified more than 30 minutes ago.
+        # Short window prevents old context bleeding into unrelated tasks.
         _journal_path = settings.workspace_path / ".task_journal.md"
         try:
             if _journal_path.exists():
                 import os as _os
                 age_s = time.time() - _journal_path.stat().st_mtime
-                if age_s > 7200:  # 2 hours
+                if age_s > 1800:  # 30 minutes
                     _journal_path.unlink()
                     log.info("task_journal_expired", age_s=round(age_s))
         except Exception:
@@ -456,7 +456,9 @@ class AgentLoop:
 
             await bridge.emit(TaskErrorEvent(error=str(exc)[:400]))
 
-            if "429" in str(exc):
+            exc_str = str(exc)
+            if "429" in exc_str:
+                # Rate limit: preserve journal so the agent can resume
                 try:
                     from datetime import datetime as _dt
                     journal = settings.workspace_path / ".task_journal.md"
@@ -470,6 +472,16 @@ class AgentLoop:
                     journal.parent.mkdir(parents=True, exist_ok=True)
                     with journal.open("a", encoding="utf-8") as f:
                         f.write(note)
+                except Exception:
+                    pass
+            else:
+                # Hard crash (tool limit, EOF, etc.) — clear the journal so it
+                # doesn't bleed stale context into the next unrelated task.
+                try:
+                    journal = settings.workspace_path / ".task_journal.md"
+                    if journal.exists():
+                        journal.unlink()
+                        log.info("task_journal_cleared_on_crash", error=exc_str[:80])
                 except Exception:
                     pass
 
