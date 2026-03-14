@@ -134,8 +134,9 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
         except Exception as exc:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
-    # Extended thinking: only supported on claude-3-7-sonnet and newer Claude models.
-    # Haiku does not support thinking — only enable for smart/best tiers.
+    # Extended thinking: on by default for capable Claude models.
+    # Disabled when: THINKING_ENABLED=false, non-Claude model, or Haiku
+    # (Haiku does not support the thinking API).
     model_settings = None
     is_claude = "claude" in model_string
     is_haiku = "haiku" in model_string

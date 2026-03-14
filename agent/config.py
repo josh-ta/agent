@@ -28,9 +28,10 @@ class Settings(BaseSettings):
 
     # ── Extended thinking ─────────────────────────────────────────────────────
     # Enables Claude's extended thinking (chain-of-thought) feature.
-    # Only supported on claude-3-7-sonnet and newer models.
+    # Only supported on non-Haiku Claude models (sonnet, opus, etc.).
     # When enabled, thinking blocks are streamed to Discord as 🧠 messages.
-    thinking_enabled: bool = Field(default=False, alias="THINKING_ENABLED")
+    # Defaults to True — set THINKING_ENABLED=false to disable explicitly.
+    thinking_enabled: bool = Field(default=True, alias="THINKING_ENABLED")
     thinking_budget_tokens: int = Field(default=8000, alias="THINKING_BUDGET_TOKENS")
 
     # ── Identity ──────────────────────────────────────────────────────────────
