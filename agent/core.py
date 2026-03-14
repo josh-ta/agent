@@ -180,24 +180,32 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
         except Exception as exc:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
-    # Extended thinking: on by default for capable Claude models.
-    # Disabled when: THINKING_ENABLED=false, non-Claude model, or Haiku
-    # (Haiku does not support the thinking API).
-    model_settings = None
+    # Build model settings with prompt caching and optional extended thinking.
+    # anthropic_cache_instructions caches the system prompt (billed at ~10% on reads).
+    # anthropic_cache_tool_definitions caches the tool list (also large and static).
+    # Extended thinking: disabled by default; enable with THINKING_ENABLED=true.
+    # Haiku does not support thinking or prompt caching TTL control.
     is_claude = "claude" in model_string
     is_haiku = "haiku" in model_string
+
+    model_settings: dict = {}
+
+    if is_claude and not is_haiku:
+        model_settings["anthropic_cache_instructions"] = True
+        model_settings["anthropic_cache_tool_definitions"] = True
+
     if settings.thinking_enabled and is_claude and not is_haiku:
-        model_settings = {
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": settings.thinking_budget_tokens,
-            }
+        model_settings["anthropic_thinking"] = {
+            "type": "enabled",
+            "budget_tokens": settings.thinking_budget_tokens,
         }
         log.info(
             "thinking_enabled",
             model=model_string,
             budget_tokens=settings.thinking_budget_tokens,
         )
+
+    model_settings = model_settings or None
 
     agent: Agent = Agent(  # type: ignore[type-arg]
         model=model_string,

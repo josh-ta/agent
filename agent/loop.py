@@ -739,8 +739,8 @@ class AgentLoop:
             if not result.success:
                 await self._reflect_on_failure(task, result)
             else:
-                # Extract insight from complex successful tasks (>3 tool calls)
-                if result.tool_calls > 3:
+                # Extract insight from complex successful tasks (>7 tool calls)
+                if result.tool_calls > 7:
                     await self._reflect_on_success(task, result)
                 if self._success_count % MEMORY_UPDATE_INTERVAL == 0:
                     await self._update_memory_md()
@@ -792,7 +792,8 @@ class AgentLoop:
 
         try:
             # Run without MCP servers — reflection is text+memory only, no browser needed
-            reflection = await self.agent.run(reflection_prompt, usage_limits=UsageLimits(request_limit=None))
+            fast_agent = self.agents.get("fast", self.agent)
+            reflection = await fast_agent.run(reflection_prompt, usage_limits=UsageLimits(request_limit=None))
             lesson = str(reflection.output).strip()
 
             await self.memory.save_lesson(
