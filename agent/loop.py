@@ -572,6 +572,13 @@ class AgentLoop:
                     or ("400" in exc_str and "maximum" in exc_str)
                 )
                 is_rate_limit = "429" in exc_str
+                # Truncated tool-call args in message history: pydantic-ai can't
+                # re-serialize a ToolCallPart whose args JSON was cut off mid-stream.
+                # Fix: drop the message history and retry from scratch.
+                is_bad_args = (
+                    "EOF while parsing" in exc_str
+                    or "args_as_dict" in exc_str
+                )
 
                 if is_context_overflow and _context_retries < _max_context_retries:
                     _context_retries += 1
@@ -609,6 +616,15 @@ class AgentLoop:
                     ))
                     await asyncio.sleep(_rate_delay)
                     _rate_delay *= 2
+                    continue
+
+                elif is_bad_args:
+                    log.warning("truncated_tool_args_retry", error=exc_str[:200])
+                    await bridge.emit(ProgressEvent(
+                        message="⚠️ Tool args got truncated — retrying from last checkpoint…"
+                    ))
+                    # Drop message history so pydantic-ai starts fresh on the next turn
+                    message_history = None
                     continue
 
                 else:

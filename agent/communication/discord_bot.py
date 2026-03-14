@@ -62,15 +62,11 @@ from agent.tools.discord_tools import set_discord_client
 log = structlog.get_logger()
 
 MAX_REPLY_LEN = 1990  # Discord limit minus a small buffer
-
-# Tool names whose args/results are too noisy to show in Discord
 _SILENT_TOOLS = frozenset({
     "read_file", "list_dir", "memory_save", "lesson_search",
-    "task_resume", "task_journal_clear",
+    "task_resume", "task_journal_clear", "memory_search",
+    "lessons_recent", "lesson_save", "read_channel", "read_discord",
 })
-
-# How many shell output chunks to buffer before flushing to Discord.
-_SHELL_OUTPUT_BATCH = 20
 
 
 def _fmt_args(args: object) -> str:
@@ -355,17 +351,20 @@ class DiscordBot:
 
         Event → Discord mapping:
           TaskStartEvent      → 🔍 Working on: *<content>*
-          ThinkingEndEvent    → 🧠 *<thinking>*
+          ThinkingEndEvent    → 🧠 *<thinking>*  (chunked)
           TextTurnEndEvent    → 💭 <text>  (intermediate turns only)
           ToolCallStartEvent  → 🔧 `tool_name(args)`  (silent for read/memory tools)
           ShellStartEvent     → $ `command`
-          ShellOutputEvent    → batched into code blocks
-          ShellDoneEvent      → exit N (X.Xs)
+          ShellOutputEvent    → buffered, flushed as a single code block on ShellDoneEvent
+          ShellDoneEvent      → appended to the shell output block as exit N (X.Xs)
           ProgressEvent       → message as-is
           TaskErrorEvent      → ❌ error
           (all others silent)
         """
-        shell_output_buf: list[str] = []
+        # Per-command buffer: (message_obj, lines)
+        # We edit the original message to append the exit code rather than sending a new one.
+        shell_lines: list[str] = []
+        shell_msg: discord.Message | None = None
 
         async def _send(text: str) -> None:
             chunks = [text[i:i+MAX_REPLY_LEN] for i in range(0, len(text), MAX_REPLY_LEN)]
@@ -375,27 +374,17 @@ class DiscordBot:
                 except discord.HTTPException as exc:
                     log.warning("discord_sink_send_failed", error=str(exc))
 
-        async def _flush_shell_buf() -> None:
-            if not shell_output_buf:
-                return
-            combined = "".join(shell_output_buf)
-            shell_output_buf.clear()
-            display = combined[:1800]
-            await _send(f"```\n{display}\n```")
-
         async def sink(event: AgentEvent) -> None:
-            nonlocal shell_output_buf
+            nonlocal shell_lines, shell_msg
 
             if isinstance(event, TaskStartEvent):
-                await _send(f"🔍 Working on: *{event.content}*")
+                await _send(f"🔍 *{event.content}*")
 
             elif isinstance(event, ThinkingEndEvent):
                 if event.text:
-                    # Split thinking into chunks — wrap each in italics
-                    thinking_text = event.text
                     chunk_size = 1800
-                    for i in range(0, len(thinking_text), chunk_size):
-                        chunk = thinking_text[i:i+chunk_size].strip()
+                    for i in range(0, len(event.text), chunk_size):
+                        chunk = event.text[i:i+chunk_size].strip()
                         if chunk:
                             await _send(f"🧠 *{chunk}*")
 
@@ -408,16 +397,41 @@ class DiscordBot:
                     await _send(f"🔧 `{event.tool_name}({_fmt_args(event.args)})`")
 
             elif isinstance(event, ShellStartEvent):
-                await _send(f"$ `{event.command[:200]}`")
+                # Show the command; buffer output to append on done
+                shell_lines = []
+                shell_msg = None
+                try:
+                    shell_msg = await channel.send(f"$ `{event.command[:200]}`")  # type: ignore[union-attr]
+                except discord.HTTPException:
+                    pass
 
             elif isinstance(event, ShellOutputEvent):
-                shell_output_buf.append(event.chunk)
-                if len(shell_output_buf) >= _SHELL_OUTPUT_BATCH:
-                    await _flush_shell_buf()
+                # Buffer output — only flush to Discord on done to avoid message spam
+                shell_lines.append(event.chunk)
 
             elif isinstance(event, ShellDoneEvent):
-                await _flush_shell_buf()
-                await _send(f"exit {event.exit_code} ({event.elapsed_s:.1f}s)")
+                output = "".join(shell_lines).strip()
+                shell_lines = []
+                status = f"exit {event.exit_code} ({event.elapsed_s:.1f}s)"
+                if output:
+                    display = output[-1400:]  # tail — most relevant part
+                    combined = f"```\n{display}\n```\n{status}"
+                    try:
+                        if shell_msg is not None:
+                            await shell_msg.edit(content=f"{shell_msg.content}\n{combined}")
+                        else:
+                            await _send(combined)
+                    except discord.HTTPException:
+                        await _send(combined)
+                else:
+                    try:
+                        if shell_msg is not None:
+                            await shell_msg.edit(content=f"{shell_msg.content} → {status}")
+                        else:
+                            await _send(status)
+                    except discord.HTTPException:
+                        await _send(status)
+                shell_msg = None
 
             elif isinstance(event, ProgressEvent):
                 if event.message:
