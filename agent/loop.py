@@ -55,6 +55,7 @@ from typing import Any
 
 import structlog
 from pydantic_ai import Agent
+from pydantic_ai.usage import UsageLimits
 from pydantic_ai.messages import (
     FinalResultEvent,
     PartDeltaEvent,
@@ -532,6 +533,7 @@ class AgentLoop:
                     async for event in agent.run_stream_events(
                         prompt,
                         message_history=message_history or [],
+                        usage_limits=UsageLimits(request_limit=None),
                     ):
                         # ── Thinking delta ─────────────────────────────────────
                         if isinstance(event, PartDeltaEvent) and isinstance(
