@@ -73,7 +73,6 @@ class Settings(BaseSettings):
     )
 
     # ── Behaviour ─────────────────────────────────────────────────────────────
-    max_loop_iterations: int = Field(default=50, alias="MAX_LOOP_ITERATIONS")
     heartbeat_seconds: int = Field(default=60, alias="HEARTBEAT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 

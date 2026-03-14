@@ -529,7 +529,7 @@ class AgentLoop:
         _rate_retries = 0
         _max_rate_retries = 3
         _rate_delay = 5.0
-        _tool_call_total = 0  # cumulative across retries for iteration cap
+        _tool_call_total = 0  # cumulative across retries, for logging
 
         while True:  # retry loop for context overflow and rate limits
             discord_replied = False
@@ -591,13 +591,6 @@ class AgentLoop:
                             _tool_call_total += 1
                             if tool_name == "send_discord":
                                 discord_replied = True
-
-                            # Guard against infinite tool-call loops
-                            if _tool_call_total > settings.max_loop_iterations:
-                                raise RuntimeError(
-                                    f"Tool call limit reached ({settings.max_loop_iterations}). "
-                                    "Task aborted to prevent infinite loop."
-                                )
 
                             # Parse args — may be dict or JSON string
                             raw_args = event.part.args
