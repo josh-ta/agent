@@ -84,9 +84,6 @@ log = structlog.get_logger()
 # Reflect on MEMORY.md every N successful tasks
 MEMORY_UPDATE_INTERVAL = 10
 
-# How often to send a "still working" ping for long tasks (seconds)
-PROGRESS_PING_INTERVAL = 60
-
 
 # ── Model routing ──────────────────────────────────────────────────────────────
 
@@ -235,19 +232,6 @@ class AgentLoop:
         task = Task(content=content, source=source)
         return await self._process(task)
 
-    async def _progress_ticker(self, task: Task, start: float) -> None:
-        """
-        Coroutine that emits ProgressEvent pings after the agent has been running a while.
-        Sleeps first so the first ping only appears if the task is genuinely slow.
-        """
-        while True:
-            await asyncio.sleep(PROGRESS_PING_INTERVAL)
-            elapsed_s = asyncio.get_event_loop().time() - start
-            mins = int(elapsed_s // 60)
-            secs = int(elapsed_s % 60)
-            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-            await bridge.emit(ProgressEvent(message=f"⏳ Still working… ({time_str} elapsed)"))
-
     async def _summarize_context(self, task: Task, accumulated_prompt: str) -> str:
         """
         Ask the fast agent to compress accumulated tool-call history into a
@@ -352,10 +336,6 @@ class AgentLoop:
         parts.append(task.content)
         base_prompt = "\n\n---\n\n".join(parts)
 
-        # Progress ticker — fires every PROGRESS_PING_INTERVAL if task is still running
-        ticker: asyncio.Task | None = None  # type: ignore[type-arg]
-        ticker = asyncio.create_task(self._progress_ticker(task, start))
-
         try:
             result_output, tool_calls = await self._run_with_streaming(
                 task=task,
@@ -423,12 +403,7 @@ class AgentLoop:
             )
 
         finally:
-            if ticker and not ticker.done():
-                ticker.cancel()
-                try:
-                    await ticker
-                except asyncio.CancelledError:
-                    pass
+            pass
 
     async def _run_with_streaming(
         self,
