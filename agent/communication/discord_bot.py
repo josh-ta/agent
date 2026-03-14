@@ -391,7 +391,13 @@ class DiscordBot:
 
             elif isinstance(event, ThinkingEndEvent):
                 if event.text:
-                    await _send(f"🧠 *{event.text[:1900]}*")
+                    # Split thinking into chunks — wrap each in italics
+                    thinking_text = event.text
+                    chunk_size = 1800
+                    for i in range(0, len(thinking_text), chunk_size):
+                        chunk = thinking_text[i:i+chunk_size].strip()
+                        if chunk:
+                            await _send(f"🧠 *{chunk}*")
 
             elif isinstance(event, TextTurnEndEvent):
                 if not event.is_final and event.text:

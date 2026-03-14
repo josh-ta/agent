@@ -87,6 +87,8 @@ class ToolRegistry:
 
             note: what you just did, what you found, and what the next step is.
             """
+            import asyncio as _asyncio
+            from agent.events import bridge as _bridge, ProgressEvent as _ProgressEvent
             from datetime import datetime as _dt
             ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             entry = f"\n### [{ts}]\n{note.strip()}\n"
@@ -94,6 +96,13 @@ class ToolRegistry:
                 _journal_path.parent.mkdir(parents=True, exist_ok=True)
                 with _journal_path.open("a", encoding="utf-8") as f:
                     f.write(entry)
+                # Surface the checkpoint in Discord
+                try:
+                    loop = _asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(_bridge.emit(_ProgressEvent(message=f"📝 {note.strip()}")))
+                except Exception:
+                    pass
                 return f"Journal updated ({_journal_path})."
             except Exception as exc:
                 return f"[journal write error: {exc}]"
