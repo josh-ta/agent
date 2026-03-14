@@ -258,7 +258,7 @@ class AgentLoop:
             fast_agent = self.agents.get("fast", self.agent)
             # Run without MCP servers — summarization needs no browser tools
             # and we're already inside an outer run_mcp_servers() context.
-            summary_result = await fast_agent.run(summarize_prompt)
+            summary_result = await fast_agent.run(summarize_prompt, usage_limits=UsageLimits(request_limit=None))
             summary = str(summary_result.output).strip()
             log.info("context_summarized", summary_len=len(summary))
             return summary
@@ -770,7 +770,7 @@ class AgentLoop:
 
         try:
             fast_agent = self.agents.get("fast", self.agent)
-            insight_result = await fast_agent.run(reflection_prompt)
+            insight_result = await fast_agent.run(reflection_prompt, usage_limits=UsageLimits(request_limit=None))
             insight = str(insight_result.output).strip()
 
             if insight and "NOTHING_TO_RECORD" not in insight:
@@ -799,7 +799,7 @@ class AgentLoop:
 
         try:
             # Run without MCP servers — reflection is text+memory only, no browser needed
-            reflection = await self.agent.run(reflection_prompt)
+            reflection = await self.agent.run(reflection_prompt, usage_limits=UsageLimits(request_limit=None))
             lesson = str(reflection.output).strip()
 
             await self.memory.save_lesson(
