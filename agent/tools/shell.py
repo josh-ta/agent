@@ -4,14 +4,15 @@ Shell tool: run arbitrary commands on the host system.
 Security notes:
 - Commands run as the container user (non-root by default)
 - Working directory defaults to WORKSPACE_PATH
-- Output is capped at 2 KB to avoid flooding the context window; use read_file for large files
+- Output is capped at 10 KB to avoid flooding the context window; use read_file for large files
+- Pass tail_lines=N to get the last N lines instead (useful for test runners)
 - Timeout defaults to 120 s; agent can pass a higher value for long-running commands
   (e.g. timeout=3600 for docker build, npm install, etc.) — there is no upper limit
 
 Streaming:
 - stdout/stderr are read line-by-line and emitted as ShellOutputEvent via the bridge
   so Discord (and other sinks) can show live output as the command runs.
-- The 2KB cap only applies to what is returned to the model — the bridge receives
+- The 10KB cap only applies to what is returned to the model — the bridge receives
   every line regardless of size.
 """
 
@@ -28,20 +29,21 @@ from agent.events import bridge, ShellStartEvent, ShellOutputEvent, ShellDoneEve
 
 log = structlog.get_logger()
 
-MAX_OUTPUT_BYTES = 2 * 1024  # 2 KB — use read_file for large files, not cat
+MAX_OUTPUT_BYTES = 10 * 1024  # 10 KB — use read_file for large files, not cat
 
 
 async def shell_run(
     command: str,
     working_dir: str | None = None,
     timeout: int = 120,
+    tail_lines: int = 0,
 ) -> str:
     """
     Execute a shell command and return combined stdout + stderr.
 
     stdout/stderr are streamed line-by-line to the event bridge (ShellOutputEvent)
     as the process runs, so consumers see live output without waiting for completion.
-    The return value (passed back to the model) is still capped at 2KB.
+    The return value (passed back to the model) is capped at 10KB by default.
 
     Args:
         command: The shell command to run (passed to bash -c).
@@ -49,6 +51,8 @@ async def shell_run(
         timeout: Max seconds to wait. Defaults to 120. Pass a higher value
                  for long-running commands (docker build, npm install, etc.).
                  There is no upper limit — the agent controls this.
+        tail_lines: When > 0, return the last N lines instead of the first 10KB.
+                    Use this for test runners where failures appear at the end.
 
     Returns:
         Combined output string with exit code appended.
@@ -123,11 +127,16 @@ async def shell_run(
 
         output = b"".join(output_chunks).decode("utf-8", errors="replace")
 
-        # Truncate what is returned to the model — bridge already got everything
-        if len(output) > MAX_OUTPUT_BYTES:
+        # tail_lines mode: return the last N lines (ideal for test runners)
+        if tail_lines > 0:
+            lines = output.splitlines()
+            if len(lines) > tail_lines:
+                output = f"... [{len(lines) - tail_lines} earlier lines omitted]\n" + "\n".join(lines[-tail_lines:])
+            # else output fits entirely — no truncation needed
+        elif len(output) > MAX_OUTPUT_BYTES:
             output = (
                 output[:MAX_OUTPUT_BYTES]
-                + f"\n... [truncated at 2KB, total {total_bytes} bytes — use read_file for large files]"
+                + f"\n... [truncated at 10KB, total {total_bytes} bytes — use read_file for large files or tail_lines=N for test output]"
             )
 
         result = f"{output}\n[exit code: {exit_code}]"

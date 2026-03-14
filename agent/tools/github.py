@@ -12,9 +12,37 @@ import json
 
 from agent.tools.shell import shell_run
 
+_detected_repo: str | None = None  # cached within a process run
+
+
+async def _detect_repo() -> str | None:
+    """
+    Auto-detect the GitHub repo slug (owner/repo) from the workspace git remote.
+    Returns None if detection fails. Result is cached after first successful call.
+    """
+    global _detected_repo
+    if _detected_repo:
+        return _detected_repo
+    from agent.config import settings
+    try:
+        result = await shell_run(
+            "gh repo view --json nameWithOwner -q .nameWithOwner",
+            working_dir=str(settings.workspace_path),
+            timeout=10,
+        )
+        slug = result.strip()
+        if slug and "/" in slug and not slug.startswith("["):
+            _detected_repo = slug
+            return slug
+    except Exception:
+        pass
+    return None
+
 
 async def _gh(args: str, repo: str | None = None, timeout: int = 30) -> str:
-    """Run a gh command, optionally scoped to a repo."""
+    """Run a gh command, optionally scoped to a repo. Auto-detects repo if not given."""
+    if not repo:
+        repo = await _detect_repo()
     repo_flag = f" --repo {repo}" if repo else ""
     return await shell_run(f"gh {args}{repo_flag}", timeout=timeout)
 
@@ -91,10 +119,8 @@ async def pr_review_with_comments(
         return "[error] action must be 'APPROVE', 'REQUEST_CHANGES', or 'COMMENT'"
 
     if not repo:
-        # Attempt to detect current repo from git remote
-        detect = await shell_run("gh repo view --json nameWithOwner -q .nameWithOwner", timeout=10)
-        repo = detect.strip()
-        if not repo or repo.startswith("["):
+        repo = await _detect_repo()
+        if not repo:
             return "[error] repo is required for inline review comments (e.g. 'owner/repo')"
 
     review_comments = [

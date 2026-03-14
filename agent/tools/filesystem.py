@@ -9,7 +9,9 @@ workspace it should use the shell tool instead.
 from __future__ import annotations
 
 import os
+import shlex
 import stat
+import subprocess
 from pathlib import Path
 
 import structlog
@@ -142,5 +144,119 @@ def delete_file(path: str) -> str:
             return "[ERROR: use shell 'rm -rf' for directories]"
         fp.unlink()
         return f"Deleted {fp}"
+    except Exception as exc:
+        return f"[ERROR: {exc}]"
+
+
+def str_replace_file(
+    path: str,
+    old_str: str,
+    new_str: str,
+    expected_replacements: int = 1,
+) -> str:
+    """
+    Replace an exact string in a file and write it back.
+
+    Verifies the old string appears exactly expected_replacements times before
+    writing, so the agent gets a loud error instead of a silent wrong edit.
+
+    Args:
+        path: File path (relative to workspace or absolute).
+        old_str: The exact text to find. Include enough surrounding context to
+                 make it unique.
+        new_str: The replacement text.
+        expected_replacements: How many times old_str must appear (default 1).
+
+    Returns:
+        Success message or error describing the mismatch.
+    """
+    try:
+        fp = _safe_path(path)
+        if not fp.exists():
+            return f"[ERROR: file not found: {path}]"
+        if not fp.is_file():
+            return f"[ERROR: not a file: {path}]"
+
+        content = fp.read_text(encoding="utf-8", errors="replace")
+        count = content.count(old_str)
+        if count == 0:
+            return (
+                f"[ERROR: old_str not found in {path}. "
+                f"Check for whitespace or encoding differences.]"
+            )
+        if count != expected_replacements:
+            return (
+                f"[ERROR: expected {expected_replacements} occurrence(s) of old_str "
+                f"but found {count} in {path}. "
+                f"Make old_str more specific or set expected_replacements={count}.]"
+            )
+
+        updated = content.replace(old_str, new_str, expected_replacements)
+        fp.write_text(updated, encoding="utf-8")
+        log.info("str_replace", path=str(fp), count=count)
+        return f"Replaced {count} occurrence(s) in {fp}"
+    except Exception as exc:
+        return f"[ERROR: {exc}]"
+
+
+MAX_SEARCH_BYTES = 8 * 1024  # 8 KB — enough for ~200 lines of context
+
+
+def search_files(
+    pattern: str,
+    path: str = ".",
+    file_glob: str = "",
+    context_lines: int = 2,
+) -> str:
+    """
+    Search files using ripgrep (rg) and return matching lines with context.
+
+    Args:
+        pattern: Regular expression to search for.
+        path: Directory or file to search (relative to workspace or absolute).
+        file_glob: File name filter, e.g. '*.py' or '*.{ts,tsx}'.
+        context_lines: Lines of context to show around each match (default 2).
+
+    Returns:
+        Ripgrep output (file:line:content format) or error message.
+    """
+    try:
+        resolved = _safe_path(path)
+        if not resolved.exists():
+            return f"[ERROR: path not found: {path}]"
+
+        cmd: list[str] = [
+            "rg",
+            "--line-number",
+            f"--context={context_lines}",
+            "--no-heading",
+        ]
+        if file_glob:
+            cmd += ["--glob", file_glob]
+        cmd += [pattern, str(resolved)]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        output = result.stdout
+        if not output and result.returncode == 1:
+            return f"(no matches for pattern: {pattern})"
+        if result.returncode not in (0, 1):
+            return f"[ERROR: rg exited {result.returncode}: {result.stderr[:200]}]"
+
+        if len(output) > MAX_SEARCH_BYTES:
+            output = (
+                output[:MAX_SEARCH_BYTES]
+                + f"\n... [truncated at 8KB — refine your pattern or file_glob]"
+            )
+        return output or f"(no matches for pattern: {pattern})"
+    except FileNotFoundError:
+        return "[ERROR: ripgrep (rg) not found — install it with: apt-get install ripgrep]"
+    except subprocess.TimeoutExpired:
+        return "[ERROR: search timed out after 30s — narrow the search path or pattern]"
     except Exception as exc:
         return f"[ERROR: {exc}]"

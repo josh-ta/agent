@@ -423,18 +423,23 @@ class DiscordBot:
             elif isinstance(event, ShellDoneEvent):
                 output = "".join(shell_lines).strip()
                 shell_lines = []
-                status = f"exit {event.exit_code} ({event.elapsed_s:.1f}s)"
+                # Only annotate with exit status when it's a failure or there's output
+                failed = event.exit_code != 0
+                status = f"exit {event.exit_code} ({event.elapsed_s:.1f}s)" if failed else None
                 if output:
                     display = _escape_codeblock(output[-1400:])  # tail — most relevant part
-                    combined = f"```\n{display}\n```\n{status}"
+                    body = f"```\n{display}\n```"
+                    if status:
+                        body += f"\n{status}"
                     try:
                         if shell_msg is not None:
-                            await shell_msg.edit(content=f"{shell_msg.content}\n{combined}")
+                            await shell_msg.edit(content=f"{shell_msg.content}\n{body}")
                         else:
-                            await _send(combined)
+                            await _send(body)
                     except discord.HTTPException:
-                        await _send(combined)
-                else:
+                        await _send(body)
+                elif status:
+                    # Failed with no output — show the exit code
                     try:
                         if shell_msg is not None:
                             await shell_msg.edit(content=f"{shell_msg.content} → {status}")
@@ -442,6 +447,7 @@ class DiscordBot:
                             await _send(status)
                     except discord.HTTPException:
                         await _send(status)
+                # Success with no output — silently discard (no edit needed)
                 shell_msg = None
 
             elif isinstance(event, ProgressEvent):

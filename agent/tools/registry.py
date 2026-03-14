@@ -47,9 +47,13 @@ class ToolRegistry:
 
         # ── Shell ─────────────────────────────────────────────────────────────
         @agent.tool_plain
-        async def run_shell(command: str, working_dir: str = "", timeout: int = 30) -> str:
-            """Run a shell command. Returns combined stdout+stderr + exit code."""
-            return await shell.shell_run(command, working_dir or None, timeout)
+        async def run_shell(command: str, working_dir: str = "", timeout: int = 30, tail_lines: int = 0) -> str:
+            """
+            Run a shell command. Returns combined stdout+stderr + exit code.
+            tail_lines: when > 0, return only the last N lines (useful for test runners
+            where failures appear at the end and output exceeds the 10KB cap).
+            """
+            return await shell.shell_run(command, working_dir or None, timeout, tail_lines)
 
         # ── Filesystem ────────────────────────────────────────────────────────
         @agent.tool_plain
@@ -71,6 +75,31 @@ class ToolRegistry:
         def delete_file(path: str) -> str:
             """Delete a file (not directories)."""
             return filesystem.delete_file(path)
+
+        @agent.tool_plain
+        def str_replace(path: str, old_str: str, new_str: str, expected_replacements: int = 1) -> str:
+            """
+            Replace an exact string in a file (surgical edit — preferred over write_file).
+
+            Fails loudly if old_str is not found exactly expected_replacements times,
+            so mismatches are caught before any write happens.
+
+            old_str: include enough surrounding context to make it unique in the file.
+            expected_replacements: how many occurrences to replace (default 1).
+            """
+            return filesystem.str_replace_file(path, old_str, new_str, expected_replacements)
+
+        @agent.tool_plain
+        def search_files(pattern: str, path: str = ".", file_glob: str = "", context_lines: int = 2) -> str:
+            """
+            Search files with ripgrep (rg). Returns matching lines with context.
+
+            pattern: regular expression.
+            path: directory or file to search (default: workspace root).
+            file_glob: filename filter, e.g. '*.py' or '*.{ts,tsx}'.
+            context_lines: lines of context around each match (default 2).
+            """
+            return filesystem.search_files(pattern, path, file_glob, context_lines)
 
         # ── Task journal (checkpointing for long tasks) ───────────────────────
         _journal_path = settings.workspace_path / ".task_journal.md"
