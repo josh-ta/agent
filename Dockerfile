@@ -19,14 +19,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python deps first (cache layer)
+# Install Python deps first (cache layer — invalidates when pyproject.toml changes)
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[dev]" 2>/dev/null || pip install --no-cache-dir -e . || true
+RUN pip install --no-cache-dir -e .
 
 # Copy application source
 COPY agent/ ./agent/
 
-# Install the package properly
+# Re-install to register entry points after source copy
 RUN pip install --no-cache-dir -e .
 
 # Create data/workspace directories (container runs as root — simplest for bind mounts)
