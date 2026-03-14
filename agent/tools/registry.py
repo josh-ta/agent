@@ -15,7 +15,7 @@ from pydantic_ai import Agent, RunContext
 
 from agent.config import settings
 from agent.tools import filesystem, github, self_edit, shell
-from agent.tools.discord_tools import discord_read, discord_read_named, discord_send
+from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
     from agent.memory.sqlite_store import SQLiteStore
@@ -184,6 +184,24 @@ class ToolRegistry:
             Use this to catch up on conversation history or check what other agents said.
             """
             return await discord_read_named(name, limit)
+
+        @agent.tool_plain
+        async def ask_user_question(question: str, timeout: int = 300) -> str:
+            """
+            Ask the user a question and wait for their reply (up to timeout seconds).
+
+            Use this when you are genuinely uncertain about something that could
+            change what you do: ambiguous requirements, risky/irreversible actions,
+            missing credentials, or a fork in the approach. Do NOT ask for things
+            you can figure out yourself.
+
+            The question is posted to your private channel with a ❓ prefix.
+            This tool pauses your work until the user replies or the timeout expires.
+
+            question: A clear, specific question. Prefer yes/no or short-answer questions.
+            timeout:  Seconds to wait (default 300 = 5 min). Use longer for low-urgency asks.
+            """
+            return await ask_user(question, timeout)
 
         # ── GitHub ────────────────────────────────────────────────────────────
 

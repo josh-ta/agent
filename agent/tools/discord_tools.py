@@ -86,7 +86,58 @@ async def discord_read(channel_id: int, limit: int = 20) -> str:
         return f"[ERROR: {exc}]"
 
 
-async def discord_read_named(name: str, limit: int = 20) -> str:
+async def ask_user(question: str, timeout: int = 300) -> str:
+    """
+    Post a question to the agent's private channel and wait for the user's reply.
+
+    Sends the question with a ❓ prefix so the user knows a response is needed,
+    then polls for a new message from a non-bot user for up to `timeout` seconds.
+
+    Args:
+        question: The question to ask the user.
+        timeout:  Seconds to wait for a reply (default 300 = 5 minutes).
+
+    Returns:
+        The user's reply text, or a timeout notice if no reply arrives.
+    """
+    from agent.config import settings
+
+    if _discord_client is None:
+        return "[ERROR: Discord client not initialised]"
+
+    channel_id = settings.discord_agent_channel_id
+    if not channel_id:
+        return "[ERROR: DISCORD_AGENT_CHANNEL_ID not configured]"
+
+    channel = _discord_client.get_channel(channel_id)
+    if channel is None:
+        return f"[ERROR: private channel {channel_id} not found]"
+
+    # Record the message ID we're about to send so we only read replies after it
+    try:
+        sent = await channel.send(f"❓ {question}")  # type: ignore[union-attr]
+        sent_id = sent.id
+        log.info("ask_user_sent", channel=channel_id, question=question[:80])
+    except Exception as exc:
+        return f"[ERROR sending question: {exc}]"
+
+    # Poll for a reply from a non-bot user
+    import asyncio as _asyncio
+    poll_interval = 3  # seconds between checks
+    elapsed = 0
+    while elapsed < timeout:
+        await _asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            async for msg in channel.history(limit=10, after=sent):  # type: ignore[union-attr]
+                if not msg.author.bot:
+                    log.info("ask_user_replied", elapsed_s=elapsed, reply=msg.content[:80])
+                    return msg.content
+        except Exception as exc:
+            return f"[ERROR reading reply: {exc}]"
+
+    log.warning("ask_user_timeout", timeout=timeout, question=question[:80])
+    return f"[No reply received after {timeout}s — proceeding with best judgment]"
     """
     Read recent messages from a named channel: 'private', 'bus', or 'comms'.
 
