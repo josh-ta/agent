@@ -72,11 +72,19 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
                 return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
             except json.JSONDecodeError:
                 pass
-        # Non-JSON message in comms from a human — treat as a task so both agents act on it.
-        # Bot posts that are non-JSON (e.g. malformed JSON) remain IGNORE.
+        # Non-JSON message in comms from a human.
+        # If a specific agent is @mentioned, only that agent acts.
+        # If no agent is @mentioned (broadcast intent), all agents act.
+        # Bot non-JSON posts remain IGNORE.
         if not message.author.bot:
             clean = re.sub(r"<@!?\d+>", "", content).strip()
             if clean:
+                # If the message mentions any bot, only respond if it mentions THIS bot
+                if any(user.bot for user in message.mentions):
+                    if bot_user.mentioned_in(message):
+                        return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
+                    return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
+                # No specific bot mentioned — broadcast, all agents act
                 return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
 
     # Private channel for this agent → always a task
