@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from pydantic import Field
@@ -95,8 +96,16 @@ class Settings(BaseSettings):
     def _to_model_string(self, model: str) -> str:
         if model.startswith("claude"):
             return f"anthropic:{model}"
-        if model.startswith("gpt") or model.startswith("o"):
+        if model.startswith("gpt") or re.match(r"^o\d", model):
             return f"openai:{model}"
+        if model.startswith("gemini"):
+            return f"google-gla:{model}"
+        # Already fully-qualified with a provider prefix — pass through as-is.
+        if ":" in model:
+            return model
+        # Bare open-source model names default to Groq inference.
+        if model.startswith(("llama", "mixtral", "qwen", "deepseek", "mistral", "kimi", "moonshotai")):
+            return f"groq:{model}"
         return model
 
     def model_string_for(self, tier: str) -> str:

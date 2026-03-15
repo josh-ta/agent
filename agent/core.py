@@ -108,9 +108,6 @@ def build_system_prompt(other_agents: list[str] | None = None) -> str:
 - Agent comms — structured JSON A2A only: {comms_id}
 - Agent bus — brief broadcast announcements: {bus_id}
 
-## Tools
-shell, read_file, write_file, str_replace, search_files, list_dir, browser_navigate/screenshot/click/type, discord_send, read_discord, read_channel(name), ask_user_question, edit_skill, edit_identity, self_restart, memory_save, lesson_search, skill_read, task_note, task_resume, task_journal_clear, gh_pr_view, gh_pr_diff, gh_pr_comment, gh_pr_review, gh_pr_review_inline, gh_pr_checks, gh_pr_merge, gh_issue_view, gh_issue_comment, gh_issue_create, gh_ci_list, gh_ci_logs_failed, gh_ci_rerun
-
 ## Rules
 1. Think before acting. Use shell for system tasks.
 2. Read files before writing. Ask if unsure.
@@ -181,24 +178,63 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
     # Build model settings with prompt caching and optional extended thinking.
-    # anthropic_cache_instructions caches the system prompt (billed at ~10% on reads).
-    # anthropic_cache_tool_definitions caches the tool list (also large and static).
-    # Extended thinking: disabled by default; enable with THINKING_ENABLED=true.
-    # Haiku does not support thinking or prompt caching TTL control.
+    # Cache TTL is 1h (vs default 5m) — sporadic Discord usage means 5m caches
+    # frequently expire; 1h gives far more cache hits at only a slightly higher
+    # write cost (2x vs 1.25x surcharge, same 90% discount on reads).
     is_claude = "claude" in model_string
     is_haiku = "haiku" in model_string
+    is_openai = "openai" in model_string
+    is_reasoning_model = any(x in model_string for x in ("o1", "o3", "o4"))
+    is_gemini = "google" in model_string or "gemini" in model_string
+    is_groq = "groq" in model_string
 
     model_settings: dict = {}
 
+    # Anthropic — explicit cache markers required; Haiku does not support TTL control.
     if is_claude and not is_haiku:
-        model_settings["anthropic_cache_instructions"] = True
-        model_settings["anthropic_cache_tool_definitions"] = True
+        model_settings["anthropic_cache_instructions"] = "1h"
+        model_settings["anthropic_cache_tool_definitions"] = "1h"
+        # Cache the last user message so accumulated tool-call turns stay cached.
+        model_settings["anthropic_cache_messages"] = "1h"
 
     if settings.thinking_enabled and is_claude and not is_haiku:
         model_settings["anthropic_thinking"] = {
             "type": "enabled",
             "budget_tokens": settings.thinking_budget_tokens,
         }
+        log.info(
+            "thinking_enabled",
+            model=model_string,
+            budget_tokens=settings.thinking_budget_tokens,
+        )
+
+    # OpenAI — caching is automatic; these settings improve routing hit rates
+    # and extend retention from the default 5–60 min to 24h.
+    if is_openai:
+        model_settings["openai_prompt_cache_key"] = settings.agent_name
+        model_settings["openai_prompt_cache_retention"] = "24h"
+        if is_reasoning_model and settings.thinking_enabled:
+            model_settings["openai_reasoning_effort"] = "high"
+            log.info(
+                "thinking_enabled",
+                model=model_string,
+                budget_tokens=settings.thinking_budget_tokens,
+            )
+
+    # Gemini — caching is fully automatic (implicit); only wire thinking here.
+    if is_gemini and settings.thinking_enabled:
+        model_settings["google_thinking_config"] = {
+            "thinking_budget": settings.thinking_budget_tokens,
+        }
+        log.info(
+            "thinking_enabled",
+            model=model_string,
+            budget_tokens=settings.thinking_budget_tokens,
+        )
+
+    # Groq — no caching available; wire reasoning format for capable models.
+    if is_groq and settings.thinking_enabled:
+        model_settings["groq_reasoning_format"] = "parsed"
         log.info(
             "thinking_enabled",
             model=model_string,
