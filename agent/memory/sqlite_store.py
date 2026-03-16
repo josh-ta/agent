@@ -19,6 +19,14 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 import structlog
 
+from agent.memory.sqlite_components import (
+    SQLiteConversationRepository,
+    SQLiteLessonRepository,
+    SQLiteMaintenance,
+    SQLiteMemoryRepository,
+    SQLiteTaskRepository,
+)
+
 if TYPE_CHECKING:
     from agent.loop import Task, TaskResult
 
@@ -138,6 +146,11 @@ class SQLiteStore:
         self._db: aiosqlite.Connection | None = None
         self._has_vec: bool = False
         self._last_cleanup_ts: float = 0.0
+        self.conversations = SQLiteConversationRepository(self)
+        self.tasks = SQLiteTaskRepository(self)
+        self.memory_facts = SQLiteMemoryRepository(self)
+        self.lessons = SQLiteLessonRepository(self)
+        self.maintenance = SQLiteMaintenance(self)
 
     def _check(self) -> None:
         if not self._db:
@@ -205,135 +218,24 @@ class SQLiteStore:
         channel_id: int = 0,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        self._check()
-        assert self._db
-        await self._db.execute(
-            "INSERT INTO conversations (channel_id, role, content, metadata, ts) VALUES (?,?,?,?,?)",
-            (channel_id, role, content, json.dumps(metadata or {}), time.time()),
-        )
-        await self._db.commit()
+        await self.conversations.save_message(role, content, channel_id, metadata)
 
     async def get_history(self, channel_id: int = 0, limit: int = 20) -> list[dict[str, Any]]:
-        self._check()
-        assert self._db
-        async with self._db.execute(
-            "SELECT role, content, ts FROM conversations "
-            "WHERE channel_id=? ORDER BY ts DESC LIMIT ?",
-            (channel_id, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in reversed(rows)]
+        return await self.conversations.get_history(channel_id, limit)
 
     # ── Tasks ─────────────────────────────────────────────────────────────────
 
     async def record_task(self, task: Task, result: TaskResult) -> None:
-        self._check()
-        assert self._db
-        await self._db.execute(
-            """INSERT INTO tasks
-               (source, author, content, result, success, elapsed_ms, tool_calls, ts)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (
-                task.source,
-                task.author,
-                task.content,
-                result.output,
-                int(result.success),
-                result.elapsed_ms,
-                result.tool_calls,
-                time.time(),
-            ),
-        )
-        await self._db.commit()
+        await self.tasks.record_task(task, result)
 
     # ── Memory facts ──────────────────────────────────────────────────────────
 
     async def save_memory_fact(self, content: str, metadata: dict[str, Any] | None = None) -> int:
-        self._check()
-        assert self._db
-        cur = await self._db.execute(
-            "INSERT INTO memory_facts (content, metadata, ts) VALUES (?,?,?)",
-            (content, json.dumps(metadata or {}), time.time()),
-        )
-        await self._db.commit()
-        fact_id = cur.lastrowid or 0
-
-        # Store embedding in vec table if sqlite-vec is available
-        if self._has_vec and fact_id:
-            try:
-                embedding = await _embed(content)
-                if embedding is not None:
-                    vec_str = json.dumps(embedding)
-                    await self._db.execute(
-                        "INSERT OR REPLACE INTO memory_vec(fact_id, embedding) VALUES (?, ?)",
-                        (fact_id, vec_str),
-                    )
-                    await self._db.commit()
-            except Exception as exc:
-                log.warning("memory_vec_insert_failed", error=str(exc))
-
-        return fact_id
+        return await self.memory_facts.save_memory_fact(content, metadata)
 
     async def search_memory(self, query: str, limit: int = 5) -> str:
         """Search memory facts — tries vector similarity first, falls back to FTS5."""
-        self._check()
-        assert self._db
-
-        # Try semantic vector search first
-        if self._has_vec:
-            try:
-                embedding = await _embed(query)
-                if embedding is not None:
-                    vec_str = json.dumps(embedding)
-                    async with self._db.execute(
-                        """SELECT mf.content, mf.ts, mv.distance
-                           FROM memory_vec mv
-                           JOIN memory_facts mf ON mv.fact_id = mf.id
-                           WHERE mv.embedding MATCH ?
-                             AND k = ?
-                           ORDER BY mv.distance""",
-                        (vec_str, limit),
-                    ) as cur:
-                        rows = await cur.fetchall()
-                    if rows:
-                        import datetime
-                        lines = []
-                        for row in rows:
-                            ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
-                            lines.append(f"[{ts_str}] {row['content']}")
-                        return "\n".join(lines)
-            except Exception as exc:
-                log.debug("memory_vec_search_failed", error=str(exc))
-
-        # FTS5 keyword search
-        safe_query = query.replace('"', '""')
-        try:
-            async with self._db.execute(
-                """SELECT mf.content, mf.ts, rank
-                   FROM memory_fts
-                   JOIN memory_facts mf ON memory_fts.rowid = mf.id
-                   WHERE memory_fts MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (f'"{safe_query}"', limit),
-            ) as cur:
-                rows = await cur.fetchall()
-        except Exception:
-            async with self._db.execute(
-                "SELECT content, ts, 0 as rank FROM memory_facts WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
-                (f"%{query}%", limit),
-            ) as cur:
-                rows = await cur.fetchall()
-
-        if not rows:
-            return f"(no memory matches for: {query})"
-
-        import datetime
-        lines = []
-        for row in rows:
-            ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
-            lines.append(f"[{ts_str}] {row['content']}")
-        return "\n".join(lines)
+        return await self.memory_facts.search_memory(query, limit)
 
     # ── Lessons ───────────────────────────────────────────────────────────────
 
@@ -344,219 +246,33 @@ class SQLiteStore:
         context: str = "",
     ) -> int:
         """Record a lesson, mistake, or insight for future reference."""
-        self._check()
-        assert self._db
-        cur = await self._db.execute(
-            "INSERT INTO lessons (kind, summary, context, ts) VALUES (?,?,?,?)",
-            (kind, summary, context, time.time()),
-        )
-        await self._db.commit()
-        return cur.lastrowid or 0
+        return await self.lessons.save_lesson(summary, kind, context)
 
     async def search_lessons(self, query: str, limit: int = 5) -> str:
-        """Search lessons relevant to a query — surfaced before each task.
-        Increments `applied` counter for each matched lesson so useful lessons
-        accumulate higher scores and survive retention longer.
-        """
-        self._check()
-        assert self._db
-        safe_query = query.replace('"', '""')
-        matched_ids: list[int] = []
-        try:
-            async with self._db.execute(
-                """SELECT l.id, l.kind, l.summary, l.ts
-                   FROM lessons_fts
-                   JOIN lessons l ON lessons_fts.rowid = l.id
-                   WHERE lessons_fts MATCH ?
-                   ORDER BY rank
-                   LIMIT ?""",
-                (f'"{safe_query}"', limit),
-            ) as cur:
-                rows = await cur.fetchall()
-            matched_ids = [r["id"] for r in rows]
-        except Exception:
-            async with self._db.execute(
-                "SELECT id, kind, summary, ts FROM lessons WHERE summary LIKE ? ORDER BY ts DESC LIMIT ?",
-                (f"%{query}%", limit),
-            ) as cur:
-                rows = await cur.fetchall()
-            matched_ids = [r["id"] for r in rows]
-
-        if not rows:
-            return ""
-
-        # Increment applied counter for retrieved lessons
-        if matched_ids:
-            placeholders = ",".join("?" * len(matched_ids))
-            await self._db.execute(
-                f"UPDATE lessons SET applied=applied+1 WHERE id IN ({placeholders})",
-                matched_ids,
-            )
-            await self._db.commit()
-
-        import datetime
-        lines = ["## Relevant past lessons:"]
-        for row in rows:
-            ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
-            lines.append(f"- [{row['kind'].upper()} {ts_str}] {row['summary']}")
-            # Cap at whole-lesson boundary — stop before this line would overflow
-            candidate = "\n".join(lines)
-            if len(candidate) > 1200:
-                break
-        return "\n".join(lines)
+        """Search lessons relevant to a query and increment their applied counters."""
+        return await self.lessons.search_lessons(query, limit)
 
     async def get_recent_lessons(self, limit: int = 20) -> str:
         """Return the most recent lessons for MEMORY.md updates."""
-        self._check()
-        assert self._db
-        async with self._db.execute(
-            "SELECT kind, summary, ts FROM lessons ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ) as cur:
-            rows = await cur.fetchall()
-
-        if not rows:
-            return "(no lessons recorded yet)"
-
-        import datetime
-        lines = []
-        for row in rows:
-            ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
-            lines.append(f"- [{row['kind'].upper()} {ts_str}] {row['summary']}")
-        return "\n".join(lines)
+        return await self.lessons.get_recent_lessons(limit)
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def get_stats(self) -> dict[str, Any]:
         """Return row counts and file size for diagnostics."""
-        self._check()
-        assert self._db
-        stats: dict[str, Any] = {}
-        for table in ("conversations", "tasks", "memory_facts", "lessons"):
-            async with self._db.execute(f"SELECT COUNT(*) as n FROM {table}") as cur:
-                row = await cur.fetchone()
-                stats[table] = row["n"] if row else 0
-        try:
-            stats["db_size_mb"] = round(self._path.stat().st_size / 1_048_576, 2)
-        except Exception:
-            stats["db_size_mb"] = "unknown"
-        stats["last_cleanup"] = (
-            time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self._last_cleanup_ts))
-            if self._last_cleanup_ts else "never"
-        )
-        stats["vec_enabled"] = self._has_vec
-        return stats
+        return await self.maintenance.get_stats()
 
     # ── Cleanup / Retention ───────────────────────────────────────────────────
 
     async def _cleanup(self) -> None:
-        """Prune tables to their retention limits. Runs at most once per hour."""
-        from agent.config import settings
-        self._check()
-        assert self._db
-        now = time.time()
-        log.info("sqlite_cleanup_start")
-
-        # conversations: keep last RETENTION_CONVERSATIONS_DAYS per channel,
-        # also hard-cap at 1000 rows per channel
-        days = settings.retention_conversations_days
-        cutoff = now - days * 86400
-        await self._db.execute(
-            "DELETE FROM conversations WHERE ts < ?", (cutoff,)
-        )
-        # Per-channel hard cap: delete oldest beyond 1000
-        async with self._db.execute(
-            "SELECT DISTINCT channel_id FROM conversations"
-        ) as cur:
-            channels = [r[0] for r in await cur.fetchall()]
-        for ch in channels:
-            await self._db.execute(
-                """DELETE FROM conversations WHERE channel_id=? AND id NOT IN (
-                       SELECT id FROM conversations WHERE channel_id=? ORDER BY ts DESC LIMIT 1000
-                   )""",
-                (ch, ch),
-            )
-
-        # tasks: keep last RETENTION_TASKS_DAYS
-        days_t = settings.retention_tasks_days
-        await self._db.execute(
-            "DELETE FROM tasks WHERE ts < ?", (now - days_t * 86400,)
-        )
-
-        # memory_facts: keep newest RETENTION_MEMORY_FACTS_MAX rows
-        max_facts = settings.retention_memory_facts_max
-        await self._db.execute(
-            """DELETE FROM memory_facts WHERE id NOT IN (
-                   SELECT id FROM memory_facts ORDER BY ts DESC LIMIT ?
-               )""",
-            (max_facts,),
-        )
-        # Also clean up orphaned vec entries
-        if self._has_vec:
-            await self._db.execute(
-                "DELETE FROM memory_vec WHERE fact_id NOT IN (SELECT id FROM memory_facts)"
-            )
-
-        # lessons: keep top RETENTION_LESSONS_MAX by applied DESC, ts DESC
-        max_lessons = settings.retention_lessons_max
-        await self._db.execute(
-            """DELETE FROM lessons WHERE id NOT IN (
-                   SELECT id FROM lessons ORDER BY applied DESC, ts DESC LIMIT ?
-               )""",
-            (max_lessons,),
-        )
-
-        await self._db.commit()
-
-        # Rebuild FTS indexes after deletes
-        try:
-            await self._db.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')")
-            await self._db.execute("INSERT INTO lessons_fts(lessons_fts) VALUES ('rebuild')")
-            await self._db.commit()
-        except Exception as exc:
-            log.warning("fts_rebuild_failed", error=str(exc))
-
-        # WAL checkpoint
-        await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-
-        # Monthly VACUUM
-        async with self._db.execute(
-            "SELECT value FROM _meta WHERE key='last_vacuum_ts'"
-        ) as cur:
-            row = await cur.fetchone()
-        last_vacuum = float(row[0]) if row else 0.0
-        if now - last_vacuum > _VACUUM_INTERVAL_S:
-            await self._db.execute("VACUUM")
-            await self._db.execute(
-                "INSERT OR REPLACE INTO _meta(key,value) VALUES('last_vacuum_ts',?)",
-                (str(now),),
-            )
-            await self._db.commit()
-            log.info("sqlite_vacuumed")
-
-        # Record cleanup time
-        self._last_cleanup_ts = now
-        await self._db.execute(
-            "INSERT OR REPLACE INTO _meta(key,value) VALUES('last_cleanup_ts',?)",
-            (str(now),),
-        )
-        await self._db.commit()
-        log.info("sqlite_cleanup_done")
+        """Prune tables to their retention limits."""
+        await self.maintenance.cleanup()
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def heartbeat(self) -> None:
         """Periodic maintenance: checkpoint WAL, run cleanup if due."""
-        if not self._db:
-            return
-        await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-
-        now = time.time()
-        if now - self._last_cleanup_ts >= _CLEANUP_INTERVAL_S:
-            try:
-                await self._cleanup()
-            except Exception as exc:
-                log.warning("sqlite_cleanup_error", error=str(exc))
+        await self.maintenance.heartbeat()
 
 
 # ── Embedding helper (mirrors postgres_store pattern) ─────────────────────────

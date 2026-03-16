@@ -21,6 +21,13 @@ import asyncpg
 import structlog
 
 from agent.config import settings
+from agent.memory.postgres_components import (
+    AgentRegistryRepository,
+    AuditLogRepository,
+    PostgresMaintenance,
+    SharedMemoryRepository,
+    SharedTaskRepository,
+)
 
 log = structlog.get_logger()
 
@@ -130,6 +137,11 @@ class PostgresStore:
         self._has_vector: bool = False
         self._has_embeddings: bool = False  # True when vector + OpenAI key both available
         self._last_cleanup_ts: float = 0.0
+        self.registry = AgentRegistryRepository(self)
+        self.tasks = SharedTaskRepository(self)
+        self.audit = AuditLogRepository(self)
+        self.shared_memory_repo = SharedMemoryRepository(self)
+        self.maintenance = PostgresMaintenance(self)
 
     async def init(self) -> None:
         """Create connection pool and ensure schema exists."""
@@ -177,340 +189,88 @@ class PostgresStore:
 
     async def register_agent(self) -> None:
         """Upsert this agent's presence in the agents table."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO agents (id, name, status, model, last_seen)
-                   VALUES ($1, $2, 'online', $3, NOW())
-                   ON CONFLICT (id) DO UPDATE
-                   SET status='online', last_seen=NOW(), model=EXCLUDED.model""",
-                settings.agent_name,
-                settings.agent_name,
-                settings.agent_model,
-            )
+        await self.registry.register_agent()
         log.info("agent_registered", name=settings.agent_name)
 
     async def set_offline(self) -> None:
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE agents SET status='offline', last_seen=NOW() WHERE id=$1",
-                settings.agent_name,
-            )
+        await self.registry.set_offline()
 
     async def list_agents(self) -> str:
         """Return a formatted list of all registered agents."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT name, status, model, last_seen FROM agents ORDER BY last_seen DESC"
-            )
-        if not rows:
-            return "(no agents registered)"
-        lines = ["Registered agents:", ""]
-        for r in rows:
-            last = r["last_seen"].strftime("%Y-%m-%d %H:%M") if r["last_seen"] else "never"
-            lines.append(f"  • {r['name']} [{r['status']}] model={r['model']} last_seen={last}")
-        return "\n".join(lines)
+        return await self.registry.list_agents()
 
     # ── Shared task queue ─────────────────────────────────────────────────────
 
     async def create_task(self, to_agent: str, description: str) -> str:
         """Create a task for another agent."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """INSERT INTO shared_tasks (from_agent, to_agent, description)
-                   VALUES ($1, $2, $3) RETURNING id""",
-                settings.agent_name,
-                to_agent,
-                description,
-            )
-        task_id = row["id"] if row else "unknown"
-        log.info("shared_task_created", to=to_agent, id=task_id)
-        return f"Task {task_id} created for {to_agent}."
+        result = await self.tasks.create_task(to_agent, description)
+        log.info("shared_task_created", to=to_agent)
+        return result
 
     async def get_my_tasks(self) -> str:
         """Get pending tasks assigned to this agent (formatted for tool output)."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT id, from_agent, description, status, created_at
-                   FROM shared_tasks
-                   WHERE to_agent=$1 AND status='pending'
-                   ORDER BY created_at ASC""",
-                settings.agent_name,
-            )
-        if not rows:
-            return "(no pending tasks)"
-        lines = ["My pending tasks:", ""]
-        for r in rows:
-            ts = r["created_at"].strftime("%Y-%m-%d %H:%M")
-            lines.append(f"  [{r['id'][:8]}] from={r['from_agent']} at={ts}: {r['description']}")
-        return "\n".join(lines)
+        return await self.tasks.get_my_tasks()
 
     async def get_pending_task_rows(self) -> list[dict]:
         """Fetch pending tasks for the heartbeat A2A poller (returns raw dicts)."""
-        if not self._pool:
-            return []
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT id, from_agent, description
-                   FROM shared_tasks
-                   WHERE to_agent=$1 AND status='pending'
-                   ORDER BY created_at ASC
-                   LIMIT 5""",
-                settings.agent_name,
-            )
-        return [dict(r) for r in rows]
+        return await self.tasks.get_pending_task_rows()
 
     async def mark_task_running(self, task_id: str) -> None:
         """Mark a shared task as running so it's not picked up twice."""
-        if not self._pool:
-            return
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE shared_tasks SET status='running', updated_at=NOW() WHERE id=$1",
-                task_id,
-            )
+        await self.tasks.mark_task_running(task_id)
 
     async def complete_task(self, task_id: str, result: str) -> str:
         """Mark a shared task as done with a result."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            tag = await conn.execute(
-                """UPDATE shared_tasks
-                   SET status='done', result=$1, updated_at=NOW()
-                   WHERE id=$2""",
-                result,
-                task_id,
-            )
-        updated = int(tag.split()[-1]) if tag else 0
-        if updated == 0:
-            return f"Task {task_id[:8]} not found or already completed."
+        result_text = await self.tasks.complete_task(task_id, result)
         log.info("shared_task_completed", id=task_id)
-        return f"Task {task_id[:8]} marked done."
+        return result_text
 
     # ── Broadcasts (audit_log) ────────────────────────────────────────────────
 
     async def broadcast_message(self, message: str, event_type: str = "broadcast") -> str:
         """Write a broadcast message to the audit log, visible to all agents."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO audit_log (agent_id, event_type, payload) VALUES ($1,$2,$3)",
-                settings.agent_name,
-                event_type,
-                json.dumps({"message": message}),
-            )
-        return f"Broadcast sent [{event_type}]: {message[:80]}"
+        return await self.audit.broadcast_message(message, event_type)
 
     async def read_broadcasts(self, limit: int = 20, event_type: str = "broadcast") -> str:
         """Read recent broadcast messages from the audit log."""
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT agent_id, payload, ts FROM audit_log
-                   WHERE event_type=$1
-                   ORDER BY ts DESC LIMIT $2""",
-                event_type,
-                limit,
-            )
-        if not rows:
-            return "(no broadcasts)"
-        lines = [f"Recent broadcasts (last {limit}):", ""]
-        for r in rows:
-            ts = r["ts"].strftime("%Y-%m-%d %H:%M")
-            payload = r["payload"] or {}
-            msg = payload.get("message", str(payload))
-            lines.append(f"  [{ts}] {r['agent_id']}: {msg}")
-        return "\n".join(lines)
+        return await self.audit.read_broadcasts(limit, event_type)
 
     # ── Shared memory ─────────────────────────────────────────────────────────
 
     async def share_memory(self, content: str, metadata: dict | None = None) -> str:
         """Write a fact to shared memory — visible to all agents."""
-        assert self._pool
-        embedding = await _embed(content) if self._has_embeddings else None
-        async with self._pool.acquire() as conn:
-            if embedding is not None:
-                # pgvector expects the literal string '[x,y,z,...]' cast to vector
-                vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
-                row = await conn.fetchrow(
-                    """INSERT INTO shared_memory (agent_id, content, metadata, embedding)
-                       VALUES ($1, $2, $3, $4::vector) RETURNING id""",
-                    settings.agent_name,
-                    content,
-                    json.dumps(metadata or {}),
-                    vec_str,
-                )
-            else:
-                row = await conn.fetchrow(
-                    """INSERT INTO shared_memory (agent_id, content, metadata)
-                       VALUES ($1, $2, $3) RETURNING id""",
-                    settings.agent_name,
-                    content,
-                    json.dumps(metadata or {}),
-                )
-        mem_id = row["id"][:8] if row else "unknown"
-        return f"Shared memory saved [{mem_id}]: {content[:80]}"
+        return await self.shared_memory_repo.share_memory(content, metadata)
 
     async def search_shared_memory(self, query: str, limit: int = 5) -> str:
-        """Search shared memory.
-
-        Uses cosine similarity (pgvector <=> operator) when embeddings are
-        available, otherwise falls back to case-insensitive keyword search.
-        """
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            if self._has_embeddings:
-                query_vec = await _embed(query)
-                if query_vec is not None:
-                    vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
-                    rows = await conn.fetch(
-                        """SELECT agent_id, content, created_at,
-                                  1 - (embedding <=> $1::vector) AS similarity
-                           FROM shared_memory
-                           WHERE embedding IS NOT NULL
-                           ORDER BY embedding <=> $1::vector
-                           LIMIT $2""",
-                        vec_str,
-                        limit,
-                    )
-                    if rows:
-                        lines = [f"Shared memory — semantic search for '{query}':", ""]
-                        for r in rows:
-                            ts = r["created_at"].strftime("%Y-%m-%d %H:%M")
-                            sim = f"{r['similarity']:.2f}"
-                            lines.append(f"  [{ts}] {r['agent_id']} (sim={sim}): {r['content']}")
-                        return "\n".join(lines)
-
-            # Fallback: keyword search
-            rows = await conn.fetch(
-                """SELECT agent_id, content, created_at FROM shared_memory
-                   WHERE content ILIKE $1
-                   ORDER BY created_at DESC LIMIT $2""",
-                f"%{query}%",
-                limit,
-            )
-        if not rows:
-            return f"(no shared memory matches for: {query})"
-        lines = [f"Shared memory results for '{query}':", ""]
-        for r in rows:
-            ts = r["created_at"].strftime("%Y-%m-%d %H:%M")
-            lines.append(f"  [{ts}] {r['agent_id']}: {r['content']}")
-        return "\n".join(lines)
+        """Search shared memory."""
+        return await self.shared_memory_repo.search_shared_memory(query, limit)
 
     # ── Audit log ─────────────────────────────────────────────────────────────
 
     async def log_event(self, event_type: str, payload: dict) -> None:
-        assert self._pool
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO audit_log (agent_id, event_type, payload) VALUES ($1,$2,$3)",
-                settings.agent_name,
-                event_type,
-                json.dumps(payload),
-            )
+        await self.audit.log_event(event_type, payload)
 
     async def log_task_start(self, task_content: str, source: str, tier: str) -> None:
         """Auto-write a task_start event to the shared audit log."""
-        if not self._pool:
-            return
-        try:
-            await self.log_event("task_start", {
-                "content": task_content[:300],
-                "source": source,
-                "tier": tier,
-            })
-        except Exception as exc:
-            log.warning("audit_log_task_start_failed", error=str(exc))
+        await self.audit.log_task_start(task_content, source, tier)
 
     async def log_task_done(self, task_content: str, success: bool, elapsed_ms: float, tool_calls: int) -> None:
         """Auto-write a task_done event to the shared audit log."""
-        if not self._pool:
-            return
-        try:
-            await self.log_event("task_done", {
-                "content": task_content[:300],
-                "success": success,
-                "elapsed_ms": round(elapsed_ms),
-                "tool_calls": tool_calls,
-            })
-        except Exception as exc:
-            log.warning("audit_log_task_done_failed", error=str(exc))
+        await self.audit.log_task_done(task_content, success, elapsed_ms, tool_calls)
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
     async def heartbeat(self) -> None:
         """Update last_seen timestamp and run cleanup if due."""
-        if self._pool:
-            try:
-                async with self._pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE agents SET last_seen=NOW() WHERE id=$1",
-                        settings.agent_name,
-                    )
-            except Exception as exc:
-                log.warning("postgres_heartbeat_failed", error=str(exc))
-
-        now_ts = time.time()
-        if now_ts - self._last_cleanup_ts >= _PG_CLEANUP_INTERVAL_S:
-            try:
-                await self._cleanup()
-            except Exception as exc:
-                log.warning("postgres_cleanup_error", error=str(exc))
+        await self.maintenance.heartbeat()
 
     async def _cleanup(self) -> None:
-        """Prune Postgres tables to their retention limits. Runs at most once per hour."""
-        if not self._pool:
-            return
-        log.info("postgres_cleanup_start")
-        now_ts = time.time()
-
-        async with self._pool.acquire() as conn:
-            # audit_log: keep last RETENTION_AUDIT_LOG_DAYS
-            await conn.execute(
-                "DELETE FROM audit_log WHERE ts < NOW() - ($1 || ' days')::interval",
-                str(settings.retention_audit_log_days),
-            )
-
-            # shared_tasks: keep completed/failed for RETENTION_SHARED_TASKS_DAYS
-            await conn.execute(
-                """DELETE FROM shared_tasks
-                   WHERE status IN ('done','failed')
-                     AND updated_at < NOW() - ($1 || ' days')::interval""",
-                str(settings.retention_shared_tasks_days),
-            )
-
-            # shared_memory: keep newest RETENTION_SHARED_MEMORY_MAX rows per agent
-            max_rows = settings.retention_shared_memory_max
-            await conn.execute(
-                """DELETE FROM shared_memory
-                   WHERE id NOT IN (
-                       SELECT id FROM shared_memory
-                       WHERE agent_id = $1
-                       ORDER BY created_at DESC
-                       LIMIT $2
-                   ) AND agent_id = $1""",
-                settings.agent_name,
-                max_rows,
-            )
-
-        self._last_cleanup_ts = now_ts
-        log.info("postgres_cleanup_done")
+        """Prune Postgres tables to their retention limits."""
+        await self.maintenance.cleanup()
 
     async def get_stats(self) -> dict:
         """Return row counts for diagnostics."""
-        if not self._pool:
-            return {}
-        stats: dict = {}
-        async with self._pool.acquire() as conn:
-            for table in ("agents", "shared_tasks", "audit_log", "shared_memory"):
-                row = await conn.fetchrow(f"SELECT COUNT(*) as n FROM {table}")
-                stats[table] = row["n"] if row else 0
-        stats["last_cleanup"] = (
-            time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self._last_cleanup_ts))
-            if self._last_cleanup_ts else "never"
-        )
-        return stats
+        return await self.maintenance.get_stats()
+
+    async def _embed(self, text: str) -> list[float] | None:
+        return await _embed(text)

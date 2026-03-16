@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 import agent.loop as loop_module
-from agent.loop import AgentLoop, Task
+from agent.loop import AgentLoop, Task, _classify_tier, _parse_override
 
 
 class _NullContext:
@@ -91,3 +91,11 @@ async def test_bad_args_retry_is_bounded(monkeypatch: pytest.MonkeyPatch) -> Non
         )
 
     assert agent.calls == 3
+
+
+def test_parse_override_and_classify_tier() -> None:
+    cleaned, override = _parse_override("/best investigate the architecture")
+
+    assert cleaned == "investigate the architecture"
+    assert override == "best"
+    assert _classify_tier("fix the failing tests") == "smart"

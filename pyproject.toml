@@ -34,6 +34,7 @@ agent = "agent.main:cli"
 dev = [
     "pytest",
     "pytest-asyncio",
+    "pytest-cov",
     "ruff",
     "mypy",
 ]
@@ -54,3 +55,19 @@ strict = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--cov=agent --cov-branch --cov-report=term-missing"
+markers = [
+    "unit: fast isolated tests",
+    "integration: tests that use real local resources like temporary SQLite databases",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["agent"]
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = true
+omit = [
+    "tests/*",
+]
