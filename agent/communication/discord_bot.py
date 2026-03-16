@@ -70,6 +70,11 @@ def _fmt_args(args: object) -> str:
     return str(args)[:200]
 
 
+def _allows_inline_reply(channel_id: int) -> bool:
+    """Keep `#agent-comms` raw JSON only by suppressing inline Discord replies there."""
+    return channel_id != settings.discord_comms_channel_id
+
+
 class DiscordBot:
     """Wraps a discord.py Client and connects it to the AgentLoop."""
 
@@ -160,13 +165,14 @@ class DiscordBot:
         inject_q = self._inject_queues.get(parsed.channel_id)
         if inject_q is not None:
             await inject_q.put(task_content)
-            try:
-                await message.reply(
-                    "💬 Got it — I'll fold that into what I'm working on.",
-                    mention_author=False,
-                )
-            except discord.HTTPException:
-                pass
+            if _allows_inline_reply(parsed.channel_id):
+                try:
+                    await message.reply(
+                        "💬 Got it — I'll fold that into what I'm working on.",
+                        mention_author=False,
+                    )
+                except discord.HTTPException:
+                    pass
             return
 
         if self._agent_loop.has_pending_work:
@@ -180,13 +186,14 @@ class DiscordBot:
             ))
             queue_depth = self._agent_loop.queue.qsize()
             position = f"#{queue_depth}" if queue_depth > 1 else "next"
-            try:
-                await message.reply(
-                    f"⏸️ I'm still working on the previous task — queued yours ({position} up).",
-                    mention_author=False,
-                )
-            except discord.HTTPException:
-                pass
+            if _allows_inline_reply(parsed.channel_id):
+                try:
+                    await message.reply(
+                        f"⏸️ I'm still working on the previous task — queued yours ({position} up).",
+                        mention_author=False,
+                    )
+                except discord.HTTPException:
+                    pass
             return
 
         # Agent is free — set up inject queue and run

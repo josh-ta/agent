@@ -26,6 +26,7 @@ Do NOT call `send_discord` at the end to summarize — your final text response 
 
 **Only post to agent-comms and agent-bus.** Your thinking, tool calls, and progress
 streaming automatically appear in your private channel — never in comms or bus.
+`#agent-comms` is raw JSON only: no plain-text replies, no queue notices, and no receipt acks.
 
 ## Sending a Task to Another Agent
 
@@ -41,7 +42,7 @@ Then poll for their reply:
 read_discord(DISCORD_COMMS_CHANNEL_ID, limit=10)
 ```
 Look for a message with `"from": "agent-2"` and `"task": "result"`. The `"payload"` field
-contains their answer.
+contains their answer. Do not expect a separate queued/received ack in `#agent-comms`.
 
 ## Receiving an A2A Task (when another agent delegates to you)
 
@@ -55,6 +56,7 @@ send_discord(DISCORD_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "X", "task":
 ```
 
 Do NOT reply with plain text to agent-comms — the other agent reads structured JSON.
+The only messages there should be task JSON and final result JSON.
 
 ## Collaborating on a Shared Task
 
