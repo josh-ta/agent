@@ -90,4 +90,8 @@ if [[ -f "$MEMORY_FILE" ]]; then
 fi
 
 # ── Start agent ────────────────────────────────────────────────────────────────
+if [[ "${CONTROL_PLANE_ENABLED:-true}" == "true" ]]; then
+    exec python -m agent.main serve-api "$@"
+fi
+
 exec python -m agent.main start "$@"

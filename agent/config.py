@@ -59,6 +59,15 @@ class Settings(BaseSettings):
         default="http://browser:3080/sse", alias="BROWSER_MCP_URL"
     )
 
+    # ── Control plane ─────────────────────────────────────────────────────────
+    control_plane_enabled: bool = Field(default=True, alias="CONTROL_PLANE_ENABLED")
+    control_plane_host: str = Field(default="0.0.0.0", alias="CONTROL_PLANE_HOST")
+    control_plane_port: int = Field(default=8000, alias="CONTROL_PLANE_PORT")
+    control_plane_sse_ping_seconds: int = Field(
+        default=15,
+        alias="CONTROL_PLANE_SSE_PING_SECONDS",
+    )
+
     # ── Proxy (optional — routes browser traffic through a residential/ISP proxy)
     # Format: http://user:pass@host:port  or  socks5://user:pass@host:port
     proxy_url: str = Field(default="", alias="PROXY_URL")

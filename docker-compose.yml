@@ -11,6 +11,9 @@ services:
       - WORKSPACE_PATH=/workspace
       - SKILLS_PATH=/app/agent/skills
       - IDENTITY_PATH=/app/agent/identity
+      - CONTROL_PLANE_ENABLED=${CONTROL_PLANE_ENABLED:-true}
+      - CONTROL_PLANE_HOST=0.0.0.0
+      - CONTROL_PLANE_PORT=${CONTROL_PLANE_PORT:-8000}
     volumes:
       - agent_data:/data                          # SQLite database
       - ./workspace:/workspace                    # Agent writable workspace
@@ -23,6 +26,8 @@ services:
         condition: service_healthy
     networks:
       - agent_net
+    ports:
+      - "${CONTROL_PLANE_PORT:-8000}:${CONTROL_PLANE_PORT:-8000}"
     mem_limit: 2g
     cpus: "2.0"
     logging:

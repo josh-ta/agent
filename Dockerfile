@@ -34,7 +34,9 @@ RUN mkdir -p /data /workspace
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
+EXPOSE 8000
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c "import agent; print('ok')" || exit 1
+    CMD sh -c 'if [ "${CONTROL_PLANE_ENABLED:-true}" = "true" ]; then curl -sf "http://localhost:${CONTROL_PLANE_PORT:-8000}/healthz" >/dev/null; else python -c "import agent; print(\"ok\")"; fi' || exit 1
 
 ENTRYPOINT ["/docker-entrypoint.sh"]

@@ -50,3 +50,18 @@ async def test_event_bridge_unregister_removes_sink() -> None:
     await bridge.emit(ProgressEvent(message="ignored"))
 
     assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_event_bridge_applies_task_context_to_events() -> None:
+    bridge = EventBridge()
+    seen: list[str | None] = []
+
+    async def sink(event) -> None:
+        seen.append(event.task_id)
+
+    bridge.register("sink", sink)
+    with bridge.task_context("task-123"):
+        await bridge.emit(ProgressEvent(message="working"))
+
+    assert seen == ["task-123"]

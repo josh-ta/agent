@@ -52,25 +52,171 @@ class SQLiteTaskRepository:
     def __init__(self, store: "SQLiteStore") -> None:
         self._store = store
 
+    async def migrate(self) -> None:
+        self._store._check()
+        assert self._store._db
+        async with self._store._db.execute("PRAGMA table_info(tasks)") as cur:
+            columns = {row["name"] for row in await cur.fetchall()}
+
+        migrations: list[tuple[str, tuple[Any, ...] | None]] = []
+        if "task_id" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN task_id TEXT", None))
+        if "status" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'", None))
+        if "error" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN error TEXT", None))
+        if "created_ts" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN created_ts REAL", None))
+        if "started_ts" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN started_ts REAL", None))
+        if "finished_ts" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN finished_ts REAL", None))
+        if "updated_ts" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN updated_ts REAL", None))
+
+        for sql, params in migrations:
+            if params is None:
+                await self._store._db.execute(sql)
+            else:
+                await self._store._db.execute(sql, params)
+
+        await self._store._db.execute(
+            """
+            UPDATE tasks
+            SET
+                created_ts = COALESCE(created_ts, ts),
+                updated_ts = COALESCE(updated_ts, ts),
+                finished_ts = CASE
+                    WHEN status IN ('succeeded', 'failed') THEN COALESCE(finished_ts, ts)
+                    ELSE finished_ts
+                END,
+                status = CASE
+                    WHEN status IS NULL OR status = '' OR (task_id IS NULL AND status = 'completed') THEN
+                        CASE
+                            WHEN success = 1 THEN 'succeeded'
+                            ELSE 'failed'
+                        END
+                    ELSE status
+                END,
+                error = CASE
+                    WHEN success = 0 AND result IS NOT NULL AND (error IS NULL OR error = '') THEN result
+                    ELSE error
+                END
+            """
+        )
+        await self._store._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS tasks_task_id_idx ON tasks (task_id)"
+        )
+        await self._store._db.commit()
+
+    async def create_task_record(
+        self,
+        *,
+        task_id: str,
+        source: str,
+        author: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del metadata
+        self._store._check()
+        assert self._store._db
+        now = time.time()
+        await self._store._db.execute(
+            """INSERT INTO tasks
+               (task_id, source, author, content, status, success, created_ts, updated_ts, ts)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (task_id, source, author, content, "queued", 0, now, now, now),
+        )
+        await self._store._db.commit()
+
+    async def mark_task_running(self, task_id: str) -> None:
+        self._store._check()
+        assert self._store._db
+        now = time.time()
+        await self._store._db.execute(
+            """UPDATE tasks
+               SET status='running',
+                   started_ts=COALESCE(started_ts, ?),
+                   updated_ts=?
+               WHERE task_id=?""",
+            (now, now, task_id),
+        )
+        await self._store._db.commit()
+
     async def record_task(self, task: "Task", result: "TaskResult") -> None:
         self._store._check()
         assert self._store._db
-        await self._store._db.execute(
-            """INSERT INTO tasks
-               (source, author, content, result, success, elapsed_ms, tool_calls, ts)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (
-                task.source,
-                task.author,
-                task.content,
-                result.output,
-                int(result.success),
-                result.elapsed_ms,
-                result.tool_calls,
-                time.time(),
-            ),
-        )
+        task_id = str(task.metadata.get("task_id", "")).strip() if task.metadata else ""
+        now = time.time()
+        if task_id:
+            await self._store._db.execute(
+                """UPDATE tasks
+                   SET source=?,
+                       author=?,
+                       content=?,
+                       status=?,
+                       result=?,
+                       error=?,
+                       success=?,
+                       elapsed_ms=?,
+                       tool_calls=?,
+                       started_ts=COALESCE(started_ts, ?),
+                       finished_ts=?,
+                       updated_ts=?
+                   WHERE task_id=?""",
+                (
+                    task.source,
+                    task.author,
+                    task.content,
+                    "succeeded" if result.success else "failed",
+                    result.output if result.success else None,
+                    None if result.success else result.output,
+                    int(result.success),
+                    result.elapsed_ms,
+                    result.tool_calls,
+                    now,
+                    now,
+                    now,
+                    task_id,
+                ),
+            )
+        else:
+            await self._store._db.execute(
+                """INSERT INTO tasks
+                   (source, author, content, status, result, error, success, elapsed_ms, tool_calls, created_ts, finished_ts, updated_ts, ts)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    task.source,
+                    task.author,
+                    task.content,
+                    "succeeded" if result.success else "failed",
+                    result.output if result.success else None,
+                    None if result.success else result.output,
+                    int(result.success),
+                    result.elapsed_ms,
+                    result.tool_calls,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
         await self._store._db.commit()
+
+    async def get_task_record(self, task_id: str) -> dict[str, Any] | None:
+        self._store._check()
+        assert self._store._db
+        async with self._store._db.execute(
+            """SELECT task_id, source, author, content, status, result, error, success,
+                      elapsed_ms, tool_calls, created_ts, started_ts, finished_ts, updated_ts
+               FROM tasks
+               WHERE task_id=?
+               LIMIT 1""",
+            (task_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 class SQLiteMemoryRepository:

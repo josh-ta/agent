@@ -47,16 +47,24 @@ CREATE INDEX IF NOT EXISTS conv_channel_ts ON conversations (channel_id, ts DESC
 -- Task log
 CREATE TABLE IF NOT EXISTS tasks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     TEXT UNIQUE,
     source      TEXT NOT NULL,
     author      TEXT NOT NULL DEFAULT 'system',
     content     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'completed',
     result      TEXT,
+    error       TEXT,
     success     INTEGER NOT NULL DEFAULT 0,
     elapsed_ms  REAL,
     tool_calls  INTEGER DEFAULT 0,
+    created_ts  REAL,
+    started_ts  REAL,
+    finished_ts REAL,
+    updated_ts  REAL,
     ts          REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tasks_ts ON tasks (ts DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_task_id_idx ON tasks (task_id);
 
 -- Long-term memory facts (FTS5 for keyword search)
 CREATE TABLE IF NOT EXISTS memory_facts (
@@ -169,6 +177,7 @@ class SQLiteStore:
 
         # Run schema (idempotent CREATE IF NOT EXISTS)
         await self._db.executescript(SCHEMA)
+        await self.tasks.migrate()
         await self._db.commit()
 
         # Attempt to load sqlite-vec for vector similarity search
@@ -227,6 +236,29 @@ class SQLiteStore:
 
     async def record_task(self, task: Task, result: TaskResult) -> None:
         await self.tasks.record_task(task, result)
+
+    async def create_task_record(
+        self,
+        *,
+        task_id: str,
+        source: str,
+        author: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.tasks.create_task_record(
+            task_id=task_id,
+            source=source,
+            author=author,
+            content=content,
+            metadata=metadata,
+        )
+
+    async def mark_task_running(self, task_id: str) -> None:
+        await self.tasks.mark_task_running(task_id)
+
+    async def get_task_record(self, task_id: str) -> dict[str, Any] | None:
+        return await self.tasks.get_task_record(task_id)
 
     # ── Memory facts ──────────────────────────────────────────────────────────
 

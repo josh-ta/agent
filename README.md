@@ -146,6 +146,7 @@ The wizard saves everything to `.env`, then builds and starts the containers aut
 Open Discord and send a message in `#<agent-name>`. The agent replies to every message there.
 
 Watch the browser live at `http://<your-server-ip>:6080`.
+The control plane is available at `http://<your-server-ip>:8000` with interactive docs at `/docs`.
 
 Check logs:
 ```bash
@@ -185,11 +186,36 @@ Run a one-off task without Discord:
 python -m agent.main run "summarize the repository"
 ```
 
+Run the FastAPI control plane locally:
+
+```bash
+python -m agent.main serve-api
+```
+
+Then open:
+
+- `http://127.0.0.1:8000/docs` for Swagger UI
+- `http://127.0.0.1:8000/openapi.json` for the generated OpenAPI schema
+
 Run tests:
 
 ```bash
 pytest
 ```
+
+## HTTP control plane
+
+The control plane exposes a minimal HTTP API for health checks, task submission, task lookup, and server-sent task events.
+
+- `GET /healthz` returns liveness status
+- `GET /readyz` returns readiness status for the runtime
+- `POST /tasks` accepts a task and returns a stable task ID
+- `GET /tasks/{id}` returns the persisted task state from SQLite
+- `GET /events?task_id=<id>` streams task events over SSE, or omit `task_id` to watch all events
+
+By default the Docker entrypoint serves the control plane on port `8000`. Set `CONTROL_PLANE_ENABLED=false` to disable it, or change `CONTROL_PLANE_PORT` to move it to another port.
+
+See [`docs/api.md`](docs/api.md) for a short reference and example requests.
 
 ## Useful commands
 

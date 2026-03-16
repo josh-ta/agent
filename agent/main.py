@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import structlog
 import typer
+import uvicorn
 
 from agent.config import settings
 
@@ -56,6 +57,18 @@ def start() -> None:
 def run(task: str = typer.Argument(..., help="Task text to run once and exit")) -> None:
     """Run a single task and print the result."""
     asyncio.run(_run_once(task))
+
+
+@cli.command(name="serve-api")
+def serve_api() -> None:
+    """Serve the FastAPI control plane."""
+    uvicorn.run(
+        "agent.control_plane.app:build_app",
+        factory=True,
+        host=settings.control_plane_host,
+        port=settings.control_plane_port,
+        log_level=settings.log_level.lower(),
+    )
 
 
 async def _start() -> None:

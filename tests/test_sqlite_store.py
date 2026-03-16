@@ -39,6 +39,38 @@ async def test_sqlite_store_records_tasks_memory_and_lessons(sqlite_store) -> No
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_sqlite_store_persists_api_task_lifecycle(sqlite_store) -> None:
+    await sqlite_store.create_task_record(
+        task_id="task-123",
+        source="api",
+        author="tester",
+        content="Ship the API",
+    )
+    queued = await sqlite_store.get_task_record("task-123")
+    assert queued is not None
+    assert queued["status"] == "queued"
+
+    await sqlite_store.mark_task_running("task-123")
+    running = await sqlite_store.get_task_record("task-123")
+    assert running is not None
+    assert running["status"] == "running"
+    assert running["started_ts"] is not None
+
+    task = Task(content="Ship the API", source="api", author="tester", metadata={"task_id": "task-123"})
+    result = TaskResult(task=task, output="done", success=True, elapsed_ms=42.0, tool_calls=4)
+    await sqlite_store.record_task(task, result)
+
+    finished = await sqlite_store.get_task_record("task-123")
+    assert finished is not None
+    assert finished["status"] == "succeeded"
+    assert finished["result"] == "done"
+    assert finished["error"] is None
+    assert finished["tool_calls"] == 4
+    assert finished["finished_ts"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_sqlite_store_cleanup_applies_retention(monkeypatch: pytest.MonkeyPatch, sqlite_store) -> None:
     monkeypatch.setattr("agent.memory.sqlite_components.settings.retention_memory_facts_max", 1)
     monkeypatch.setattr("agent.memory.sqlite_components.settings.retention_lessons_max", 1)

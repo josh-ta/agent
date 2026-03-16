@@ -172,18 +172,24 @@ class AgentLoop:
         return self.is_busy or not self.queue.empty()
 
     async def _execute_task(self, task: Task) -> TaskResult:
-        result = await self._process(task)
+        task_id = str(task.metadata.get("task_id", "")).strip() if task.metadata else ""
 
-        if self.memory:
-            await self.memory.record_task(task, result)
+        with bridge.task_context(task_id or None):
+            if self.memory and task_id and hasattr(self.memory, "mark_task_running"):
+                await self.memory.mark_task_running(task_id)
 
-        # Post-task reflection (non-blocking, best-effort)
-        asyncio.create_task(self._reflect(task, result))
+            result = await self._process(task)
 
-        if task.response_future and not task.response_future.done():
-            task.response_future.set_result(result)
+            if self.memory:
+                await self.memory.record_task(task, result)
 
-        return result
+            # Post-task reflection (non-blocking, best-effort)
+            asyncio.create_task(self._reflect(task, result))
+
+            if task.response_future and not task.response_future.done():
+                task.response_future.set_result(result)
+
+            return result
 
     async def run_forever(self) -> None:
         """Process tasks from the queue indefinitely."""

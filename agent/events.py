@@ -37,9 +37,10 @@ Housekeeping:
 from __future__ import annotations
 
 import asyncio
-import traceback
+import contextlib
+import contextvars
 from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable, Union
+from typing import Any, Awaitable, Callable, Iterator, Union
 
 import structlog
 
@@ -54,6 +55,7 @@ SinkFn = Callable[["AgentEvent"], Awaitable[None]]
 class TextDeltaEvent:
     """One text token from the model. Emitted for every chunk."""
     delta: str
+    task_id: str | None = None
     kind: str = field(default="text_delta", init=False)
 
 
@@ -61,6 +63,7 @@ class TextDeltaEvent:
 class ThinkingDeltaEvent:
     """One thinking/reasoning token. Only emitted when the provider exposes reasoning."""
     delta: str
+    task_id: str | None = None
     kind: str = field(default="thinking_delta", init=False)
 
 
@@ -70,6 +73,7 @@ class ThinkingDeltaEvent:
 class ThinkingEndEvent:
     """Full thinking block assembled from deltas, ready to display."""
     text: str
+    task_id: str | None = None
     kind: str = field(default="thinking_end", init=False)
 
 
@@ -82,6 +86,7 @@ class TextTurnEndEvent:
     """
     text: str
     is_final: bool
+    task_id: str | None = None
     kind: str = field(default="text_turn_end", init=False)
 
 
@@ -93,6 +98,7 @@ class ToolCallStartEvent:
     tool_name: str
     call_id: str
     args: Any
+    task_id: str | None = None
     kind: str = field(default="tool_call_start", init=False)
 
 
@@ -102,6 +108,7 @@ class ToolResultEvent:
     tool_name: str
     call_id: str
     result: str
+    task_id: str | None = None
     kind: str = field(default="tool_result", init=False)
 
 
@@ -112,6 +119,7 @@ class ShellStartEvent:
     """A shell command started executing."""
     command: str
     cwd: str
+    task_id: str | None = None
     kind: str = field(default="shell_start", init=False)
 
 
@@ -119,6 +127,7 @@ class ShellStartEvent:
 class ShellOutputEvent:
     """One stdout/stderr chunk from a running command."""
     chunk: str
+    task_id: str | None = None
     kind: str = field(default="shell_output", init=False)
 
 
@@ -127,6 +136,7 @@ class ShellDoneEvent:
     """Shell command finished."""
     exit_code: int
     elapsed_s: float
+    task_id: str | None = None
     kind: str = field(default="shell_done", init=False)
 
 
@@ -137,7 +147,17 @@ class TaskStartEvent:
     """A new task has begun processing."""
     content: str
     tier: str
+    task_id: str | None = None
     kind: str = field(default="task_start", init=False)
+
+
+@dataclass
+class TaskQueuedEvent:
+    """A task has been accepted and queued for processing."""
+    content: str
+    source: str
+    task_id: str | None = None
+    kind: str = field(default="task_queued", init=False)
 
 
 @dataclass
@@ -146,6 +166,7 @@ class TaskDoneEvent:
     output: str
     elapsed_s: float
     tool_calls: int
+    task_id: str | None = None
     kind: str = field(default="task_done", init=False)
 
 
@@ -153,6 +174,7 @@ class TaskDoneEvent:
 class TaskErrorEvent:
     """Task failed with an error."""
     error: str
+    task_id: str | None = None
     kind: str = field(default="task_error", init=False)
 
 
@@ -162,6 +184,7 @@ class TaskErrorEvent:
 class ProgressEvent:
     """Ticker pings, rate-limit notices, context-compression alerts, injection acks."""
     message: str
+    task_id: str | None = None
     kind: str = field(default="progress", init=False)
 
 
@@ -177,6 +200,7 @@ AgentEvent = Union[
     ShellStartEvent,
     ShellOutputEvent,
     ShellDoneEvent,
+    TaskQueuedEvent,
     TaskStartEvent,
     TaskDoneEvent,
     TaskErrorEvent,
@@ -200,6 +224,10 @@ class EventBridge:
 
     def __init__(self) -> None:
         self._sinks: dict[str, SinkFn] = {}
+        self._task_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+            "agent_task_id",
+            default=None,
+        )
 
     def register(self, tag: str, sink: SinkFn) -> None:
         """Register a sink under a unique tag. Replaces any existing sink with that tag."""
@@ -209,8 +237,20 @@ class EventBridge:
         """Remove a sink by tag. Silent no-op if tag not found."""
         self._sinks.pop(tag, None)
 
+    @contextlib.contextmanager
+    def task_context(self, task_id: str | None) -> Iterator[None]:
+        token = self._task_id_var.set(task_id)
+        try:
+            yield
+        finally:
+            self._task_id_var.reset(token)
+
     async def emit(self, event: AgentEvent) -> None:
         """Deliver an event to all currently registered sinks concurrently."""
+        if hasattr(event, "task_id") and getattr(event, "task_id") is None:
+            task_id = self._task_id_var.get()
+            if task_id is not None:
+                setattr(event, "task_id", task_id)
         if not self._sinks:
             return
         sinks = list(self._sinks.values())

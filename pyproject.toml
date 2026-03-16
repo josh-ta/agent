@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic-ai[anthropic,openai,groq,google]>=1.0.0,<2.0.0",
     "pydantic-settings>=2.7",
+    "fastapi",
+    "uvicorn[standard]",
     "discord.py>=2.4",
     "aiohttp>=3.10",
     "aiosqlite>=0.20",
