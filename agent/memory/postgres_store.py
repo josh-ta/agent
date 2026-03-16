@@ -15,7 +15,7 @@ for semantic similarity search, falling back to ILIKE keyword search otherwise.
 from __future__ import annotations
 
 import json
-from typing import Any
+import time
 
 import asyncpg
 import structlog
@@ -45,8 +45,6 @@ async def _embed(text: str) -> list[float] | None:
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
-# pgvector / pg_trgm are optional; we try to enable them but continue without.
-# shared_memory stores content as text; vector search uses ILIKE fallback.
 
 _EXTENSIONS = [
     "CREATE EXTENSION IF NOT EXISTS vector",
@@ -456,7 +454,7 @@ class PostgresStore:
             except Exception as exc:
                 log.warning("postgres_heartbeat_failed", error=str(exc))
 
-        now_ts = __import__("time").time()
+        now_ts = time.time()
         if now_ts - self._last_cleanup_ts >= _PG_CLEANUP_INTERVAL_S:
             try:
                 await self._cleanup()
@@ -468,8 +466,7 @@ class PostgresStore:
         if not self._pool:
             return
         log.info("postgres_cleanup_start")
-        import time as _time
-        now_ts = _time.time()
+        now_ts = time.time()
 
         async with self._pool.acquire() as conn:
             # audit_log: keep last RETENTION_AUDIT_LOG_DAYS
@@ -512,9 +509,8 @@ class PostgresStore:
             for table in ("agents", "shared_tasks", "audit_log", "shared_memory"):
                 row = await conn.fetchrow(f"SELECT COUNT(*) as n FROM {table}")
                 stats[table] = row["n"] if row else 0
-        import time as _time
         stats["last_cleanup"] = (
-            _time.strftime("%Y-%m-%d %H:%M UTC", _time.gmtime(self._last_cleanup_ts))
+            time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(self._last_cleanup_ts))
             if self._last_cleanup_ts else "never"
         )
         return stats

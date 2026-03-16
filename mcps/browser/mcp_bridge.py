@@ -1,24 +1,18 @@
 """
-Playwright MCP bridge — MCP server over HTTP/SSE.
+Playwright MCP bridge exposed over HTTP/SSE.
 
-Uses only mcp + anyio (already present via mcp[cli]) plus the stdlib
-http.server for the /health endpoint on a separate thread.
-
-Architecture:
-  - Thread 1: stdlib HTTPServer on /health (for Docker healthcheck)
-  - Thread 2: asyncio event loop running the MCP SSE server on /sse
-
-Both share the same port via a single uvicorn/starlette app if those
-packages are available; otherwise falls back to mcp's built-in runner.
+When Starlette/uvicorn are available, a single ASGI app serves both `/health`
+and the MCP SSE endpoints on one port. Otherwise it falls back to a smaller
+async HTTP server that still serves `/health`, `/sse`, and `/messages`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import os as _os
 import re
 import sys
-import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
@@ -48,8 +42,6 @@ from playwright.async_api import async_playwright
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3080
 
 # ── Proxy + browser identity config ───────────────────────────────────────────
-import os as _os
-
 _PROXY_URL     = _os.environ.get("PROXY_URL", "").strip()
 _PROXY_SERVER  = _os.environ.get("PROXY_SERVER", "").strip()   # host:port (alt form)
 _PROXY_USER    = _os.environ.get("PROXY_USERNAME", "").strip()
@@ -67,6 +59,8 @@ if _PROXY_URL:
     # Rebuild server URL without embedded credentials
     _server_url = _PROXY_URL
     if _parsed.username or _parsed.password:
+        if _parsed.hostname is None:
+            raise ValueError(f"Invalid PROXY_URL: missing hostname in {_PROXY_URL!r}")
         _netloc_no_auth = _parsed.hostname
         if _parsed.port:
             _netloc_no_auth += f":{_parsed.port}"
@@ -360,7 +354,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             snapshot = await page.accessibility.snapshot()
             if snapshot is None:
                 return [TextContent(type="text", text="(accessibility tree is empty)")]
-            import json as _json
 
             def _compact(node: dict, depth: int = 0) -> str:
                 indent = "  " * depth
@@ -451,11 +444,9 @@ if HAS_STARLETTE:
         uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
 else:
-    # Fallback: run health on PORT, MCP SSE on PORT+1, tell the agent to use PORT+1
-    # But we still need /sse on PORT for the agent — run a minimal asyncio HTTP server
+    # Fallback: serve /health, /sse, and /messages from a minimal async HTTP server.
     async def _run_mcp_sse():
         """Run MCP over SSE using mcp's built-in asyncio HTTP handler."""
-        from mcp.server.sse import SseServerTransport
 
         transport = SseServerTransport("/messages")
 
@@ -488,10 +479,10 @@ else:
             await hypercorn.asyncio.serve(app, config)
         except ImportError:
             # Last resort: just run the health server on PORT and log a warning
-            print(f"[mcp_bridge] WARNING: neither uvicorn nor hypercorn available; /sse will not work", flush=True)
-            print(f"[mcp_bridge] Only /health will be served (healthcheck will pass but browser tools unavailable)", flush=True)
+            print("[mcp_bridge] WARNING: neither uvicorn nor hypercorn available; /sse will not work", flush=True)
+            print("[mcp_bridge] Only /health will be served (healthcheck will pass but browser tools unavailable)", flush=True)
             server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
-            await asyncio.get_event_loop().run_in_executor(None, server.serve_forever)
+            await asyncio.get_running_loop().run_in_executor(None, server.serve_forever)
 
     if __name__ == "__main__":
         print(f"[mcp_bridge] Running fallback MCP server on :{PORT}", flush=True)

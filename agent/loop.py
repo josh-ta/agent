@@ -1,46 +1,9 @@
 """
-Main agent reasoning loop: Observe → Think → Act → Remember → Reflect.
+Main agent loop: queue tasks, stream events, persist results, and reflect.
 
-The loop processes tasks from an asyncio.Queue populated by:
-  - Discord messages
-  - Scheduled heartbeats
-  - Direct API calls (when used as a library)
-
-After every task the agent runs a brief reflection pass:
-  - On failure: diagnoses what went wrong, saves a lesson, updates MEMORY.md
-  - On success with tool calls: extracts any reusable insight
-  - Periodically: rewrites MEMORY.md with latest lessons summary
-
-Model routing
--------------
-Tasks are classified into three tiers before execution:
-  fast  → haiku   (simple Q&A, greetings, status checks)
-  smart → sonnet  (code, research, multi-step tasks)
-  best  → opus    (architecture, complex reasoning, long tasks)
-
-Users can override per-message with a prefix:
-  /fast  <task>   force haiku
-  /smart <task>   force sonnet
-  /best  <task>   force opus
-
-Streaming
----------
-Uses agent.run_stream_events() for a single flat async stream of all events
-across the entire run (multiple model turns + all tool calls). Raw pydantic-ai
-events are translated into typed AgentEvent objects and emitted via the module-
-level EventBridge singleton (agent.events.bridge). Sinks registered on the bridge
-(Discord, logs, etc.) receive every event without the loop knowing about them.
-
-Context management
-------------------
-When the context window overflows (400 "prompt is too long"), the loop asks
-the fast agent to compress history into a brief summary, saves it, and retries.
-
-Zipper-merge injection
------------------------
-New messages arriving while the agent is running are held in Task.inject_queue.
-After each run completes, the queue is drained and a follow-up run is issued
-with the injected messages appended so the model incorporates them.
+Tasks can come from Discord, heartbeats, or direct API calls. The loop routes
+each task to a model tier, emits typed events through `agent.events.bridge`,
+and folds in queued follow-up messages via `Task.inject_queue`.
 """
 
 from __future__ import annotations
@@ -50,35 +13,35 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from pydantic_ai import Agent
-from pydantic_ai.usage import UsageLimits
 from pydantic_ai.messages import (
     FinalResultEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
     PartDeltaEvent,
     PartEndEvent,
     TextPartDelta,
     ThinkingPartDelta,
-    FunctionToolCallEvent,
-    FunctionToolResultEvent,
 )
+from pydantic_ai.usage import UsageLimits
 
 from agent.config import settings
 from agent.events import (
-    bridge,
-    TextDeltaEvent,
-    ThinkingDeltaEvent,
-    ThinkingEndEvent,
-    TextTurnEndEvent,
-    ToolCallStartEvent,
-    ToolResultEvent,
-    TaskStartEvent,
+    ProgressEvent,
     TaskDoneEvent,
     TaskErrorEvent,
-    ProgressEvent,
+    TaskStartEvent,
+    TextDeltaEvent,
+    TextTurnEndEvent,
+    ThinkingDeltaEvent,
+    ThinkingEndEvent,
+    ToolCallStartEvent,
+    ToolResultEvent,
+    bridge,
 )
 
 log = structlog.get_logger()
@@ -144,10 +107,11 @@ class Task:
     channel_id: int = 0
     message_id: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     # Queue for zipper-merge injection: new user messages arriving mid-task
     # are pushed here by DiscordBot and drained after each run completes.
     inject_queue: asyncio.Queue[str] | None = field(default=None, repr=False)
+    response_future: asyncio.Future[TaskResult] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -194,6 +158,25 @@ class AgentLoop:
         """Add a task to the processing queue."""
         await self.queue.put(task)
 
+    @property
+    def has_pending_work(self) -> bool:
+        """True when work is running or already queued."""
+        return self.is_busy or not self.queue.empty()
+
+    async def _execute_task(self, task: Task) -> TaskResult:
+        result = await self._process(task)
+
+        if self.memory:
+            await self.memory.record_task(task, result)
+
+        # Post-task reflection (non-blocking, best-effort)
+        asyncio.create_task(self._reflect(task, result))
+
+        if task.response_future and not task.response_future.done():
+            task.response_future.set_result(result)
+
+        return result
+
     async def run_forever(self) -> None:
         """Process tasks from the queue indefinitely."""
         self._running = True
@@ -203,26 +186,22 @@ class AgentLoop:
             try:
                 try:
                     task = await asyncio.wait_for(self.queue.get(), timeout=settings.heartbeat_seconds)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await self._heartbeat()
                     continue
 
                 self.is_busy = True
                 try:
-                    result = await self._process(task)
+                    await self._execute_task(task)
                 finally:
                     self.is_busy = False
                 self.queue.task_done()
 
-                if self.memory:
-                    await self.memory.record_task(task, result)
-
-                # Post-task reflection (non-blocking, best-effort)
-                asyncio.create_task(self._reflect(task, result))
-
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as exc:
+                if 'task' in locals() and task.response_future and not task.response_future.done():
+                    task.response_future.set_exception(exc)
                 log.error("loop_unhandled_exception", exc=traceback.format_exc())
 
         log.info("loop_stopped")
@@ -274,7 +253,7 @@ class AgentLoop:
         no knowledge of Discord — sinks registered on the bridge handle delivery.
         """
         self._task_count += 1
-        start = asyncio.get_event_loop().time()
+        start = asyncio.get_running_loop().time()
 
         # Parse user model override (/fast, /smart, /best) and classify tier
         content, forced_tier = _parse_override(task.content)
@@ -308,7 +287,6 @@ class AgentLoop:
         _journal_path = settings.workspace_path / ".task_journal.md"
         try:
             if _journal_path.exists():
-                import os as _os
                 age_s = time.time() - _journal_path.stat().st_mtime
                 if age_s > 1800:  # 30 minutes
                     _journal_path.unlink()
@@ -403,7 +381,7 @@ class AgentLoop:
                 tier=tier,
             )
 
-            elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
+            elapsed_ms = (asyncio.get_running_loop().time() - start) * 1000
             elapsed_s = elapsed_ms / 1000
 
             log.info(
@@ -451,7 +429,7 @@ class AgentLoop:
             )
 
         except Exception as exc:
-            elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
+            elapsed_ms = (asyncio.get_running_loop().time() - start) * 1000
             log.error("task_failed", error=str(exc), exc=traceback.format_exc())
 
             await bridge.emit(TaskErrorEvent(error=str(exc)[:400]))
@@ -492,9 +470,6 @@ class AgentLoop:
                 elapsed_ms=elapsed_ms,
             )
 
-        finally:
-            pass
-
     async def _run_with_streaming(
         self,
         task: Task,
@@ -529,6 +504,8 @@ class AgentLoop:
         _rate_retries = 0
         _max_rate_retries = 3
         _rate_delay = 5.0
+        _bad_args_retries = 0
+        _max_bad_args_retries = 2
         _tool_call_total = 0  # cumulative across retries, for logging
 
         while True:  # retry loop for context overflow and rate limits
@@ -649,9 +626,9 @@ class AgentLoop:
                         followup_output, followup_tool_calls, followup_replied = await self._run_with_streaming(
                             task=task,
                             agent=agent,
-                            base_prompt=injection_text,
+                            base_prompt=f"{base_prompt}\n\n---\n\n{injection_text}",
                             tier=tier,
-                            message_history=None,
+                            message_history=message_history,
                         )
                         result_output = followup_output
                         tool_calls += followup_tool_calls
@@ -712,10 +689,19 @@ class AgentLoop:
                     _rate_delay *= 2
                     continue
 
-                elif is_bad_args:
-                    log.warning("truncated_tool_args_retry", error=exc_str[:200])
+                elif is_bad_args and _bad_args_retries < _max_bad_args_retries:
+                    _bad_args_retries += 1
+                    log.warning(
+                        "truncated_tool_args_retry",
+                        attempt=_bad_args_retries,
+                        max_attempts=_max_bad_args_retries,
+                        error=exc_str[:200],
+                    )
                     await bridge.emit(ProgressEvent(
-                        message="⚠️ Tool args got truncated — retrying from last checkpoint…"
+                        message=(
+                            "⚠️ Tool args got truncated — retrying from last checkpoint… "
+                            f"({_bad_args_retries}/{_max_bad_args_retries})"
+                        )
                     ))
                     # Drop message history so pydantic-ai starts fresh on the next turn
                     message_history = None
@@ -729,7 +715,7 @@ class AgentLoop:
         Post-task reflection: learn from failures and extract insights from successes.
 
         On failure  → ask the agent what went wrong + save a MISTAKE lesson
-        On success with >3 tool calls → extract a reusable pattern/insight
+        On success with >7 tool calls → extract a reusable pattern/insight
         Every MEMORY_UPDATE_INTERVAL successes → rewrite MEMORY.md
         """
         if not self.memory:

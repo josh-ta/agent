@@ -8,18 +8,18 @@ the agent is assembled after all dependencies are available.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import structlog
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 
 from agent.config import settings
 from agent.tools import filesystem, github, self_edit, shell
 from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
-    from agent.memory.sqlite_store import SQLiteStore
     from agent.memory.postgres_store import PostgresStore
+    from agent.memory.sqlite_store import SQLiteStore
 
 log = structlog.get_logger()
 
@@ -33,8 +33,8 @@ class ToolRegistry:
 
     def register_all(
         self,
-        sqlite: "SQLiteStore | None" = None,
-        postgres: "PostgresStore | None" = None,
+        sqlite: SQLiteStore | None = None,
+        postgres: PostgresStore | None = None,
     ) -> None:
         self._sqlite = sqlite
         self._postgres = postgres
@@ -117,8 +117,10 @@ class ToolRegistry:
             note: what you just did, what you found, and what the next step is.
             """
             import asyncio as _asyncio
-            from agent.events import bridge as _bridge, ProgressEvent as _ProgressEvent
             from datetime import datetime as _dt
+
+            from agent.events import ProgressEvent as _ProgressEvent
+            from agent.events import bridge as _bridge
             ts = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             entry = f"\n### [{ts}]\n{note.strip()}\n"
             try:
@@ -127,7 +129,7 @@ class ToolRegistry:
                     f.write(entry)
                 # Surface the checkpoint in Discord
                 try:
-                    loop = _asyncio.get_event_loop()
+                    loop = _asyncio.get_running_loop()
                     if loop.is_running():
                         loop.create_task(_bridge.emit(_ProgressEvent(message=f"📝 {note.strip()}")))
                 except Exception:

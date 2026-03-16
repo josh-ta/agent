@@ -18,10 +18,10 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 # Module-level reference to the discord client (set by discord_bot.py on startup)
-_discord_client: "discord.Client | None" = None
+_discord_client: discord.Client | None = None
 
 
-def set_discord_client(client: "discord.Client") -> None:
+def set_discord_client(client: discord.Client) -> None:
     global _discord_client
     _discord_client = client
 
@@ -120,7 +120,8 @@ async def ask_user(question: str, timeout: int = 300) -> str:
     except Exception as exc:
         return f"[ERROR sending question: {exc}]"
 
-    # Poll for a reply from a non-bot user
+    # Poll for a reply from a human. Prefer an explicit reply to our question;
+    # otherwise only accept a lone human response to avoid grabbing chatter.
     import asyncio as _asyncio
     poll_interval = 3  # seconds between checks
     elapsed = 0
@@ -128,10 +129,22 @@ async def ask_user(question: str, timeout: int = 300) -> str:
         await _asyncio.sleep(poll_interval)
         elapsed += poll_interval
         try:
-            async for msg in channel.history(limit=10, after=sent):  # type: ignore[union-attr]
-                if not msg.author.bot:
+            candidates = []
+            async for msg in channel.history(limit=50, after=sent, oldest_first=True):  # type: ignore[union-attr]
+                if not msg.author.bot and msg.content.strip():
+                    candidates.append(msg)
+
+            for msg in candidates:
+                ref = getattr(msg, "reference", None)
+                if ref and getattr(ref, "message_id", None) == sent.id:
                     log.info("ask_user_replied", elapsed_s=elapsed, reply=msg.content[:80])
                     return msg.content
+
+            distinct_authors = {msg.author.id for msg in candidates}
+            if len(distinct_authors) == 1 and candidates:
+                reply = candidates[-1]
+                log.info("ask_user_replied", elapsed_s=elapsed, reply=reply.content[:80])
+                return reply.content
         except Exception as exc:
             return f"[ERROR reading reply: {exc}]"
 

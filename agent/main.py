@@ -50,12 +50,13 @@ def run(task: str = typer.Argument(..., help="Task text to run once and exit")) 
 
 
 async def _start() -> None:
-    from agent.memory.sqlite_store import SQLiteStore
-    from agent.memory.postgres_store import PostgresStore
-    from agent.tools.registry import ToolRegistry
-    from agent.loop import AgentLoop
-    from agent.communication.discord_bot import DiscordBot
     from importlib.metadata import version as _pkg_version
+
+    from agent.communication.discord_bot import DiscordBot
+    from agent.loop import AgentLoop
+    from agent.memory.postgres_store import PostgresStore
+    from agent.memory.sqlite_store import SQLiteStore
+    from agent.tools.registry import ToolRegistry
     _agent_version = _pkg_version("agent")
 
     log.info("agent_starting", name=settings.agent_name, model=settings.agent_model, version=_agent_version)
@@ -83,7 +84,7 @@ async def _start() -> None:
     loop = AgentLoop(agents, memory_store=sqlite, postgres_store=postgres)
 
     # ── Graceful shutdown ──────────────────────────────────────────────────────
-    ev_loop = asyncio.get_event_loop()
+    ev_loop = asyncio.get_running_loop()
     main_task: asyncio.Task | None = None
 
     async def _shutdown(sig_name: str) -> None:
@@ -130,10 +131,10 @@ async def _start() -> None:
 
 
 async def _run_once(task: str) -> None:
-    from agent.memory.sqlite_store import SQLiteStore
-    from agent.tools.registry import ToolRegistry
     from agent.core import create_agents
     from agent.loop import AgentLoop
+    from agent.memory.sqlite_store import SQLiteStore
+    from agent.tools.registry import ToolRegistry
 
     sqlite = SQLiteStore(settings.sqlite_path)
     await sqlite.init()

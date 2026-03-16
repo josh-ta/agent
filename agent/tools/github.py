@@ -61,6 +61,8 @@ async def pr_list(repo: str | None = None, state: str = "open", limit: int = 20)
 
 async def pr_diff(pr: int | str, repo: str | None = None) -> str:
     """Return the full diff for a PR (piped through head to cap size)."""
+    if not repo:
+        repo = await _detect_repo()
     repo_flag = f" --repo {repo}" if repo else ""
     # Cap diff at ~300 lines to keep context manageable
     return await shell_run(
@@ -134,7 +136,8 @@ async def pr_review_with_comments(
     })
 
     # Write payload to a temp file to avoid shell quoting issues entirely
-    import tempfile, os
+    import os
+    import tempfile
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
         tf.write(payload)
         tmp_path = tf.name
@@ -226,6 +229,8 @@ async def ci_view(run_id: str | int, repo: str | None = None) -> str:
 
 async def ci_logs_failed(run_id: str | int, repo: str | None = None) -> str:
     """Fetch only the failed step logs from a CI run (capped at 4KB)."""
+    if not repo:
+        repo = await _detect_repo()
     repo_flag = f" --repo {repo}" if repo else ""
     return await shell_run(
         f"gh run view {run_id}{repo_flag} --log-failed 2>&1 | head -200",

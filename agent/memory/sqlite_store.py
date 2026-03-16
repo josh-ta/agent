@@ -226,7 +226,7 @@ class SQLiteStore:
 
     # ── Tasks ─────────────────────────────────────────────────────────────────
 
-    async def record_task(self, task: "Task", result: "TaskResult") -> None:
+    async def record_task(self, task: Task, result: TaskResult) -> None:
         self._check()
         assert self._db
         await self._db.execute(
@@ -424,17 +424,6 @@ class SQLiteStore:
             ts_str = datetime.datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
             lines.append(f"- [{row['kind'].upper()} {ts_str}] {row['summary']}")
         return "\n".join(lines)
-
-    async def get_failed_tasks(self, limit: int = 5) -> list[dict[str, Any]]:
-        """Return recent failed tasks for post-task reflection."""
-        self._check()
-        assert self._db
-        async with self._db.execute(
-            "SELECT content, result, ts FROM tasks WHERE success=0 ORDER BY ts DESC LIMIT ?",
-            (limit,),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in rows]
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 

@@ -4,13 +4,14 @@ Agent core: builds the Pydantic AI agent, loads skills, wires tools + MCP server
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerHTTP
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from agent.config import settings
 
@@ -21,10 +22,10 @@ log = structlog.get_logger()
 
 # Module-level Postgres reference — set by main.py after init so the dynamic
 # system prompt can look up online peer agents on every task.
-_postgres: "Any | None" = None
+_postgres: Any | None = None
 
 
-def set_postgres(store: "Any") -> None:
+def set_postgres(store: Any) -> None:
     global _postgres
     _postgres = store
 
@@ -76,23 +77,19 @@ def _load_identity(identity_path: Path) -> str:
 
 
 def build_system_prompt(other_agents: list[str] | None = None) -> str:
-    """Compose a compact system prompt from identity + skill index.
-
-    other_agents: names of other online agents (from Postgres registry).
-                  Injected so the agent knows who it can delegate to.
-    """
+    """Compose the system prompt from identity, peers, and the skill index."""
     identity = _load_identity(settings.identity_path)
     skills = _load_skills_compact(settings.skills_path)
 
-    # Channel IDs as usable constants
+    # Channel IDs injected as concrete constants so the prompt can reference them directly.
     comms_id = settings.discord_comms_channel_id
     bus_id = settings.discord_bus_channel_id
     private_id = settings.discord_agent_channel_id
 
-    # Peer agent section — only shown when there are peers
+    # Only show the peer section when other agents are online.
     if other_agents:
         peers_block = (
-            f"\n## Peer Agents (online now)\n"
+            "\n## Peer Agents (online now)\n"
             + "\n".join(f"- {name}" for name in other_agents)
             + "\n"
         )
@@ -111,64 +108,73 @@ def build_system_prompt(other_agents: list[str] | None = None) -> str:
 ## Rules
 1. Think before acting. Use shell for system tasks.
 2. Read files before writing. Ask if unsure.
-3. Code editing — prefer surgical edits over full rewrites:
-   - Use `str_replace` for targeted changes (pass the minimal unique surrounding context as old_str). This is the default for fixing bugs, updating functions, or changing specific lines.
-   - Use `write_file` only for new files or complete rewrites where most of the content changes.
-   - Use `search_files` to locate the exact lines you need before editing, rather than reading entire large files. Example: search_files("def my_func", path="src/", file_glob="*.py")
-   - For test runs and other verbose commands, pass tail_lines=100 to run_shell so failures at the end of output are never truncated.
+3. Prefer surgical edits:
+   - Use `str_replace` for targeted edits.
+   - Use `write_file` for new files or true rewrites.
+   - Use `search_files` to locate code before editing.
+   - Use `tail_lines=100` with `run_shell` for verbose test output.
 4. After failures: call lesson_save(kind="mistake"). Before complex tasks: call lesson_search.
 5. Use skill_read <name> to load a skill's full procedure before following it.
 6. Use read_channel('private') to catch up on recent conversation history when context is needed.
 7. Each mistake happens only once — record it and move on.
-8. For multi-step tasks (>2 tool calls), call task_note() after each major step — notes are forwarded to Discord automatically. Your final text response is the reply; don't call send_discord to summarize.
+8. For multi-step tasks (>2 tool calls), call task_note() after each major step. Do not use send_discord to restate your final answer.
 9. Give one clear response. Do not send multiple messages saying the same thing.
-10. If the same approach fails twice, STOP and report what you tried and what's blocking you. Do not keep retrying variations of the same broken approach.
-11. For long-running commands (docker build, npm install, git clone large repos), pass timeout=3600 or higher to run_shell — there is no task-level timeout.
-12. When you receive a task prefixed [A2A from X], another agent has delegated work to you. Complete the task, then send your result back to agent-comms:
+10. If the same approach fails twice, STOP and report what you tried and what is blocking you.
+11. For long-running commands, pass timeout=3600 or higher to run_shell.
+12. When you receive a task prefixed [A2A from X], complete it and send the result back to agent-comms:
     send_discord({comms_id}, '{{"from": "{settings.agent_name}", "to": "X", "task": "result", "payload": "your answer"}}')
-    When delegating, poll read_discord({comms_id}) every few tool calls to check for their reply.
-13. When genuinely uncertain about something that would change your approach — ambiguous requirements, a destructive/irreversible action, missing credentials, or a fork between two valid paths — call ask_user_question() to pause and get clarification. Ask one clear question at a time.
-14. DELEGATION — When a task has clearly separable sub-tasks AND other agents are online, split the work:
-    a. Identify what can run in parallel (e.g. "fix frontend tests" vs "fix backend tests").
+    When delegating, poll read_discord({comms_id}) every few tool calls for replies.
+13. If uncertainty would change the approach, call ask_user_question() and ask one clear question.
+14. Delegate only when the work splits cleanly and other agents are online:
+    a. Identify parallelizable sub-tasks.
     b. Delegate one sub-task via agent-comms JSON: send_discord({comms_id}, '{{"from": "{settings.agent_name}", "to": "PEER_NAME", "task": "DESCRIPTION", "payload": ""}}')
     c. Work your own sub-task simultaneously.
     d. Poll read_discord({comms_id}) periodically until you see their result ("task": "result").
     e. Combine both results in your final reply.
-    Do NOT delegate if you are the only agent online, if the task is trivially small, or if you have already started doing the work yourself.
+    Do not delegate trivial work, solo work, or work you have already started.
 
 ## Long tasks — checkpointing (IMPORTANT)
-For any task with more than ~5 tool calls, use the task journal to avoid losing work:
+For tasks with more than ~5 tool calls, use the task journal:
 - Call task_resume() FIRST — check if this task was previously attempted.
 - Call task_note(note) after EVERY significant step: what you did, what you found, what comes next.
-- Write notes in plain English, NOT JSON. Example: "Checked CI run 23057002906. Backend and security jobs failed — root cause is PYTHONPATH missing in ci-cd.yml line 186. Fixed that. Next: fix security-scan permissions."
-- NEVER pass a JSON object or dict as the note — just write a sentence or two.
-- Call task_journal_clear() only after the task is fully and successfully complete.
-- If you hit a rate limit or error mid-task, your next run should start with task_resume() to pick up from the last note.
+- Write notes in plain English, not JSON.
+- Call task_journal_clear() only after success.
+- After a rate limit or interruption, resume with task_resume().
 
 ## Git / GitHub
 - Clone repos to /workspace/<repo-name> (NOT /tmp).
 - `gh` CLI is pre-authenticated via GH_TOKEN env var — NEVER run `gh auth login`.
 - If `gh auth status` exits 0, you ARE authenticated — proceed directly to `gh pr create`.
 - Create PRs with: `gh pr create --title "..." --body "..." --base main --repo owner/repo`
-- SSH key is at /data/ssh/id_ed25519 (or id_rsa). GIT_SSH_COMMAND env var is pre-configured — plain `git clone git@github.com:...` just works.
+- SSH key is at /data/ssh/id_ed25519 (or id_rsa). Plain `git clone git@github.com:...` should work.
 - Always set git user inside cloned repos: `git config user.name "bob-agent" && git config user.email "bob@agent.local"`
 
 {skills}
 """
     prompt = base.strip()
 
-    # Hard cap: ~40k chars ≈ 10k tokens. Keep system prompt small so there's
-    # plenty of room for tool call output within the 200k token window.
+    # Keep the prompt capped so tool output still has room in the model context.
     MAX_CHARS = 40_000
     if len(prompt) > MAX_CHARS:
-        prompt = prompt[:MAX_CHARS] + "\n[...system prompt truncated — MEMORY.md too large, use identity_edit to trim it...]"
+        prompt = (
+            prompt[:MAX_CHARS]
+            + "\n[...system prompt truncated — MEMORY.md too large, use identity_edit to trim it...]"
+        )
         log.warning("system_prompt_truncated", chars=len(base), cap=MAX_CHARS)
 
     log.info("system_prompt_built", chars=len(prompt))
     return prompt
 
 
-def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type: ignore[type-arg]
+def _build_openai_compatible_model(model_name: str, *, base_url: str, api_key: str) -> OpenAIModel:
+    provider = OpenAIProvider(
+        base_url=base_url or None,
+        api_key=api_key or None,
+    )
+    return OpenAIModel(model_name, provider=provider)
+
+
+def create_agent(registry: ToolRegistry, model_string: str) -> Agent:  # type: ignore[type-arg]
     """Create a single agent for the given model string."""
     mcp_servers = []
     if settings.browser_mcp_url:
@@ -177,13 +183,33 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
         except Exception as exc:
             log.warning("browser_mcp_unavailable", error=str(exc))
 
+    model: str | OpenAIModel = model_string
+    if model_string.startswith("xai:"):
+        model = _build_openai_compatible_model(
+            model_string.split(":", 1)[1],
+            base_url=settings.xai_base_url,
+            api_key=settings.xai_api_key,
+        )
+    elif model_string.startswith("mistral:"):
+        model = _build_openai_compatible_model(
+            model_string.split(":", 1)[1],
+            base_url=settings.mistral_base_url,
+            api_key=settings.mistral_api_key,
+        )
+    elif model_string.startswith("openai:") and settings.openai_base_url:
+        model = _build_openai_compatible_model(
+            model_string.split(":", 1)[1],
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
+        )
+
     # Build model settings with prompt caching and optional extended thinking.
     # Cache TTL is 1h (vs default 5m) — sporadic Discord usage means 5m caches
     # frequently expire; 1h gives far more cache hits at only a slightly higher
     # write cost (2x vs 1.25x surcharge, same 90% discount on reads).
-    is_claude = "claude" in model_string
+    is_claude = model_string.startswith("anthropic:") or "claude" in model_string
     is_haiku = "haiku" in model_string
-    is_openai = "openai" in model_string
+    is_openai = model_string.startswith(("openai:", "xai:", "mistral:"))
     is_reasoning_model = any(x in model_string for x in ("o1", "o3", "o4"))
     is_gemini = "google" in model_string or "gemini" in model_string
     is_groq = "groq" in model_string
@@ -244,7 +270,7 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
     model_settings = model_settings or None
 
     agent: Agent = Agent(  # type: ignore[type-arg]
-        model=model_string,
+        model=model,
         mcp_servers=mcp_servers,
         model_settings=model_settings,
         retries=2,
@@ -277,7 +303,7 @@ def create_agent(registry: "ToolRegistry", model_string: str) -> Agent:  # type:
     return agent
 
 
-def create_agents(registry: "ToolRegistry") -> dict[str, "Agent"]:  # type: ignore[type-arg]
+def create_agents(registry: ToolRegistry) -> dict[str, Agent]:  # type: ignore[type-arg]
     """Create fast/smart/best agent tiers, reusing the same MCP + tool registry."""
     tiers = {
         "fast": settings.model_string_for("fast"),

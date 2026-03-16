@@ -1,0 +1,17 @@
+.git
+.cursor
+.mypy_cache
+.pytest_cache
+.ruff_cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+dist/
+build/
+workspace/
+agent_data/
+postgres_data/
+*.db

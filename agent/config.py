@@ -19,9 +19,14 @@ class Settings(BaseSettings):
     # ── LLM ───────────────────────────────────────────────────────────────────
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    mistral_api_key: str = Field(default="", alias="MISTRAL_API_KEY")
+    xai_api_key: str = Field(default="", alias="XAI_API_KEY")
     agent_model: str = Field(default="claude-haiku-4-5", alias="AGENT_MODEL")
     # Embedding model used for semantic memory search (requires OPENAI_API_KEY)
     embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
+    openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
+    mistral_base_url: str = Field(default="https://api.mistral.ai/v1", alias="MISTRAL_BASE_URL")
+    xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
     # ── Model tiers for dynamic routing (override with env vars)
     model_fast: str = Field(default="claude-haiku-4-5", alias="MODEL_FAST")
     model_smart: str = Field(default="claude-sonnet-4-5", alias="MODEL_SMART")
@@ -54,7 +59,7 @@ class Settings(BaseSettings):
         default="http://browser:3080/sse", alias="BROWSER_MCP_URL"
     )
 
-    # ── Proxy (optional — routes browser + shell HTTP through a residential/ISP proxy)
+    # ── Proxy (optional — routes browser traffic through a residential/ISP proxy)
     # Format: http://user:pass@host:port  or  socks5://user:pass@host:port
     proxy_url: str = Field(default="", alias="PROXY_URL")
 
@@ -94,17 +99,22 @@ class Settings(BaseSettings):
         return self._to_model_string(self.agent_model)
 
     def _to_model_string(self, model: str) -> str:
+        model = model.strip()
         if model.startswith("claude"):
             return f"anthropic:{model}"
         if model.startswith("gpt") or re.match(r"^o\d", model):
             return f"openai:{model}"
         if model.startswith("gemini"):
             return f"google-gla:{model}"
+        if model.startswith("grok"):
+            return f"xai:{model}"
+        if model.startswith(("mistral", "ministral", "codestral", "pixtral")):
+            return f"mistral:{model}"
         # Already fully-qualified with a provider prefix — pass through as-is.
         if ":" in model:
             return model
         # Bare open-source model names default to Groq inference.
-        if model.startswith(("llama", "mixtral", "qwen", "deepseek", "mistral", "kimi", "moonshotai")):
+        if model.startswith(("llama", "mixtral", "qwen", "deepseek", "kimi", "moonshotai")):
             return f"groq:{model}"
         return model
 

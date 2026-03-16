@@ -247,6 +247,9 @@ configure_env() {
         prompt_var "OPENAI_API_KEY" \
             "OpenAI API key — platform.openai.com/api-keys" \
             "$(current_val OPENAI_API_KEY)" 1
+        prompt_var "OPENAI_BASE_URL" \
+            "Optional OpenAI-compatible base URL (blank = official OpenAI API)" \
+            "$(current_val OPENAI_BASE_URL)"
         if [[ "$want_anthropic" == "false" ]]; then
             set_var "AGENT_MODEL" "gpt-4o"
         fi
@@ -257,7 +260,7 @@ configure_env() {
             "Google AI API key — aistudio.google.com/app/apikey" \
             "$(current_val GOOGLE_API_KEY)" 1
         if [[ "$want_anthropic" == "false" && "$want_openai" == "false" ]]; then
-            set_var "AGENT_MODEL" "gemini-2.0-flash"
+            set_var "AGENT_MODEL" "gemini-2.5-flash"
         fi
     fi
 
@@ -271,6 +274,9 @@ configure_env() {
         prompt_var "MISTRAL_API_KEY" \
             "Mistral API key — console.mistral.ai" \
             "$(current_val MISTRAL_API_KEY)" 1
+        if [[ "$want_anthropic" == "false" && "$want_openai" == "false" && "$want_google" == "false" && "$want_xai" == "false" ]]; then
+            set_var "AGENT_MODEL" "mistral-large-latest"
+        fi
     fi
 
     if [[ "$want_xai" == "true" ]]; then

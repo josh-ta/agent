@@ -2,6 +2,8 @@
 
 A fully autonomous, self-modifying AI agent that runs in Docker. Give it a name, connect it to Discord, and chat with it. It can browse the web, run shell commands, write code, manage files, and improve itself over time.
 
+Supported model providers include Anthropic, OpenAI, Google, Groq, xAI, and Mistral. OpenAI-compatible endpoints such as Ollama or vLLM can also be used via `OPENAI_BASE_URL`.
+
 ---
 
 ## Full Setup Guide
@@ -130,9 +132,10 @@ bash scripts/install.sh
 
 The wizard will ask for:
 1. **Agent name** — must match the repo name and Discord channel (e.g. `bob`)
-2. **LLM provider** — choose Anthropic (Claude) or OpenAI (GPT-4o) using arrow keys + Space
-3. **API key** for the chosen provider
-4. **Discord bot token** and the four IDs from step 5f
+2. **LLM providers** — choose one or more of Anthropic, OpenAI, Google, Groq, Mistral, and xAI
+3. **API keys** for the providers you selected
+4. **Optional OpenAI-compatible base URL** if you want to use Ollama, vLLM, or another compatible endpoint
+5. **Discord bot token** and the four IDs from step 5f
 
 The wizard saves everything to `.env`, then builds and starts the containers automatically. The build takes about 2 minutes on first run.
 
@@ -168,6 +171,26 @@ docker compose up --build -d
 
 ---
 
+## Local development
+
+Install the project and dev tools locally:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Run a one-off task without Discord:
+
+```bash
+python -m agent.main run "summarize the repository"
+```
+
+Run tests:
+
+```bash
+pytest
+```
+
 ## Useful commands
 
 ```bash
@@ -175,6 +198,7 @@ docker compose logs -f agent        # live agent logs
 docker compose logs -f browser      # browser sidecar logs
 docker compose down                 # stop everything
 docker compose up --build -d        # rebuild and restart
+docker compose --profile postgres up -d  # start optional shared Postgres too
 bash scripts/install.sh             # re-run configuration wizard
 ```
 
@@ -200,9 +224,9 @@ Agents communicate by posting JSON in `#agent-comms`:
 
 ```
 VPS (Docker host)
-├── agent container        ← Python + Claude or GPT-4o
+├── agent container        ← Python + your configured model provider(s)
 │   ├── shell tool         ← run commands on the server
-│   ├── filesystem tool    ← read/write /workspace
+│   ├── filesystem tool    ← read/write /workspace (and explicit external paths when needed)
 │   ├── browser tool       ← Playwright via MCP sidecar
 │   ├── discord tool       ← send/read Discord messages
 │   └── self-edit tool     ← update own skills and identity

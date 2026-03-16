@@ -19,14 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python deps first (cache layer — invalidates when pyproject.toml changes)
+# Copy application source before installing the package so editable installs
+# always see the `agent/` package.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e .
-
-# Copy application source
+COPY README.md ./
 COPY agent/ ./agent/
 
-# Re-install to register entry points after source copy
 RUN pip install --no-cache-dir -e .
 
 # Create data/workspace directories (container runs as root — simplest for bind mounts)

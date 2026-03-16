@@ -1,16 +1,13 @@
 """
-Filesystem tools: read, write, list, delete files within the workspace.
+Filesystem tools: read, write, list, delete files in or alongside the workspace.
 
-All paths are resolved relative to WORKSPACE_PATH to prevent escaping
-the sandbox.  If the agent needs to access absolute paths outside the
-workspace it should use the shell tool instead.
+Relative paths are resolved from WORKSPACE_PATH. Absolute paths outside the
+workspace are still allowed for operational use cases such as `/tmp`, but the
+tool logs them so external access is visible.
 """
 
 from __future__ import annotations
 
-import os
-import shlex
-import stat
 import subprocess
 from pathlib import Path
 
@@ -24,7 +21,7 @@ MAX_READ_BYTES = 32 * 1024  # 32 KB
 
 
 def _safe_path(path: str) -> Path:
-    """Resolve path relative to workspace; raise if it escapes."""
+    """Resolve a path relative to the workspace and warn on external access."""
     workspace = settings.workspace_path.resolve()
     resolved = (workspace / path).resolve()
 
@@ -76,6 +73,7 @@ def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
     Args:
         path: File path (relative to workspace or absolute).
         content: Text content to write.
+        encoding: Text encoding to use when writing.
 
     Returns:
         Success message or error.
@@ -251,7 +249,7 @@ def search_files(
         if len(output) > MAX_SEARCH_BYTES:
             output = (
                 output[:MAX_SEARCH_BYTES]
-                + f"\n... [truncated at 8KB — refine your pattern or file_glob]"
+                + "\n... [truncated at 8KB — refine your pattern or file_glob]"
             )
         return output or f"(no matches for pattern: {pattern})"
     except FileNotFoundError:

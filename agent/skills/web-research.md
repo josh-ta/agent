@@ -7,7 +7,7 @@ Use this skill when asked to research a topic, find information online, or verif
 1. **Plan the search**: Identify 2–3 specific search queries that will yield high-quality results.
 2. **Execute searches**: Use the browser tool to navigate to a search engine or directly to authoritative sources.
    ```
-   navigate("https://www.google.com/search?q=<your+query>")
+   browser_navigate(url="https://www.google.com/search?q=<your+query>")
    ```
 3. **Extract information**: Take a screenshot or read the page's accessible text to gather content.
 4. **Cross-reference**: Verify important facts with at least one additional source.

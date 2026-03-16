@@ -17,13 +17,14 @@ from enum import Enum, auto
 from typing import Any
 
 import discord
-import structlog
 
 from agent.config import settings
 
-log = structlog.get_logger()
-
 A2A_RE = re.compile(r'^\s*\{.*"from"\s*:.*\}', re.DOTALL)
+
+
+def _strip_mentions(content: str) -> str:
+    return re.sub(r"<@!?\d+>", "", content).strip()
 
 
 class MessageKind(Enum):
@@ -67,7 +68,12 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
                 # Only process if addressed to this agent or broadcast
                 if to in ("*", settings.agent_name, ""):
                     return ParsedMessage(
-                        MessageKind.A2A, content, author, channel_id, message_id, a2a_payload=payload
+                        MessageKind.A2A,
+                        content,
+                        author,
+                        channel_id,
+                        message_id,
+                        a2a_payload=payload,
                     )
                 return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
             except json.JSONDecodeError:
@@ -77,12 +83,18 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
         # If no agent is @mentioned (broadcast intent), all agents act.
         # Bot non-JSON posts remain IGNORE.
         if not message.author.bot:
-            clean = re.sub(r"<@!?\d+>", "", content).strip()
+            clean = _strip_mentions(content)
             if clean:
                 # If the message mentions any bot, only respond if it mentions THIS bot
                 if any(user.bot for user in message.mentions):
                     if bot_user.mentioned_in(message):
-                        return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
+                        return ParsedMessage(
+                            MessageKind.TASK,
+                            clean,
+                            author,
+                            channel_id,
+                            message_id,
+                        )
                     return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
                 # No specific bot mentioned — broadcast, all agents act
                 return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
@@ -95,13 +107,13 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
     if channel_id == settings.discord_bus_channel_id:
         if bot_user.mentioned_in(message):
             # Strip mention from content
-            clean = re.sub(r"<@!?\d+>", "", content).strip()
+            clean = _strip_mentions(content)
             return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
         return ParsedMessage(MessageKind.BUS, content, author, channel_id, message_id)
 
     # Any other channel: only respond if mentioned
     if bot_user.mentioned_in(message):
-        clean = re.sub(r"<@!?\d+>", "", content).strip()
+        clean = _strip_mentions(content)
         return ParsedMessage(MessageKind.TASK, clean, author, channel_id, message_id)
 
     return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)

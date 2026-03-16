@@ -1,33 +1,9 @@
 """
-Discord bot: receives messages, routes them to the agent loop, sends replies.
+Discord bot integration.
 
-Uses discord.py with the following intents:
-  - message_content  (required to read message text)
-  - guilds
-  - guild_messages
-
-Channel roles
--------------
-  #bob / #barbara (DISCORD_AGENT_CHANNEL_ID)
-      The user's real-time window into the agent. ALL streaming — thinking,
-      tool calls, shell output, progress events — goes here regardless of
-      where the triggering message came from. Also used for direct user↔agent
-      conversation and full task replies.
-
-  #agent-comms (DISCORD_COMMS_CHANNEL_ID)
-      Machine channel. Structured JSON A2A task routing only. When an agent
-      finishes an A2A task, it posts the result back here as JSON so the
-      requesting agent can read it programmatically. No reasoning, no streaming.
-
-  #agent-bus (DISCORD_BUS_CHANNEL_ID)
-      Broadcast channel. Brief one-line status announcements only. No streaming.
-
-Event bridge integration
-------------------------
-A per-task sink is registered on the EventBridge against the PRIVATE channel
-(DISCORD_AGENT_CHANNEL_ID), not the channel the triggering message came from.
-This ensures thinking/tool streaming always appears in the private channel,
-keeping agent-comms and agent-bus clean.
+The bot classifies inbound messages, routes tasks into `AgentLoop`, and sends
+final replies. Streaming is always bound to the private agent channel so
+agent-comms and agent-bus stay clean.
 """
 
 from __future__ import annotations
@@ -39,22 +15,25 @@ import traceback
 import discord
 import structlog
 
-from agent.communication.message_router import MessageKind, a2a_to_task_content, classify
+from agent.communication.message_router import (
+    MessageKind,
+    ParsedMessage,
+    a2a_to_task_content,
+    classify,
+)
 from agent.config import settings
 from agent.events import (
-    bridge,
     AgentEvent,
+    ProgressEvent,
+    ShellDoneEvent,
+    ShellOutputEvent,
+    ShellStartEvent,
+    TaskErrorEvent,
+    TaskStartEvent,
     TextTurnEndEvent,
     ThinkingEndEvent,
     ToolCallStartEvent,
-    ToolResultEvent,
-    ShellStartEvent,
-    ShellOutputEvent,
-    ShellDoneEvent,
-    TaskStartEvent,
-    TaskDoneEvent,
-    TaskErrorEvent,
-    ProgressEvent,
+    bridge,
 )
 from agent.loop import AgentLoop, Task
 from agent.tools.discord_tools import set_discord_client
@@ -96,10 +75,8 @@ class DiscordBot:
 
     def __init__(self, loop: AgentLoop) -> None:
         self._agent_loop = loop
-        # Per-channel inject queues for zipper-merge
+        # Per-channel inject queues for pending/running Discord tasks.
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
-        # The channel_id of the task currently running (0 if none)
-        self._active_channel: int = 0
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -178,21 +155,21 @@ class DiscordBot:
         # the message came from. This keeps agent-comms and agent-bus clean.
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
 
-        # Zipper-merge: if agent is busy, inject into running task or queue
-        if self._agent_loop.is_busy:
-            if self._active_channel == parsed.channel_id:
-                inject_q = self._inject_queues.get(parsed.channel_id)
-                if inject_q is not None:
-                    await inject_q.put(task_content)
-                    try:
-                        await message.reply(
-                            "💬 Got it — I'll fold that into what I'm working on.",
-                            mention_author=False,
-                        )
-                    except discord.HTTPException:
-                        pass
-                    return
+        # Zipper-merge: if this channel already has pending/running work, fold
+        # the new message into that task instead of spawning a sibling task.
+        inject_q = self._inject_queues.get(parsed.channel_id)
+        if inject_q is not None:
+            await inject_q.put(task_content)
+            try:
+                await message.reply(
+                    "💬 Got it — I'll fold that into what I'm working on.",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+            return
 
+        if self._agent_loop.has_pending_work:
             await self._agent_loop.enqueue(Task(
                 content=task_content,
                 source="discord",
@@ -215,7 +192,7 @@ class DiscordBot:
         # Agent is free — set up inject queue and run
         inject_q = asyncio.Queue()
         self._inject_queues[parsed.channel_id] = inject_q
-        self._active_channel = parsed.channel_id
+        response_future: asyncio.Future = asyncio.get_running_loop().create_future()
 
         task = Task(
             content=task_content,
@@ -224,6 +201,7 @@ class DiscordBot:
             channel_id=parsed.channel_id,
             message_id=parsed.message_id,
             inject_queue=inject_q,
+            response_future=response_future,
         )
 
         # Always register the EventBridge sink against the PRIVATE channel so
@@ -240,13 +218,11 @@ class DiscordBot:
             else message.channel.typing()  # type: ignore[union-attr]
         )
 
-        self._agent_loop.is_busy = True
         try:
             async with typing_ctx:
-                result = await self._agent_loop._process(task)
+                await self._agent_loop.enqueue(task)
+                result = await response_future
         finally:
-            self._agent_loop.is_busy = False
-            self._active_channel = 0
             self._inject_queues.pop(parsed.channel_id, None)
             bridge.unregister(sink_tag)
 
@@ -261,7 +237,7 @@ class DiscordBot:
 
     async def _send_reply(
         self,
-        parsed: object,
+        parsed: ParsedMessage,
         output: str,
         original_message: discord.Message,
     ) -> None:
@@ -273,23 +249,11 @@ class DiscordBot:
           Bus task  → post brief status to agent-bus; full result to private
           Direct    → reply in the private channel
         """
-        from agent.communication.message_router import ParsedMessage
-
-        # Narrow the type for attribute access
-        parsed_msg = parsed  # type: ignore[assignment]
-
-        is_a2a = (
-            hasattr(parsed_msg, "kind")
-            and parsed_msg.kind == MessageKind.A2A  # type: ignore[attr-defined]
-            and getattr(parsed_msg, "a2a_payload", None)
-        )
-        is_bus = (
-            hasattr(parsed_msg, "channel_id")
-            and parsed_msg.channel_id == settings.discord_bus_channel_id  # type: ignore[attr-defined]
-        )
+        is_a2a = parsed.kind == MessageKind.A2A and parsed.a2a_payload is not None
+        is_bus = parsed.channel_id == settings.discord_bus_channel_id
 
         if is_a2a:
-            from_agent = parsed_msg.a2a_payload.get("from", "")  # type: ignore[attr-defined]
+            from_agent = parsed.a2a_payload.get("from", "")
             # Post JSON result back to comms for the requesting agent to read
             if from_agent and settings.discord_comms_channel_id:
                 comms = self._client.get_channel(settings.discord_comms_channel_id)
