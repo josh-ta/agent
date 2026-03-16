@@ -12,5 +12,6 @@ venv/
 /data/
 .DS_Store
 *.log
+.coverage
 # SSH keys — never commit these
 .ssh/
