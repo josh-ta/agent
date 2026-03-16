@@ -12,7 +12,7 @@ import json
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -71,7 +71,7 @@ class TaskJournal:
 
     def append(self, title: str, body: str) -> None:
         try:
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(f"\n### [{ts}] — {title}\n{body}\n")
