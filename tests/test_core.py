@@ -43,6 +43,22 @@ def test_model_factory_sets_reasoning_for_openai_models(monkeypatch: pytest.Monk
     assert model_settings["openai_reasoning_effort"] == "high"
 
 
+def test_model_factory_sets_safe_max_tokens_for_claude_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "thinking_enabled", True)
+    monkeypatch.setattr(settings, "thinking_budget_tokens", 5000)
+
+    model_settings = ModelFactory().model_settings("anthropic:claude-sonnet-4-5")
+
+    assert model_settings is not None
+    assert model_settings["anthropic_thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 5000,
+    }
+    assert model_settings["max_tokens"] == 6024
+
+
 def test_model_factory_builds_openai_compatible_models(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "openai_base_url", "http://localhost:1234/v1")
     monkeypatch.setattr(settings, "openai_api_key", "test-key")

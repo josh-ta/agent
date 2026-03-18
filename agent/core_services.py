@@ -217,6 +217,9 @@ class ModelFactory:
                 "type": "enabled",
                 "budget_tokens": settings.thinking_budget_tokens,
             }
+            # Anthropic requires max_tokens to be greater than thinking.budget_tokens.
+            # Reserve additional room for the visible answer instead of just adding 1.
+            model_settings["max_tokens"] = max(4096, settings.thinking_budget_tokens + 1024)
 
         if is_openai:
             model_settings["openai_prompt_cache_key"] = settings.agent_name
