@@ -121,6 +121,20 @@ class _StreamingAgent:
         yield final
 
 
+class _StreamingAgentWithEmptyThinkingDelta:
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        del prompt, message_history, usage_limits
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "done"
+        yield PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta="reason"))
+        yield PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta=None))
+        yield PartEndEvent(index=0, part=ThinkingPart(content="reason"))
+        yield final
+
+
 class _ContextOverflowAgent:
     def __init__(self) -> None:
         self.calls = 0
@@ -276,6 +290,28 @@ async def test_run_executor_emits_events_and_folds_injected_messages() -> None:
         ToolResultEvent,
         ProgressEvent,
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_executor_ignores_empty_thinking_deltas() -> None:
+    bridge = _Bridge()
+    agent = _StreamingAgentWithEmptyThinkingDelta()
+    executor = RunExecutor(event_bridge=bridge)
+
+    result = await executor.run(
+        task=Task(content="start"),
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert result == ("done", 0, False)
+    assert [type(event) for event in bridge.events] == [
+        ThinkingDeltaEvent,
+        ThinkingEndEvent,
+    ]
+    assert bridge.events[0].delta == "reason"
+    assert bridge.events[1].text == "reason"
 
 
 @pytest.mark.asyncio

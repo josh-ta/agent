@@ -220,8 +220,9 @@ class RunExecutor:
                     ):
                         if isinstance(event, PartDeltaEvent) and isinstance(event.delta, ThinkingPartDelta):
                             delta = event.delta.content_delta
-                            thinking_buf.append(delta)
-                            await self._bridge.emit(ThinkingDeltaEvent(delta=delta))
+                            if delta:
+                                thinking_buf.append(delta)
+                                await self._bridge.emit(ThinkingDeltaEvent(delta=delta))
                         elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                             delta = event.delta.content_delta
                             text_buf.append(delta)
