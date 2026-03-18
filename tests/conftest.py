@@ -92,10 +92,14 @@ class FakeDiscordMessage:
     id: int = 1
     mentions: list[Any] = field(default_factory=list)
     replies: list[str] = field(default_factory=list)
+    reactions: list[str] = field(default_factory=list)
     reference: FakeMessageReference | None = None
 
     async def reply(self, content: str, mention_author: bool = False) -> None:
         self.replies.append(content)
+
+    async def add_reaction(self, emoji: str) -> None:
+        self.reactions.append(emoji)
 
 
 class FakeClientUser(FakeAuthor):

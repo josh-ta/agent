@@ -76,6 +76,7 @@ async def test_message_service_queues_when_busy(fake_client, discord_channels, f
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
+    assert message.reactions == ["✅"]
     assert "queued yours" in message.replies[0]
 
 
@@ -143,6 +144,7 @@ async def test_message_service_injects_followup_and_replies_inline(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert await inject_q.get() == "new detail"
+    assert message.reactions == ["✅"]
     assert "fold that into what I'm working on" in message.replies[0]
 
 
@@ -170,7 +172,32 @@ async def test_message_service_injects_followup_without_inline_reply_in_comms(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert await inject_q.get() == "new detail"
+    assert message.reactions == ["✅"]
     assert message.replies == []
+
+
+@pytest.mark.asyncio
+async def test_message_service_reacts_when_accepting_new_task(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MessageHandlingService(
+        agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, content="please help", channel_id=discord_channels["private"].id),
+    )
+    message = fake_message_factory(channel=discord_channels["private"], content="please help")
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+
+    assert message.reactions == ["✅"]
 
 
 @pytest.mark.asyncio

@@ -195,6 +195,12 @@ class MessageHandlingService:
         self._bridge = event_bridge
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
 
+    async def _acknowledge_message(self, message: discord.Message, emoji: str = "✅") -> None:
+        try:
+            await message.add_reaction(emoji)
+        except discord.HTTPException:
+            pass
+
     async def handle_message(self, message: discord.Message) -> None:
         assert self._client.user
         parsed = classify(message, self._client.user)
@@ -214,6 +220,7 @@ class MessageHandlingService:
         inject_q = self._inject_queues.get(parsed.channel_id)
         if inject_q is not None:
             await inject_q.put(task_content)
+            await self._acknowledge_message(message)
             if allows_inline_reply(parsed.channel_id):
                 try:
                     await message.reply(
@@ -235,6 +242,7 @@ class MessageHandlingService:
                     inject_queue=asyncio.Queue(),
                 )
             )
+            await self._acknowledge_message(message)
             if allows_inline_reply(parsed.channel_id):
                 position = f"#{self._agent_loop.queue.qsize()}" if self._agent_loop.queue.qsize() > 1 else "next"
                 try:
@@ -267,6 +275,7 @@ class MessageHandlingService:
         try:
             async with typing_ctx:
                 await self._agent_loop.enqueue(task)
+                await self._acknowledge_message(message)
                 result = await response_future
         finally:
             self._inject_queues.pop(parsed.channel_id, None)

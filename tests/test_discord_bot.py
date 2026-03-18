@@ -40,9 +40,13 @@ class _FakeMessage:
         self.content = "please fix it"
         self.author = SimpleNamespace(display_name="Josh", bot=False)
         self.replies: list[str] = []
+        self.reactions: list[str] = []
 
     async def reply(self, content: str, mention_author: bool = False) -> None:
         self.replies.append(content)
+
+    async def add_reaction(self, emoji: str) -> None:
+        self.reactions.append(emoji)
 
 
 class _FakeLoop:
@@ -102,6 +106,7 @@ async def test_free_discord_message_uses_queue_path(monkeypatch: pytest.MonkeyPa
 
     assert loop.enqueued is not None
     assert loop.enqueued.content == "Fix the bug"
+    assert message.reactions == ["✅"]
     assert message.replies == ["done"]
 
 
