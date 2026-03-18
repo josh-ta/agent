@@ -125,6 +125,7 @@ For tasks with more than ~5 tool calls, use the task journal:
 - Clone repos to /workspace/<repo-name> (NOT /tmp).
 - `gh` CLI is pre-authenticated via GH_TOKEN env var — NEVER run `gh auth login`.
 - If `gh auth status` exits 0, you ARE authenticated — proceed directly to `gh pr create`.
+- Never guess a GitHub repo slug from memory or narrative context. Use the checked-out repo, confirm the slug with `gh repo view`, or ask the user.
 - Create PRs with: `gh pr create --title "..." --body "..." --base main --repo owner/repo`
 - SSH key is at /data/ssh/id_ed25519 (or id_rsa). Plain `git clone git@github.com:...` should work.
 - Always set git user inside cloned repos: `git config user.name "bob-agent" && git config user.email "bob@agent.local"`

@@ -9,10 +9,65 @@ doesn't have to remember exact flag syntax or parse raw CLI output.
 from __future__ import annotations
 
 import json
+import re
 
 from agent.tools.shell import shell_run
 
 _detected_repo: str | None = None  # cached within a process run
+_verified_repos: dict[str, str] = {}
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _split_shell_result(result: str) -> tuple[str, int | None]:
+    marker = "\n[exit code: "
+    if marker not in result:
+        return result.strip(), None
+    body, _, tail = result.rpartition(marker)
+    exit_text = tail.rstrip("] \n\t")
+    try:
+        exit_code = int(exit_text)
+    except ValueError:
+        exit_code = None
+    return body.strip(), exit_code
+
+
+def _looks_like_repo_slug(repo: str) -> bool:
+    return bool(_REPO_SLUG_RE.fullmatch(repo.strip()))
+
+
+async def _verify_repo(repo: str) -> str | None:
+    normalized = repo.strip()
+    if normalized in _verified_repos:
+        return _verified_repos[normalized]
+    result = await shell_run(
+        f"gh repo view {normalized} --json nameWithOwner -q .nameWithOwner",
+        timeout=10,
+    )
+    body, exit_code = _split_shell_result(result)
+    if exit_code == 0 and _looks_like_repo_slug(body):
+        _verified_repos[normalized] = body
+        return body
+    return None
+
+
+async def _resolve_repo(repo: str | None) -> tuple[str | None, str | None]:
+    if repo:
+        normalized = repo.strip()
+        if not _looks_like_repo_slug(normalized):
+            return None, (
+                f"[error] invalid repo '{repo}'. Use a confirmed 'owner/repo' slug, "
+                "or omit repo to use the current checkout."
+            )
+        verified = await _verify_repo(normalized)
+        if verified:
+            return verified, None
+        detected = await _detect_repo()
+        hint = f" Current workspace repo is '{detected}'." if detected else ""
+        return None, (
+            f"[error] could not verify repo '{normalized}'. Do not guess repository names."
+            f"{hint} Omit repo to use the checked-out repo, or provide a confirmed slug."
+        )
+    return await _detect_repo(), None
 
 
 async def _detect_repo() -> str | None:
@@ -30,8 +85,8 @@ async def _detect_repo() -> str | None:
             working_dir=str(settings.workspace_path),
             timeout=10,
         )
-        slug = result.strip()
-        if slug and "/" in slug and not slug.startswith("["):
+        slug, exit_code = _split_shell_result(result)
+        if exit_code == 0 and _looks_like_repo_slug(slug):
             _detected_repo = slug
             return slug
     except Exception:
@@ -41,8 +96,9 @@ async def _detect_repo() -> str | None:
 
 async def _gh(args: str, repo: str | None = None, timeout: int = 30) -> str:
     """Run a gh command, optionally scoped to a repo. Auto-detects repo if not given."""
-    if not repo:
-        repo = await _detect_repo()
+    repo, error = await _resolve_repo(repo)
+    if error:
+        return error
     repo_flag = f" --repo {repo}" if repo else ""
     return await shell_run(f"gh {args}{repo_flag}", timeout=timeout)
 
@@ -61,8 +117,9 @@ async def pr_list(repo: str | None = None, state: str = "open", limit: int = 20)
 
 async def pr_diff(pr: int | str, repo: str | None = None) -> str:
     """Return the full diff for a PR (piped through head to cap size)."""
-    if not repo:
-        repo = await _detect_repo()
+    repo, error = await _resolve_repo(repo)
+    if error:
+        return error
     repo_flag = f" --repo {repo}" if repo else ""
     # Cap diff at ~300 lines to keep context manageable
     return await shell_run(
@@ -120,10 +177,11 @@ async def pr_review_with_comments(
     if action not in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
         return "[error] action must be 'APPROVE', 'REQUEST_CHANGES', or 'COMMENT'"
 
+    repo, error = await _resolve_repo(repo)
+    if error:
+        return error
     if not repo:
-        repo = await _detect_repo()
-        if not repo:
-            return "[error] repo is required for inline review comments (e.g. 'owner/repo')"
+        return "[error] repo is required for inline review comments (e.g. 'owner/repo')"
 
     review_comments = [
         {"path": c["path"], "line": c["line"], "body": c["message"]}
@@ -229,8 +287,9 @@ async def ci_view(run_id: str | int, repo: str | None = None) -> str:
 
 async def ci_logs_failed(run_id: str | int, repo: str | None = None) -> str:
     """Fetch only the failed step logs from a CI run (capped at 4KB)."""
-    if not repo:
-        repo = await _detect_repo()
+    repo, error = await _resolve_repo(repo)
+    if error:
+        return error
     repo_flag = f" --repo {repo}" if repo else ""
     return await shell_run(
         f"gh run view {run_id}{repo_flag} --log-failed 2>&1 | head -200",

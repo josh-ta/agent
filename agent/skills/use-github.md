@@ -27,6 +27,7 @@ Dedicated structured tools (use these — they're more reliable than raw shell):
 | `gh_ci_rerun(run_id, failed_only?, repo?)` | Re-trigger a CI run |
 
 The `repo` argument is `owner/repo` (e.g. `josh-ta/TicketActionApp`). Omit it when running from inside a cloned repo directory — `gh` infers it automatically.
+Never guess `owner/repo` from memory or conversation context. If you cannot verify the slug from the checked-out repo or with `gh repo view`, ask the user.
 
 ## Workflows
 
