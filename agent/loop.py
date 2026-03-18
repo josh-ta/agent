@@ -34,6 +34,7 @@ from agent.loop_services import (
     TaskContextBuilder,
     TaskJournal,
 )
+from agent.tools.discord_tools import DiscordAttachment
 
 log = structlog.get_logger()
 
@@ -113,6 +114,7 @@ class TaskResult:
     elapsed_ms: float
     tool_calls: int = 0
     discord_replied: bool = False  # True if agent called send_discord during this task
+    attachments: list[DiscordAttachment] = field(default_factory=list)
 
 
 class AgentLoop:
@@ -310,7 +312,7 @@ class AgentLoop:
                 pass
 
         try:
-            result_output, tool_calls, discord_replied = await self._run_executor.run(
+            result_output, tool_calls, discord_replied, attachments = await self._run_executor.run(
                 task=task,
                 agent=agent,
                 base_prompt=base_prompt,
@@ -359,6 +361,7 @@ class AgentLoop:
                 task=task,
                 output=result_output,
                 discord_replied=discord_replied,
+                attachments=attachments,
                 success=True,
                 elapsed_ms=elapsed_ms,
                 tool_calls=tool_calls,
@@ -398,7 +401,7 @@ class AgentLoop:
         base_prompt: str,
         tier: str,
         message_history: list | None = None,
-    ) -> tuple[str, int, bool]:
+    ) -> tuple[str, int, bool, list[DiscordAttachment]]:
         return await self._run_executor.run(
             task=task,
             agent=agent,

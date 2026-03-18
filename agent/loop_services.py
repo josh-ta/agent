@@ -43,6 +43,7 @@ from agent.events import (
     ToolResultEvent,
     bridge,
 )
+from agent.tools.discord_tools import DiscordAttachment, decode_data_url_attachment
 
 if TYPE_CHECKING:
     from agent.loop import Task, TaskResult
@@ -192,7 +193,7 @@ class RunExecutor:
         base_prompt: str,
         tier: str,
         message_history: list | None = None,
-    ) -> tuple[str, int, bool]:
+    ) -> tuple[str, int, bool, list[DiscordAttachment]]:
         prompt = base_prompt
         context_retries = 0
         max_context_retries = 2
@@ -206,6 +207,7 @@ class RunExecutor:
             discord_replied = False
             tool_calls = 0
             result_output = ""
+            attachments: list[DiscordAttachment] = []
 
             try:
                 async with agent.run_mcp_servers():
@@ -256,10 +258,12 @@ class RunExecutor:
                             )
                         elif isinstance(event, FunctionToolResultEvent):
                             ret = getattr(event, "result", None)
+                            tool_name = self._tool_name_from_result_event(event, ret)
                             result_str = str(getattr(ret, "content", ret)) if ret is not None else ""
+                            attachments.extend(self._extract_discord_attachments(tool_name, getattr(ret, "content", ret)))
                             await self._bridge.emit(
                                 ToolResultEvent(
-                                    tool_name=getattr(event, "tool_name", ""),
+                                    tool_name=tool_name,
                                     call_id=getattr(ret, "tool_call_id", ""),
                                     result=result_str[:500],
                                 )
@@ -278,7 +282,7 @@ class RunExecutor:
                                 )
                             )
                         )
-                        followup_output, followup_calls, followup_replied = await self.run(
+                        followup_output, followup_calls, followup_replied, followup_attachments = await self.run(
                             task=task,
                             agent=agent,
                             base_prompt=(
@@ -293,8 +297,9 @@ class RunExecutor:
                         result_output = followup_output
                         tool_calls += followup_calls
                         discord_replied = discord_replied or followup_replied
+                        attachments.extend(followup_attachments)
 
-                return result_output, tool_calls, discord_replied
+                return result_output, tool_calls, discord_replied, attachments
 
             except Exception as exc:
                 exc_str = str(exc)
@@ -368,6 +373,50 @@ class RunExecutor:
             return False
         visible_channels = {cid for cid in (task.channel_id, settings.discord_agent_channel_id) if cid}
         return channel_id in visible_channels
+
+    @staticmethod
+    def _tool_name_from_result_event(event: FunctionToolResultEvent, result: object) -> str:
+        return str(getattr(event, "tool_name", "") or getattr(result, "tool_name", "") or "")
+
+    @staticmethod
+    def _extract_discord_attachments(tool_name: str, result: object) -> list[DiscordAttachment]:
+        if tool_name != "browser_screenshot":
+            return []
+
+        attachments: list[DiscordAttachment] = []
+        for text in RunExecutor._iter_text_values(result):
+            attachment = decode_data_url_attachment(
+                text,
+                filename=f"browser-screenshot-{len(attachments) + 1}.png",
+            )
+            if attachment is not None:
+                attachments.append(attachment)
+        return attachments
+
+    @staticmethod
+    def _iter_text_values(value: object) -> list[str]:
+        texts: list[str] = []
+        if value is None:
+            return texts
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                texts.extend(RunExecutor._iter_text_values(item))
+            return texts
+        if isinstance(value, dict):
+            for item in value.values():
+                texts.extend(RunExecutor._iter_text_values(item))
+            return texts
+
+        text = getattr(value, "text", None)
+        if isinstance(text, str):
+            texts.append(text)
+        else:
+            content = getattr(value, "content", None)
+            if content is not None and content is not value:
+                texts.extend(RunExecutor._iter_text_values(content))
+        return texts
 
     @staticmethod
     def _drain_queue(queue: asyncio.Queue[str]) -> list[str]:

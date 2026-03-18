@@ -9,7 +9,7 @@ import pytest
 
 import agent.tools.discord_tools as discord_tools_module
 from agent.config import settings
-from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
+from agent.tools.discord_tools import DiscordAttachment, ask_user, discord_read, discord_read_named, discord_send, send_attachments
 
 
 @dataclass
@@ -29,10 +29,13 @@ class _Channel:
     def __init__(self, channel_id: int) -> None:
         self.id = channel_id
         self.sent: list[str] = []
+        self.sent_files: list[str] = []
         self._history_items: list[_HistoryMessage] = []
 
-    async def send(self, content: str):
+    async def send(self, content: str = "", *, file=None):
         self.sent.append(content)
+        if file is not None:
+            self.sent_files.append(getattr(file, "filename", "attachment"))
         return SimpleNamespace(id=len(self.sent))
 
     async def history(self, limit: int = 20, after=None, oldest_first: bool = False):
@@ -62,6 +65,21 @@ async def test_discord_send_splits_long_messages(monkeypatch: pytest.MonkeyPatch
 
     assert "Sent 2 message(s)" in result
     assert len(channel.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_attachments_uploads_png_files() -> None:
+    channel = _Channel(1)
+
+    sent = await send_attachments(
+        channel,
+        [DiscordAttachment(filename="browser-screenshot-1.png", data=b"png-bytes")],
+        message="here you go",
+    )
+
+    assert sent == 2
+    assert channel.sent == ["here you go", ""]
+    assert channel.sent_files == ["browser-screenshot-1.png"]
 
 
 @pytest.mark.asyncio

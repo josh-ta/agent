@@ -56,14 +56,17 @@ class FakeHistoryMessage:
 class FakeChannel:
     id: int
     sent: list[str] = field(default_factory=list)
+    sent_files: list[str] = field(default_factory=list)
     sent_messages: list[FakeSentMessage] = field(default_factory=list)
     history_messages: list[FakeHistoryMessage] = field(default_factory=list)
 
     def typing(self) -> NullAsyncContext:
         return NullAsyncContext()
 
-    async def send(self, content: str) -> FakeSentMessage:
+    async def send(self, content: str = "", *, file=None) -> FakeSentMessage:
         self.sent.append(content)
+        if file is not None:
+            self.sent_files.append(getattr(file, "filename", "attachment"))
         sent = FakeSentMessage(content=content, id=len(self.sent_messages) + 1)
         self.sent_messages.append(sent)
         return sent

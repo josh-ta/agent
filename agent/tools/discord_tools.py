@@ -1,5 +1,5 @@
 """
-Discord tools: send messages and read channel history.
+Discord tools: send messages, uploads, and read channel history.
 
 These are thin wrappers called from within a running Pydantic AI tool.
 The actual discord.py Client lives in communication/discord_bot.py;
@@ -8,18 +8,32 @@ these functions receive it as a dependency or via a module-level ref.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import base64
+import binascii
+import io
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Sequence
 
+import discord
 import structlog
 
 if TYPE_CHECKING:
-    import discord
+    from discord.abc import Messageable
 
 log = structlog.get_logger()
 
 # Module-level reference to the discord client (set by discord_bot.py on startup)
 _discord_client: discord.Client | None = None
 _pending_question_ids: dict[int, set[int]] = {}
+
+
+@dataclass(frozen=True)
+class DiscordAttachment:
+    filename: str
+    data: bytes
+
+    def to_file(self) -> discord.File:
+        return discord.File(io.BytesIO(self.data), filename=self.filename)
 
 
 def set_discord_client(client: discord.Client) -> None:
@@ -58,14 +72,52 @@ async def discord_send(channel_id: int, message: str) -> str:
         return f"[ERROR: channel {channel_id} not found or not accessible]"
 
     try:
-        # Split messages longer than Discord's 2000-char limit
-        chunks = [message[i:i+1990] for i in range(0, len(message), 1990)]
-        for chunk in chunks:
-            await channel.send(chunk)  # type: ignore[union-attr]
-        log.info("discord_sent", channel=channel_id, chunks=len(chunks))
-        return f"Sent {len(chunks)} message(s) to channel {channel_id}."
+        sent_messages = await send_text(channel, message)
+        log.info("discord_sent", channel=channel_id, chunks=sent_messages)
+        return f"Sent {sent_messages} message(s) to channel {channel_id}."
     except Exception as exc:
         return f"[ERROR: {exc}]"
+
+
+async def send_text(channel: "Messageable", message: str, *, max_len: int = 1990) -> int:
+    if not message:
+        return 0
+
+    chunks = [message[i:i + max_len] for i in range(0, len(message), max_len)]
+    for chunk in chunks:
+        await channel.send(chunk)
+    return len(chunks)
+
+
+async def send_attachments(
+    channel: "Messageable",
+    attachments: Sequence[DiscordAttachment],
+    *,
+    message: str = "",
+) -> int:
+    sent_messages = 0
+    if message:
+        sent_messages += await send_text(channel, message)
+
+    for attachment in attachments:
+        await channel.send(file=attachment.to_file())
+        sent_messages += 1
+    return sent_messages
+
+
+def decode_data_url_attachment(data_url: str, *, filename: str = "browser-screenshot.png") -> DiscordAttachment | None:
+    prefix = "data:image/png;base64,"
+    if not data_url.startswith(prefix):
+        return None
+
+    try:
+        return DiscordAttachment(
+            filename=filename,
+            data=base64.b64decode(data_url[len(prefix):], validate=True),
+        )
+    except (ValueError, binascii.Error):
+        log.warning("discord_attachment_decode_failed")
+        return None
 
 
 async def discord_read(channel_id: int, limit: int = 20) -> str:

@@ -29,7 +29,7 @@ class _FakeChannel:
     def typing(self) -> _NullTyping:
         return _NullTyping()
 
-    async def send(self, content: str) -> None:
+    async def send(self, content: str = "", *, file=None) -> None:
         self.sent.append(content)
 
 

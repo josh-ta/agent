@@ -241,6 +241,14 @@ async def test_message_service_skips_sending_reply_for_empty_or_already_sent_res
     results = [
         TaskResult(task=SimpleNamespace(), output="", success=True, elapsed_ms=1.0),
         TaskResult(task=SimpleNamespace(), output="done", success=True, elapsed_ms=1.0, discord_replied=True),
+        TaskResult(
+            task=SimpleNamespace(),
+            output="done",
+            success=True,
+            elapsed_ms=1.0,
+            discord_replied=True,
+            attachments=[discord_tools_module.DiscordAttachment(filename="browser-screenshot-1.png", data=b"png")],
+        ),
     ]
     sent: list[str] = []
 
@@ -273,8 +281,9 @@ async def test_message_service_skips_sending_reply_for_empty_or_already_sent_res
 
     await service.handle_message(message)  # type: ignore[arg-type]
     await service.handle_message(message)  # type: ignore[arg-type]
+    await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert sent == []
+    assert sent == ["reply"]
 
 
 @pytest.mark.asyncio
@@ -315,7 +324,7 @@ async def test_message_service_send_reply_handles_a2a_failure(fake_client, disco
     message = fake_message_factory(channel=discord_channels["private"], content="hello")
 
     class _ExplodingChannel(FakeChannel):
-        async def send(self, content: str):
+        async def send(self, content: str = "", *, file=None):
             raise RuntimeError("send failed")
 
     fake_client.channels[discord_channels["comms"].id] = _ExplodingChannel(id=discord_channels["comms"].id)
@@ -368,6 +377,31 @@ async def test_message_service_send_reply_splits_private_reply(
 
 
 @pytest.mark.asyncio
+async def test_message_service_send_reply_uploads_screenshot_attachments(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+) -> None:
+    service = MessageHandlingService(
+        agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["private"].id)
+    message = fake_message_factory(channel=discord_channels["private"], content="hello")
+
+    await service.send_reply(
+        parsed,
+        "screenshot attached",
+        message,  # type: ignore[arg-type]
+        attachments=[discord_tools_module.DiscordAttachment(filename="browser-screenshot-1.png", data=b"png")],
+    )
+
+    assert message.replies == ["screenshot attached"]
+    assert discord_channels["private"].sent_files == ["browser-screenshot-1.png"]
+
+
+@pytest.mark.asyncio
 async def test_post_bus_status_handles_noop_and_failure(fake_client, discord_channels, monkeypatch: pytest.MonkeyPatch) -> None:
     service = MessageHandlingService(
         agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
@@ -382,7 +416,7 @@ async def test_post_bus_status_handles_noop_and_failure(fake_client, discord_cha
     monkeypatch.setattr(discord_services_module.discord, "HTTPException", RuntimeError)
 
     class _ExplodingChannel(FakeChannel):
-        async def send(self, content: str):
+        async def send(self, content: str = "", *, file=None):
             raise RuntimeError("send failed")
 
     fake_client.channels[discord_channels["bus"].id] = _ExplodingChannel(id=discord_channels["bus"].id)
@@ -432,8 +466,10 @@ async def test_discord_event_presenter_falls_back_when_shell_edit_fails(fake_cli
             raise RuntimeError("edit failed")
 
     class _BrokenChannel(FakeChannel):
-        async def send(self, content: str) -> FakeSentMessage:
+        async def send(self, content: str = "", *, file=None) -> FakeSentMessage:
             self.sent.append(content)
+            if file is not None:
+                self.sent_files.append(getattr(file, "filename", "attachment"))
             sent = _BrokenSentMessage(content=content, id=len(self.sent_messages) + 1)
             self.sent_messages.append(sent)
             return sent

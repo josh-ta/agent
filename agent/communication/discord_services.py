@@ -92,12 +92,20 @@ class DiscordEventPresenter:
         self._client = client
 
     async def send_chunked(self, channel: discord.abc.Messageable, text: str) -> None:
-        chunks = [text[i:i + MAX_REPLY_LEN] for i in range(0, len(text), MAX_REPLY_LEN)]
-        for chunk in chunks:
-            try:
-                await channel.send(chunk)
-            except discord.HTTPException as exc:
-                log.warning("send_chunked_failed", error=str(exc))
+        try:
+            await discord_tools_module.send_text(channel, text, max_len=MAX_REPLY_LEN)
+        except discord.HTTPException as exc:
+            log.warning("send_chunked_failed", error=str(exc))
+
+    async def send_attachments(
+        self,
+        channel: discord.abc.Messageable,
+        attachments: list[discord_tools_module.DiscordAttachment],
+    ) -> None:
+        try:
+            await discord_tools_module.send_attachments(channel, attachments)
+        except discord.HTTPException as exc:
+            log.warning("send_attachment_failed", error=str(exc))
 
     def make_sink(self, channel: discord.abc.Messageable):  # type: ignore[return]
         shell_lines: list[str] = []
@@ -309,19 +317,27 @@ class MessageHandlingService:
             self._inject_queues.pop(parsed.channel_id, None)
             self._bridge.unregister(sink_tag)
 
-        if result.discord_replied or not result.output:
+        if result.discord_replied:
+            if result.attachments:
+                await self.send_reply(parsed, "", message, attachments=result.attachments)
+            return
+        if not result.output:
+            if result.attachments:
+                await self.send_reply(parsed, "", message, attachments=result.attachments)
             return
 
-        await self.send_reply(parsed, result.output, message)
+        await self.send_reply(parsed, result.output, message, attachments=result.attachments)
 
     async def send_reply(
         self,
         parsed: ParsedMessage,
         output: str,
         original_message: discord.Message,
+        attachments: list[discord_tools_module.DiscordAttachment] | None = None,
     ) -> None:
         is_a2a = parsed.kind == MessageKind.A2A and parsed.a2a_payload is not None
         is_bus = parsed.channel_id == settings.discord_bus_channel_id
+        attachments = attachments or []
 
         if is_a2a:
             from_agent = parsed.a2a_payload.get("from", "")
@@ -349,6 +365,8 @@ class MessageHandlingService:
             private_channel = self._client.get_channel(settings.discord_agent_channel_id)
             if private_channel is not None:
                 await self._presenter.send_chunked(private_channel, output)  # type: ignore[arg-type]
+                if attachments:
+                    await self._presenter.send_attachments(private_channel, attachments)  # type: ignore[arg-type]
             return
 
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
@@ -361,6 +379,8 @@ class MessageHandlingService:
                     await target.send(chunk)  # type: ignore[union-attr]
             else:
                 await self._presenter.send_chunked(target, output)  # type: ignore[arg-type]
+            if attachments:
+                await self._presenter.send_attachments(target, attachments)  # type: ignore[arg-type]
         except discord.HTTPException as exc:
             log.error("discord_send_failed", error=str(exc))
 
