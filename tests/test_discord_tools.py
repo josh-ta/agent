@@ -114,3 +114,4 @@ async def test_ask_user_returns_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await ask_user("Proceed?", timeout=3)
 
     assert result == "yes, proceed"
+    assert discord_tools_module.has_pending_question(9) is False

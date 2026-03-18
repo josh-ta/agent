@@ -21,10 +21,25 @@ import discord
 from agent.config import settings
 
 A2A_RE = re.compile(r'^\s*\{.*"from"\s*:.*\}', re.DOTALL)
+NON_ACTIONABLE_A2A_TASKS = frozenset(
+    {
+        "ack",
+        "acknowledge",
+        "result",
+        "status",
+        "status-response",
+        "status_response",
+        "update",
+    }
+)
 
 
 def _strip_mentions(content: str) -> str:
     return re.sub(r"<@!?\d+>", "", content).strip()
+
+
+def _normalize_a2a_task(task: object) -> str:
+    return str(task or "").strip().lower()
 
 
 class MessageKind(Enum):
@@ -67,6 +82,8 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
                 to = payload.get("to", "")
                 # Only process if addressed to this agent or broadcast
                 if to in ("*", settings.agent_name, ""):
+                    if _normalize_a2a_task(payload.get("task")) in NON_ACTIONABLE_A2A_TASKS:
+                        return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
                     return ParsedMessage(
                         MessageKind.A2A,
                         content,

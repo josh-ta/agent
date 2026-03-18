@@ -35,6 +35,7 @@ from agent.events import (
     bridge,
 )
 from agent.loop import Task
+from agent.tools import discord_tools as discord_tools_module
 
 if TYPE_CHECKING:
     from agent.loop import AgentLoop
@@ -195,6 +196,21 @@ class MessageHandlingService:
         self._bridge = event_bridge
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
 
+    def _is_answering_pending_question(
+        self,
+        parsed: ParsedMessage,
+        message: discord.Message,
+    ) -> bool:
+        if parsed.channel_id != settings.discord_agent_channel_id:
+            return False
+        if not self._agent_loop.has_pending_work:
+            return False
+        if not discord_tools_module.has_pending_question(parsed.channel_id):
+            return False
+        if discord_tools_module.is_pending_question_reply(message):
+            return True
+        return getattr(message, "reference", None) is None
+
     async def _acknowledge_message(self, message: discord.Message, emoji: str = "✅") -> None:
         try:
             await message.add_reaction(emoji)
@@ -217,6 +233,18 @@ class MessageHandlingService:
             return
 
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
+        if self._is_answering_pending_question(parsed, message):
+            await self._acknowledge_message(message)
+            if allows_inline_reply(parsed.channel_id):
+                try:
+                    await message.reply(
+                        "💬 Got it — using that answer now.",
+                        mention_author=False,
+                    )
+                except discord.HTTPException:
+                    pass
+            return
+
         inject_q = self._inject_queues.get(parsed.channel_id)
         if inject_q is not None:
             await inject_q.put(task_content)

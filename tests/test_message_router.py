@@ -31,6 +31,18 @@ def test_classify_accepts_targeted_a2a_payload(discord_channels, fake_client, fa
     assert parsed.a2a_payload["task"] == "review"
 
 
+def test_classify_ignores_non_actionable_a2a_payloads(discord_channels, fake_client, fake_message_factory) -> None:
+    message = fake_message_factory(
+        channel=discord_channels["comms"],
+        content='{"from":"peer-1","to":"agent-1","task":"result","payload":"done"}',
+        author=SimpleNamespace(display_name="peer-1", bot=True),
+    )
+
+    parsed = classify(message, fake_client.user)
+
+    assert parsed.kind == MessageKind.IGNORE
+
+
 def test_classify_human_broadcast_in_comms_becomes_task(discord_channels, fake_client, fake_message_factory) -> None:
     message = fake_message_factory(
         channel=discord_channels["comms"],

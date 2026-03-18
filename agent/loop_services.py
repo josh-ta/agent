@@ -244,13 +244,14 @@ class RunExecutor:
                         elif isinstance(event, FunctionToolCallEvent):
                             tool_calls += 1
                             tool_name = event.part.tool_name
-                            if tool_name == "send_discord":
+                            parsed_args = self._parse_tool_args(event.part.args)
+                            if self._is_user_visible_discord_send(task, tool_name, parsed_args):
                                 discord_replied = True
                             await self._bridge.emit(
                                 ToolCallStartEvent(
                                     tool_name=tool_name,
                                     call_id=event.part.tool_call_id,
-                                    args=self._parse_tool_args(event.part.args),
+                                    args=parsed_args,
                                 )
                             )
                         elif isinstance(event, FunctionToolResultEvent):
@@ -354,6 +355,19 @@ class RunExecutor:
             except Exception:
                 return raw_args
         return raw_args
+
+    @staticmethod
+    def _is_user_visible_discord_send(task: "Task", tool_name: str, args: object) -> bool:
+        if tool_name != "send_discord" or not isinstance(args, dict):
+            return False
+        try:
+            channel_id = int(args.get("channel_id", 0))
+        except (TypeError, ValueError):
+            return False
+        if channel_id in {settings.discord_comms_channel_id, settings.discord_bus_channel_id}:
+            return False
+        visible_channels = {cid for cid in (task.channel_id, settings.discord_agent_channel_id) if cid}
+        return channel_id in visible_channels
 
     @staticmethod
     def _drain_queue(queue: asyncio.Queue[str]) -> list[str]:

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent.communication.discord_services as discord_services_module
+import agent.tools.discord_tools as discord_tools_module
 from agent.communication.discord_services import DiscordEventPresenter, MAX_REPLY_LEN, MessageHandlingService
 from agent.communication.message_router import MessageKind, ParsedMessage
 from agent.config import settings
@@ -94,6 +95,36 @@ async def test_message_service_uses_next_position_when_single_item_ahead(fake_cl
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert "next up" in message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_message_service_treats_pending_question_answer_as_in_place_reply(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MessageHandlingService(
+        agent_loop=_BusyLoop(),  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    discord_tools_module._pending_question_ids[discord_channels["private"].id] = {42}
+    message = fake_message_factory(channel=discord_channels["private"], content="skip it")
+    message.reference = SimpleNamespace(message_id=42)
+
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, content="skip it", channel_id=discord_channels["private"].id),
+    )
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+
+    assert message.reactions == ["✅"]
+    assert message.replies == ["💬 Got it — using that answer now."]
+    assert service._agent_loop.enqueued is None
+    discord_tools_module._pending_question_ids.clear()
 
 
 @pytest.mark.asyncio

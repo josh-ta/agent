@@ -42,7 +42,7 @@ Then poll for their reply:
 read_discord(DISCORD_COMMS_CHANNEL_ID, limit=10)
 ```
 Look for a message with `"from": "agent-2"` and `"task": "result"`. The `"payload"` field
-contains their answer. Do not expect a separate queued/received ack in `#agent-comms`.
+contains their answer. Do not expect a separate queued/received ack in `#agent-comms`, and do not send one back.
 
 ## Receiving an A2A Task (when another agent delegates to you)
 
@@ -56,7 +56,7 @@ send_discord(DISCORD_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "X", "task":
 ```
 
 Do NOT reply with plain text to agent-comms — the other agent reads structured JSON.
-The only messages there should be task JSON and final result JSON.
+The only messages there should be task JSON and final result JSON. Never send ack, acknowledge, thank-you, or status-response messages there.
 
 ## Collaborating on a Shared Task
 

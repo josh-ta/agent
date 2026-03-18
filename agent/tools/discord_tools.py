@@ -19,11 +19,24 @@ log = structlog.get_logger()
 
 # Module-level reference to the discord client (set by discord_bot.py on startup)
 _discord_client: discord.Client | None = None
+_pending_question_ids: dict[int, set[int]] = {}
 
 
 def set_discord_client(client: discord.Client) -> None:
     global _discord_client
     _discord_client = client
+
+
+def has_pending_question(channel_id: int) -> bool:
+    return bool(_pending_question_ids.get(channel_id))
+
+
+def is_pending_question_reply(message: "discord.Message") -> bool:
+    pending_ids = _pending_question_ids.get(message.channel.id)
+    if not pending_ids:
+        return False
+    ref = getattr(message, "reference", None)
+    return getattr(ref, "message_id", None) in pending_ids
 
 
 async def discord_send(channel_id: int, message: str) -> str:
@@ -116,6 +129,7 @@ async def ask_user(question: str, timeout: int = 300) -> str:
     # Record the message ID we're about to send so we only read replies after it
     try:
         sent = await channel.send(f"❓ {question}")  # type: ignore[union-attr]
+        _pending_question_ids.setdefault(channel_id, set()).add(sent.id)
         log.info("ask_user_sent", channel=channel_id, question=question[:80])
     except Exception as exc:
         return f"[ERROR sending question: {exc}]"
@@ -125,31 +139,38 @@ async def ask_user(question: str, timeout: int = 300) -> str:
     import asyncio as _asyncio
     poll_interval = 3  # seconds between checks
     elapsed = 0
-    while elapsed < timeout:
-        await _asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-        try:
-            candidates = []
-            async for msg in channel.history(limit=50, after=sent, oldest_first=True):  # type: ignore[union-attr]
-                if not msg.author.bot and msg.content.strip():
-                    candidates.append(msg)
+    try:
+        while elapsed < timeout:
+            await _asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            try:
+                candidates = []
+                async for msg in channel.history(limit=50, after=sent, oldest_first=True):  # type: ignore[union-attr]
+                    if not msg.author.bot and msg.content.strip():
+                        candidates.append(msg)
 
-            for msg in candidates:
-                ref = getattr(msg, "reference", None)
-                if ref and getattr(ref, "message_id", None) == sent.id:
-                    log.info("ask_user_replied", elapsed_s=elapsed, reply=msg.content[:80])
-                    return msg.content
+                for msg in candidates:
+                    ref = getattr(msg, "reference", None)
+                    if ref and getattr(ref, "message_id", None) == sent.id:
+                        log.info("ask_user_replied", elapsed_s=elapsed, reply=msg.content[:80])
+                        return msg.content
 
-            distinct_authors = {msg.author.id for msg in candidates}
-            if len(distinct_authors) == 1 and candidates:
-                reply = candidates[-1]
-                log.info("ask_user_replied", elapsed_s=elapsed, reply=reply.content[:80])
-                return reply.content
-        except Exception as exc:
-            return f"[ERROR reading reply: {exc}]"
+                distinct_authors = {msg.author.id for msg in candidates}
+                if len(distinct_authors) == 1 and candidates:
+                    reply = candidates[-1]
+                    log.info("ask_user_replied", elapsed_s=elapsed, reply=reply.content[:80])
+                    return reply.content
+            except Exception as exc:
+                return f"[ERROR reading reply: {exc}]"
 
-    log.warning("ask_user_timeout", timeout=timeout, question=question[:80])
-    return f"[No reply received after {timeout}s — proceeding with best judgment]"
+        log.warning("ask_user_timeout", timeout=timeout, question=question[:80])
+        return f"[No reply received after {timeout}s — proceeding with best judgment]"
+    finally:
+        pending_ids = _pending_question_ids.get(channel_id)
+        if pending_ids is not None:
+            pending_ids.discard(sent.id)
+            if not pending_ids:
+                _pending_question_ids.pop(channel_id, None)
 
 
 async def discord_read_named(name: str, limit: int = 20) -> str:

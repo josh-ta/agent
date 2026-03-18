@@ -19,6 +19,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
+from agent.config import settings
 from agent.loop import Task, TaskResult
 from agent.loop_services import HeartbeatService, ReflectionService, RunExecutor, TaskContextBuilder, TaskJournal
 from agent.events import (
@@ -132,6 +133,23 @@ class _StreamingAgentWithEmptyThinkingDelta:
         yield PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta="reason"))
         yield PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta=None))
         yield PartEndEvent(index=0, part=ThinkingPart(content="reason"))
+        yield final
+
+
+class _StreamingAgentWithDiscordSend:
+    def __init__(self, args: str) -> None:
+        self._args = args
+
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        del prompt, message_history, usage_limits
+        yield FunctionToolCallEvent(
+            ToolCallPart(tool_name="send_discord", args=self._args, tool_call_id="call-1")
+        )
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "done"
         yield final
 
 
@@ -312,6 +330,42 @@ async def test_run_executor_ignores_empty_thinking_deltas() -> None:
     ]
     assert bridge.events[0].delta == "reason"
     assert bridge.events[1].text == "reason"
+
+
+@pytest.mark.asyncio
+async def test_run_executor_does_not_treat_comms_send_as_user_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "discord_comms_channel_id", 303)
+    monkeypatch.setattr(settings, "discord_bus_channel_id", 202)
+    monkeypatch.setattr(settings, "discord_agent_channel_id", 101)
+    executor = RunExecutor(event_bridge=_Bridge())
+    agent = _StreamingAgentWithDiscordSend('{"channel_id": 303, "message": "done"}')
+
+    result = await executor.run(
+        task=Task(content="start", channel_id=101),
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert result == ("done", 1, False)
+
+
+@pytest.mark.asyncio
+async def test_run_executor_treats_private_send_as_user_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "discord_comms_channel_id", 303)
+    monkeypatch.setattr(settings, "discord_bus_channel_id", 202)
+    monkeypatch.setattr(settings, "discord_agent_channel_id", 101)
+    executor = RunExecutor(event_bridge=_Bridge())
+    agent = _StreamingAgentWithDiscordSend('{"channel_id": 101, "message": "done"}')
+
+    result = await executor.run(
+        task=Task(content="start", channel_id=404),
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert result == ("done", 1, True)
 
 
 @pytest.mark.asyncio

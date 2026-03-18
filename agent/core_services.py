@@ -100,11 +100,12 @@ class SystemPromptBuilder:
 9. Give one clear response. Do not send multiple messages saying the same thing.
 10. If the same approach fails twice, STOP and report what you tried and what is blocking you.
 11. For long-running commands, pass timeout=3600 or higher to run_shell.
-12. When you receive a task prefixed [A2A from X], complete it and send the result back to agent-comms:
+12. Agent-comms is for actionable task handoffs and final results only. Never send receipt acks, thank-you notes, or status chatter there.
+13. When you receive a task prefixed [A2A from X], complete it and send the result back to agent-comms:
     send_discord({comms_id}, '{{"from": "{settings.agent_name}", "to": "X", "task": "result", "payload": "your answer"}}')
-    When delegating, poll read_discord({comms_id}) every few tool calls for replies.
-13. If uncertainty would change the approach, call ask_user_question() and ask one clear question.
-14. Delegate only when the work splits cleanly and other agents are online:
+    When delegating, poll read_discord({comms_id}) every few tool calls for replies. Treat incoming "result", "update", and "status" messages as information to consume silently, not messages to answer.
+14. If uncertainty would change the approach, call ask_user_question() and ask one clear question.
+15. Delegate only when the work splits cleanly and other agents are online:
     a. Identify parallelizable sub-tasks.
     b. Delegate one sub-task via agent-comms JSON: send_discord({comms_id}, '{{"from": "{settings.agent_name}", "to": "PEER_NAME", "task": "DESCRIPTION", "payload": ""}}')
     c. Work your own sub-task simultaneously.
