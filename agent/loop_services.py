@@ -8,6 +8,7 @@ so they can be tested with fakes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import traceback
@@ -208,8 +209,15 @@ class RunExecutor:
             tool_calls = 0
             result_output = ""
             attachments: list[DiscordAttachment] = []
+            loop = asyncio.get_running_loop()
+            progress_state = {
+                "last_activity_at": loop.time(),
+                "activity": "thinking through the task",
+            }
+            progress_watchdog: asyncio.Task[None] | None = None
 
             try:
+                progress_watchdog = loop.create_task(self._progress_watchdog(progress_state))
                 async with agent.run_mcp_servers():
                     thinking_buf: list[str] = []
                     text_buf: list[str] = []
@@ -220,6 +228,7 @@ class RunExecutor:
                         message_history=message_history or [],
                         usage_limits=UsageLimits(request_limit=None),
                     ):
+                        self._mark_progress_activity(progress_state)
                         if isinstance(event, PartDeltaEvent) and isinstance(event.delta, ThinkingPartDelta):
                             delta = event.delta.content_delta
                             if delta:
@@ -246,6 +255,7 @@ class RunExecutor:
                         elif isinstance(event, FunctionToolCallEvent):
                             tool_calls += 1
                             tool_name = event.part.tool_name
+                            self._set_progress_activity(progress_state, f"running `{tool_name}`")
                             parsed_args = self._parse_tool_args(event.part.args)
                             if self._is_user_visible_discord_send(task, tool_name, parsed_args):
                                 discord_replied = True
@@ -259,6 +269,8 @@ class RunExecutor:
                         elif isinstance(event, FunctionToolResultEvent):
                             ret = getattr(event, "result", None)
                             tool_name = self._tool_name_from_result_event(event, ret)
+                            if tool_name:
+                                self._set_progress_activity(progress_state, f"reviewing results from `{tool_name}`")
                             result_str = str(getattr(ret, "content", ret)) if ret is not None else ""
                             attachments.extend(self._extract_discord_attachments(tool_name, getattr(ret, "content", ret)))
                             await self._bridge.emit(
@@ -351,6 +363,11 @@ class RunExecutor:
                     continue
 
                 raise
+            finally:
+                if progress_watchdog is not None:
+                    progress_watchdog.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await progress_watchdog
 
     @staticmethod
     def _parse_tool_args(raw_args: object) -> object:
@@ -427,6 +444,27 @@ class RunExecutor:
             except asyncio.QueueEmpty:
                 break
         return items
+
+    async def _progress_watchdog(self, progress_state: dict[str, object]) -> None:
+        interval_s = max(1, int(settings.progress_heartbeat_seconds))
+        while True:
+            await self._sleep(interval_s)
+            now = asyncio.get_running_loop().time()
+            last_activity_at = float(progress_state["last_activity_at"])
+            if now - last_activity_at < interval_s:
+                continue
+            activity = str(progress_state.get("activity") or "working on the task")
+            await self._bridge.emit(ProgressEvent(message=f"⏳ Still working — {activity}."))
+            progress_state["last_activity_at"] = now
+
+    @staticmethod
+    def _mark_progress_activity(progress_state: dict[str, object]) -> None:
+        progress_state["last_activity_at"] = asyncio.get_running_loop().time()
+
+    @staticmethod
+    def _set_progress_activity(progress_state: dict[str, object], activity: str) -> None:
+        progress_state["activity"] = activity
+        RunExecutor._mark_progress_activity(progress_state)
 
 
 class ReflectionService:

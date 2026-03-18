@@ -106,7 +106,7 @@ async def test_free_discord_message_uses_queue_path(monkeypatch: pytest.MonkeyPa
 
     assert loop.enqueued is not None
     assert loop.enqueued.content == "Fix the bug"
-    assert message.reactions == ["✅"]
+    assert message.reactions == ["👀", "🏁"]
     assert message.replies == ["done"]
 
 

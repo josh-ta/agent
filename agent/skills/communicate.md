@@ -14,6 +14,11 @@ For step-by-step notes (auto-forwarded to Discord AND saved to journal):
 task_note("Checked CI run 23065824301. Jobs: backend=failed. Root cause: PYTHONPATH missing. Next: fix ci-cd.yml.")
 ```
 
+Use `task_note()` before the first tool call, after each major step, and again any time the task would otherwise go quiet for a while. Each note should cover:
+- what you just did
+- what you learned
+- what you will do next
+
 Do NOT call `send_discord` at the end to summarize — your final text response is the reply.
 
 ## Channel Layout

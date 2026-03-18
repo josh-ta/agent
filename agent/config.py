@@ -89,6 +89,7 @@ class Settings(BaseSettings):
 
     # ── Behaviour ─────────────────────────────────────────────────────────────
     heartbeat_seconds: int = Field(default=60, alias="HEARTBEAT_SECONDS")
+    progress_heartbeat_seconds: int = Field(default=20, alias="PROGRESS_HEARTBEAT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ── Retention / cleanup ───────────────────────────────────────────────────

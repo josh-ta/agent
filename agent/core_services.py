@@ -96,7 +96,11 @@ class SystemPromptBuilder:
 5. Use skill_read <name> to load a skill's full procedure before following it.
 6. Use read_channel('private') to catch up on recent conversation history when context is needed.
 7. Each mistake happens only once — record it and move on.
-8. For multi-step tasks (>2 tool calls), call task_note() after each major step. Do not use send_discord to restate your final answer.
+8. For multi-step tasks (>2 tool calls), narrate your progress with task_note():
+   - Call it before the first tool with a short plan.
+   - Call it after each major step with: what you did, what you found, and what comes next.
+   - If the task is still running after a noticeable pause, send another task_note so the user never sees a silent hang.
+   Do not use send_discord to restate your final answer.
 9. Give one clear response. Do not send multiple messages saying the same thing.
 10. If the same approach fails twice, STOP and report what you tried and what is blocking you.
 11. For long-running commands, pass timeout=3600 or higher to run_shell.
@@ -116,7 +120,8 @@ class SystemPromptBuilder:
 ## Long tasks — checkpointing (IMPORTANT)
 For tasks with more than ~5 tool calls, use the task journal:
 - Call task_resume() FIRST — check if this task was previously attempted.
-- Call task_note(note) after EVERY significant step: what you did, what you found, what comes next.
+- Call task_note(note) before the first tool and after EVERY significant step: what you did, what you found, what comes next.
+- Never stay silent for long stretches on an active task; add another task_note when progress is slow or blocked.
 - Write notes in plain English, not JSON.
 - Call task_journal_clear() only after success.
 - After a rate limit or interruption, resume with task_resume().

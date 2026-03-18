@@ -118,6 +118,10 @@ class DiscordEventPresenter:
             nonlocal shell_lines, shell_msg
 
             if isinstance(event, TaskStartEvent):
+                summary = event.content.strip().replace("\n", " ")
+                if len(summary) > 160:
+                    summary = summary[:157] + "..."
+                await _send(f"🟢 Starting: {summary}")
                 return
 
             if isinstance(event, ThinkingEndEvent):
@@ -219,11 +223,14 @@ class MessageHandlingService:
             return True
         return getattr(message, "reference", None) is None
 
-    async def _acknowledge_message(self, message: discord.Message, emoji: str = "✅") -> None:
+    async def _acknowledge_message(self, message: discord.Message, emoji: str = "👀") -> None:
         try:
             await message.add_reaction(emoji)
         except discord.HTTPException:
             pass
+
+    async def _mark_task_finished(self, message: discord.Message, *, success: bool) -> None:
+        await self._acknowledge_message(message, "🏁" if success else "❌")
 
     async def handle_message(self, message: discord.Message) -> None:
         assert self._client.user
@@ -316,6 +323,8 @@ class MessageHandlingService:
         finally:
             self._inject_queues.pop(parsed.channel_id, None)
             self._bridge.unregister(sink_tag)
+
+        await self._mark_task_finished(message, success=result.success)
 
         if result.discord_replied:
             if result.attachments:

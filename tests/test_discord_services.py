@@ -16,6 +16,7 @@ from agent.events import (
     ShellOutputEvent,
     ShellStartEvent,
     TaskErrorEvent,
+    TaskStartEvent,
     TextTurnEndEvent,
     ThinkingEndEvent,
     ToolCallStartEvent,
@@ -77,7 +78,7 @@ async def test_message_service_queues_when_busy(fake_client, discord_channels, f
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert message.reactions == ["✅"]
+    assert message.reactions == ["👀"]
     assert "queued yours" in message.replies[0]
 
 
@@ -121,7 +122,7 @@ async def test_message_service_treats_pending_question_answer_as_in_place_reply(
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert message.reactions == ["✅"]
+    assert message.reactions == ["👀"]
     assert message.replies == ["💬 Got it — using that answer now."]
     assert service._agent_loop.enqueued is None
     discord_tools_module._pending_question_ids.clear()
@@ -175,7 +176,7 @@ async def test_message_service_injects_followup_and_replies_inline(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert await inject_q.get() == "new detail"
-    assert message.reactions == ["✅"]
+    assert message.reactions == ["👀"]
     assert "fold that into what I'm working on" in message.replies[0]
 
 
@@ -203,7 +204,7 @@ async def test_message_service_injects_followup_without_inline_reply_in_comms(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert await inject_q.get() == "new detail"
-    assert message.reactions == ["✅"]
+    assert message.reactions == ["👀"]
     assert message.replies == []
 
 
@@ -228,7 +229,7 @@ async def test_message_service_reacts_when_accepting_new_task(
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert message.reactions == ["✅"]
+    assert message.reactions == ["👀", "🏁"]
 
 
 @pytest.mark.asyncio
@@ -443,6 +444,7 @@ async def test_discord_event_presenter_renders_text_tool_progress_and_error(fake
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
     sink = presenter.make_sink(discord_channels["private"])  # type: ignore[arg-type]
 
+    await sink(TaskStartEvent(content="Investigate the failing deployment workflow", tier="smart"))
     await sink(ThinkingEndEvent(text="first *idea*"))
     await sink(TextTurnEndEvent(text="working", is_final=False))
     await sink(ToolCallStartEvent(tool_name="run_shell", call_id="1", args={"command": "pytest"}))
@@ -451,6 +453,7 @@ async def test_discord_event_presenter_renders_text_tool_progress_and_error(fake
     await sink(TaskErrorEvent(error="boom"))
 
     assert discord_channels["private"].sent == [
+        "🟢 Starting: Investigate the failing deployment workflow",
         "🧠 *first \\*idea\\**",
         "💭 working",
         "🔧 `run_shell(command=pytest)`",

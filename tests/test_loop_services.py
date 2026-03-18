@@ -174,6 +174,18 @@ class _StreamingAgentWithBrowserScreenshot:
         yield final
 
 
+class _SlowFinalAgent:
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        del prompt, message_history, usage_limits
+        await asyncio.sleep(1.05)
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "done"
+        yield final
+
+
 class _ContextOverflowAgent:
     def __init__(self) -> None:
         self.calls = 0
@@ -407,6 +419,30 @@ async def test_run_executor_collects_browser_screenshot_attachments() -> None:
     assert len(attachments) == 1
     assert attachments[0].filename == "browser-screenshot-1.png"
     assert attachments[0].data == b"png"
+
+
+@pytest.mark.asyncio
+async def test_run_executor_emits_idle_progress_when_task_goes_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "progress_heartbeat_seconds", 1)
+    bridge = _Bridge()
+    executor = RunExecutor(event_bridge=bridge)
+    agent = _SlowFinalAgent()
+
+    output, tool_calls, discord_replied, attachments = await executor.run(
+        task=Task(content="wait for it"),
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="wait for it",
+        tier="smart",
+    )
+
+    assert output == "done"
+    assert tool_calls == 0
+    assert discord_replied is False
+    assert attachments == []
+    assert any(
+        isinstance(event, ProgressEvent) and "Still working" in event.message
+        for event in bridge.events
+    )
 
 
 @pytest.mark.asyncio
