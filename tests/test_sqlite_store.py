@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import aiosqlite
 import pytest
 
 from agent.loop import Task, TaskResult
+from agent.memory.sqlite_store import SQLiteStore
 
 
 @pytest.mark.asyncio
@@ -93,3 +95,43 @@ async def test_sqlite_store_cleanup_applies_retention(monkeypatch: pytest.Monkey
 
     assert stats["memory_facts"] == 1
     assert stats["lessons"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_sqlite_store_init_migrates_legacy_tasks_before_creating_task_id_index(
+    isolated_paths,
+) -> None:
+    db_path = isolated_paths["workspace"] / "legacy.db"
+    async with aiosqlite.connect(db_path) as db:
+        await db.executescript(
+            """
+            CREATE TABLE tasks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                source      TEXT NOT NULL,
+                author      TEXT NOT NULL DEFAULT 'system',
+                content     TEXT NOT NULL,
+                result      TEXT,
+                success     INTEGER NOT NULL DEFAULT 0,
+                elapsed_ms  REAL,
+                tool_calls  INTEGER DEFAULT 0,
+                ts          REAL NOT NULL
+            );
+            """
+        )
+        await db.commit()
+
+    store = SQLiteStore(db_path)
+    await store.init()
+    try:
+        await store.create_task_record(
+            task_id="task-legacy",
+            source="api",
+            author="tester",
+            content="Verify migration",
+        )
+        row = await store.get_task_record("task-legacy")
+        assert row is not None
+        assert row["status"] == "queued"
+    finally:
+        await store.close()

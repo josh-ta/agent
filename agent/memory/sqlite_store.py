@@ -64,7 +64,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     ts          REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tasks_ts ON tasks (ts DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS tasks_task_id_idx ON tasks (task_id);
 
 -- Long-term memory facts (FTS5 for keyword search)
 CREATE TABLE IF NOT EXISTS memory_facts (
