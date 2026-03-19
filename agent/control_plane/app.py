@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent.config import settings
 from agent.events import AgentEvent, TaskQueuedEvent, bridge
 from agent.loop import Task
+from agent.session_router import SessionRouter
 
 
 TaskState = Literal["queued", "running", "waiting_for_user", "succeeded", "failed"]
@@ -82,6 +83,18 @@ class TaskResponse(BaseModel):
     elapsed_ms: float | None = None
     tool_calls: int | None = None
     question: str | None = None
+
+
+class ConversationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    source: str
+    channel_id: int
+    status: str
+    title: str
+    summary: str
+    pending_task_id: str
 
 
 class ApiError(Exception):
@@ -157,6 +170,8 @@ def create_app(
     start_background_runtime: bool = True,
     shutdown_runtime: bool = True,
 ) -> FastAPI:
+    session_router = SessionRouter()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from agent.main import _build_runtime, _shutdown_runtime
@@ -281,6 +296,12 @@ def create_app(
         task_id = str(uuid4())
         metadata = dict(payload.metadata)
         metadata["task_id"] = task_id
+        metadata = session_router.build_metadata(
+            source="api",
+            message_id=0,
+            reference_message_id=None,
+            metadata=metadata,
+        )
 
         await runtime.sqlite.create_task_record(
             task_id=task_id,
@@ -289,6 +310,22 @@ def create_app(
             content=content,
             metadata=metadata,
         )
+        if hasattr(runtime.sqlite, "ensure_session"):
+            await runtime.sqlite.ensure_session(
+                session_id=metadata["session_id"],
+                source="api",
+                title=content[:120],
+                status="queued",
+                pending_task_id=task_id,
+                metadata={"author": payload.author},
+            )
+            await runtime.sqlite.append_session_turn(
+                session_id=metadata["session_id"],
+                role="user",
+                content=content,
+                task_id=task_id,
+                metadata={"author": payload.author},
+            )
 
         task = Task(
             content=content,
@@ -363,9 +400,68 @@ def create_app(
             source="api",
         )
         await runtime.sqlite.mark_task_queued(task_id, metadata=resumed.metadata)
+        if hasattr(runtime.sqlite, "append_session_turn"):
+            await runtime.sqlite.append_session_turn(
+                session_id=str((resumed.metadata or {}).get("session_id", "")),
+                role="user",
+                content=answer,
+                turn_kind="answer",
+                task_id=task_id,
+                metadata={"author": payload.author},
+            )
         await runtime.loop.enqueue(resumed)
         await bridge.emit(TaskQueuedEvent(task_id=task_id, content=resumed.content, source="api"))
         return CreateTaskResponse(id=task_id, status="queued")
+
+    @app.get(
+        "/conversations/{session_id}",
+        response_model=ConversationResponse,
+        responses=ERROR_RESPONSES,
+        tags=["conversations"],
+    )
+    async def get_conversation(request: Request, session_id: str) -> ConversationResponse:
+        runtime = _require_runtime(request.app)
+        if not hasattr(runtime.sqlite, "get_session"):
+            raise ApiError(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                error_code="service_unavailable",
+                message="Conversation storage is not available.",
+            )
+        row = await runtime.sqlite.get_session(session_id)
+        if row is None:
+            raise ApiError(
+                status_code=status.HTTP_404_NOT_FOUND,
+                error_code="task_not_found",
+                message=f"Conversation '{session_id}' was not found.",
+            )
+        return ConversationResponse(
+            id=row["session_id"],
+            source=row["source"],
+            channel_id=int(row.get("channel_id") or 0),
+            status=row["status"],
+            title=row.get("title", ""),
+            summary=row.get("summary", ""),
+            pending_task_id=row.get("pending_task_id", ""),
+        )
+
+    @app.get(
+        "/conversations/{session_id}/turns",
+        responses=ERROR_RESPONSES,
+        tags=["conversations"],
+    )
+    async def get_conversation_turns(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> list[dict[str, Any]]:
+        runtime = _require_runtime(request.app)
+        if not hasattr(runtime.sqlite, "list_session_turns"):
+            raise ApiError(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                error_code="service_unavailable",
+                message="Conversation storage is not available.",
+            )
+        return await runtime.sqlite.list_session_turns(session_id, limit=limit)
 
     @app.get(
         "/events",
@@ -437,6 +533,12 @@ def _is_runtime_ready(app: FastAPI) -> bool:
         return False
     loop_task = getattr(app.state, "loop_task", None)
     if loop_task is not None and loop_task.done():
+        return False
+    sqlite = getattr(runtime, "sqlite", None)
+    if sqlite is not None and hasattr(sqlite, "_db") and getattr(sqlite, "_db", None) is None:
+        return False
+    postgres = getattr(runtime, "postgres", None)
+    if postgres is not None and hasattr(postgres, "_pool") and getattr(postgres, "_pool", None) is None:
         return False
     return True
 

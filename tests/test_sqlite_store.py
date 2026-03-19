@@ -41,6 +41,51 @@ async def test_sqlite_store_records_tasks_memory_and_lessons(sqlite_store) -> No
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_sqlite_store_persists_sessions_turns_and_checkpoints(sqlite_store) -> None:
+    await sqlite_store.ensure_session(
+        session_id="discord:101:55",
+        source="discord",
+        channel_id=101,
+        title="Investigate flaky test",
+        pending_task_id="task-55",
+        metadata={"author": "Josh"},
+    )
+    await sqlite_store.append_session_turn(
+        session_id="discord:101:55",
+        role="user",
+        content="Investigate the flaky integration test",
+        task_id="task-55",
+    )
+    await sqlite_store.append_session_turn(
+        session_id="discord:101:55",
+        role="assistant",
+        content="Which environment should I use?",
+        turn_kind="question",
+        task_id="task-55",
+    )
+    await sqlite_store.save_task_checkpoint(
+        task_id="task-55",
+        session_id="discord:101:55",
+        summary="Waiting on environment clarification.",
+        notes="Collected initial failures.",
+    )
+
+    session = await sqlite_store.get_session("discord:101:55")
+    turns = await sqlite_store.list_session_turns("discord:101:55")
+    context = await sqlite_store.get_session_context("discord:101:55")
+    checkpoint = await sqlite_store.get_task_checkpoint("task-55")
+
+    assert session is not None
+    assert session["pending_task_id"] == "task-55"
+    assert len(turns) == 2
+    assert "Latest user goal" in session["summary"]
+    assert "Session summary" in context
+    assert checkpoint is not None
+    assert checkpoint["summary"] == "Waiting on environment clarification."
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_sqlite_store_persists_api_task_lifecycle(sqlite_store) -> None:
     await sqlite_store.create_task_record(
         task_id="task-123",

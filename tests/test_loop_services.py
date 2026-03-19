@@ -638,3 +638,66 @@ async def test_heartbeat_service_enqueues_pending_a2a_tasks() -> None:
     assert len(enqueued) == 1
     assert enqueued[0].source == "a2a"
     assert enqueued[0].metadata["task_id"] == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_service_expires_stale_waiting_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    notifications: list[tuple[int, str]] = []
+
+    class _Memory:
+        def __init__(self) -> None:
+            self.failed: list[str] = []
+            self.sessions: list[tuple[str, str]] = []
+
+        async def list_waiting_task_records(self) -> list[dict]:
+            return [
+                {
+                    "task_id": "task-wait",
+                    "updated_ts": 1.0,
+                    "metadata": {
+                        "session_id": "discord:101:1",
+                        "wait_state": {
+                            "question": "Which environment?",
+                            "timeout_s": 10,
+                            "channel_id": 101,
+                            "created_ts": 1.0,
+                        },
+                    },
+                }
+            ]
+
+        async def fail_task(self, task_id: str, *, error: str, metadata=None) -> None:
+            self.failed.append(task_id)
+
+        async def set_session_status(self, session_id: str, *, status: str | None = None, pending_task_id: str | None = None, metadata=None) -> None:
+            self.sessions.append((session_id, status or ""))
+
+        async def save_task_checkpoint(self, *, task_id: str, session_id: str = "", summary: str = "", draft: str = "", notes: str = "", metadata=None) -> None:
+            return None
+
+    class _WaitRegistry:
+        def __init__(self) -> None:
+            self.popped: list[str] = []
+
+        def pop(self, task_id: str):
+            self.popped.append(task_id)
+            return None
+
+    async def fake_discord_send(channel_id: int, message: str) -> str:
+        notifications.append((channel_id, message))
+        return "ok"
+
+    monkeypatch.setattr("agent.loop_services.time.time", lambda: 30.0)
+    monkeypatch.setattr("agent.loop_services.discord_send", fake_discord_send)
+
+    service = HeartbeatService(
+        memory_store=_Memory(),
+        postgres_store=None,
+        enqueue=lambda task: asyncio.sleep(0),
+        wait_registry=_WaitRegistry(),
+    )
+
+    await service.heartbeat(is_busy=False)
+
+    assert notifications
+    assert notifications[0][0] == 101

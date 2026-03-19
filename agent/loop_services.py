@@ -41,7 +41,7 @@ from agent.events import (
     ToolResultEvent,
     bridge,
 )
-from agent.tools.discord_tools import DiscordAttachment, decode_data_url_attachment
+from agent.tools.discord_tools import DiscordAttachment, decode_data_url_attachment, discord_send
 from agent.task_waits import UserInputRequired
 
 if TYPE_CHECKING:
@@ -122,14 +122,23 @@ class TaskContextBuilder:
         )
 
         lessons_context = await self._load_lessons(task.content)
-        channel_context = await self._load_channel_history(normalized_task)
+        facts_context = await self._load_memory_facts(task.content)
+        session_context = await self._load_session_context(normalized_task)
+        channel_context = await self._load_channel_history(normalized_task) if not session_context else ""
         resume_context = self._load_resume_context(normalized_task)
+        checkpoint_context = await self._load_checkpoint_context(normalized_task)
 
         parts: list[str] = []
-        if channel_context:
+        if session_context:
+            parts.append(session_context)
+        elif channel_context:
             parts.append(channel_context)
+        if facts_context:
+            parts.append(facts_context)
         if lessons_context:
             parts.append(lessons_context)
+        if checkpoint_context:
+            parts.append(checkpoint_context)
         if resume_context:
             parts.append(resume_context)
         parts.append(normalized_task.content)
@@ -142,6 +151,47 @@ class TaskContextBuilder:
             except Exception:
                 return ""
         return ""
+
+    async def _load_memory_facts(self, content: str) -> str:
+        if self._memory and hasattr(self._memory, "search_memory"):
+            try:
+                facts = await self._memory.search_memory(content[:200], limit=3)
+                if facts and not facts.startswith("(no memory matches"):
+                    return "## Relevant stored facts\n" + facts
+            except Exception:
+                return ""
+        return ""
+
+    async def _load_session_context(self, task: "Task") -> str:
+        session_id = str((task.metadata or {}).get("session_id", "")).strip()
+        if not session_id or not self._memory or not hasattr(self._memory, "get_session_context"):
+            return ""
+        try:
+            return await self._memory.get_session_context(session_id, limit=10, char_cap=2200)
+        except Exception:
+            return ""
+
+    async def _load_checkpoint_context(self, task: "Task") -> str:
+        task_id = str((task.metadata or {}).get("task_id", "")).strip()
+        if not task_id or not self._memory or not hasattr(self._memory, "get_task_checkpoint"):
+            return ""
+        try:
+            checkpoint = await self._memory.get_task_checkpoint(task_id)
+        except Exception:
+            return ""
+        if not checkpoint:
+            return ""
+        parts: list[str] = []
+        summary = str(checkpoint.get("summary", "")).strip()
+        notes = str(checkpoint.get("notes", "")).strip()
+        draft = str(checkpoint.get("draft", "")).strip()
+        if summary:
+            parts.append("## Previous checkpoint summary\n" + summary[:1200])
+        if notes:
+            parts.append("## Previous task notes\n" + notes[-1800:])
+        if draft:
+            parts.append("## Partial draft\n" + draft[:800])
+        return "\n\n".join(parts)
 
     async def _load_channel_history(self, task: "Task") -> str:
         if task.source != "discord" or not task.channel_id:
@@ -635,23 +685,83 @@ class HeartbeatTask:
 
 
 class HeartbeatService:
-    def __init__(self, *, memory_store: Any, postgres_store: Any, enqueue: Callable[["Task"], Awaitable[None]]) -> None:
+    def __init__(
+        self,
+        *,
+        memory_store: Any,
+        postgres_store: Any,
+        enqueue: Callable[["Task"], Awaitable[None]],
+        wait_registry: Any = None,
+        event_bridge: Any = bridge,
+    ) -> None:
         self._memory = memory_store
         self._postgres = postgres_store
         self._enqueue = enqueue
+        self._wait_registry = wait_registry
+        self._bridge = event_bridge
 
     async def heartbeat(self, *, is_busy: bool) -> None:
         if self._memory and hasattr(self._memory, "heartbeat"):
             await self._memory.heartbeat()
 
+        await self._expire_waiting_tasks()
+
         if self._postgres is not None and not is_busy:
             try:
                 rows = await self._postgres.get_pending_task_rows()
                 for row in rows:
-                    await self._postgres.mark_task_running(row["id"])
+                    claimed = await self._postgres.mark_task_running(row["id"])
+                    if claimed is False:
+                        continue
                     await self._enqueue(self._build_a2a_task(row))
             except Exception as exc:
                 log.warning("a2a_poll_error", error=str(exc))
+
+    async def _expire_waiting_tasks(self) -> None:
+        if self._memory is None or not hasattr(self._memory, "list_waiting_task_records"):
+            return
+        rows = await self._memory.list_waiting_task_records()
+        now = time.time()
+        for row in rows:
+            metadata = dict(row.get("metadata") or {})
+            wait_state = dict(metadata.get("wait_state") or {})
+            task_id = str(row.get("task_id", "")).strip()
+            if not task_id or not wait_state:
+                continue
+            created_ts = float(wait_state.get("created_ts") or row.get("updated_ts") or now)
+            timeout_s = max(1, int(wait_state.get("timeout_s") or 300))
+            if now - created_ts < timeout_s:
+                continue
+            question = str(wait_state.get("question", "")).strip()
+            timeout_message = (
+                "Timed out waiting for user input."
+                + (f" Question was: {question}" if question else "")
+            )
+            try:
+                if hasattr(self._memory, "fail_task"):
+                    await self._memory.fail_task(task_id, error=timeout_message, metadata=metadata)
+                if hasattr(self._memory, "set_session_status"):
+                    session_id = str(metadata.get("session_id", "")).strip()
+                    if session_id:
+                        await self._memory.set_session_status(session_id, status="timed_out", pending_task_id="")
+                if hasattr(self._memory, "save_task_checkpoint"):
+                    await self._memory.save_task_checkpoint(
+                        task_id=task_id,
+                        session_id=str(metadata.get("session_id", "")),
+                        summary=timeout_message,
+                        metadata=metadata,
+                    )
+            except Exception:
+                log.warning("wait_timeout_persist_failed", task_id=task_id)
+            if self._wait_registry is not None:
+                self._wait_registry.pop(task_id)
+            channel_id = int(wait_state.get("channel_id") or 0)
+            if channel_id:
+                try:
+                    await discord_send(channel_id, f"⌛ {timeout_message}")
+                except Exception:
+                    log.warning("wait_timeout_notify_failed", task_id=task_id, channel_id=channel_id)
+            await self._bridge.emit(ProgressEvent(message=f"Timed out waiting on task {task_id[:8]}."))
 
     @staticmethod
     def _build_a2a_task(row: dict[str, Any]) -> "Task":

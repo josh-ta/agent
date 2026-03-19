@@ -278,8 +278,15 @@ class EventBridge:
                     error=str(result),
                 )
 
+    def current_task_id(self) -> str | None:
+        return self._task_id_var.get()
+
 
 # Module-level singleton — import and use directly:
 #   from agent.events import bridge, TextDeltaEvent
 #   await bridge.emit(TextDeltaEvent(delta="hello"))
 bridge = EventBridge()
+
+
+def current_task_id() -> str | None:
+    return bridge.current_task_id()

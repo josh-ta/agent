@@ -105,14 +105,18 @@ class SharedTaskRepository:
             )
         return [dict(row) for row in rows]
 
-    async def mark_task_running(self, task_id: str) -> None:
+    async def mark_task_running(self, task_id: str) -> bool:
         if not self._store._pool:
-            return
+            return False
         async with self._store._pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE shared_tasks SET status='running', updated_at=NOW() WHERE id=$1",
+            row = await conn.fetchrow(
+                """UPDATE shared_tasks
+                   SET status='running', updated_at=NOW()
+                   WHERE id=$1 AND status='pending'
+                   RETURNING id""",
                 task_id,
             )
+        return row is not None
 
     async def complete_task(self, task_id: str, result: str) -> str:
         assert self._store._pool

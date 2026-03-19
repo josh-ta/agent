@@ -124,16 +124,34 @@ class TaskWaitRegistry:
         return [item for item in self._by_task_id.values() if item.channel_id == channel_id and item.source == "discord"]
 
     def pop_for_discord_reply(self, *, channel_id: int, reference_message_id: int | None) -> SuspendedTask | None:
+        suspended = self.find_for_discord_reply(
+            channel_id=channel_id,
+            reference_message_id=reference_message_id,
+        )
+        if suspended is None:
+            return None
+        return self._by_task_id.pop(suspended.task_id, None)
+
+    def find_for_discord_reply(self, *, channel_id: int, reference_message_id: int | None) -> SuspendedTask | None:
         if reference_message_id is not None:
-            for task_id, suspended in list(self._by_task_id.items()):
+            for suspended in self._by_task_id.values():
                 if suspended.channel_id == channel_id and suspended.prompt_message_id == reference_message_id:
-                    return self._by_task_id.pop(task_id)
+                    return suspended
             return None
 
         candidates = self.pending_for_channel(channel_id)
         if len(candidates) == 1:
-            return self._by_task_id.pop(candidates[0].task_id)
+            return candidates[0]
         return None
+
+    def list_expired(self, *, now: datetime | None = None) -> list[SuspendedTask]:
+        now = now or datetime.now(UTC)
+        expired: list[SuspendedTask] = []
+        for item in self._by_task_id.values():
+            age = (now - item.created_at).total_seconds()
+            if age >= max(1, item.timeout_s):
+                expired.append(item)
+        return expired
 
     def build_resumed_metadata(self, suspended: SuspendedTask, *, answer: str, resumed_from: str) -> dict[str, Any]:
         metadata = dict(suspended.metadata)

@@ -165,12 +165,13 @@ class AgentLoop:
             memory_store=self.memory,
             journal=self._journal,
         )
+        self.wait_registry = TaskWaitRegistry()
         self._heartbeat_service = HeartbeatService(
             memory_store=self.memory,
             postgres_store=self._postgres,
             enqueue=self.enqueue,
+            wait_registry=self.wait_registry,
         )
-        self.wait_registry = TaskWaitRegistry()
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -190,9 +191,13 @@ class AgentLoop:
         if task.metadata is None:
             task.metadata = {}
         task_id = str(task.metadata.get("task_id", "")).strip() if task.metadata else ""
-        if not task_id and task.source == "api":
+        if not task_id:
             task_id = str(uuid4())
             task.metadata["task_id"] = task_id
+        session_id = str(task.metadata.get("session_id", "")).strip()
+        if not session_id:
+            fallback = f"{task.source}:{task.channel_id}:{task.message_id or task_id}"
+            task.metadata["session_id"] = fallback
 
         with bridge.task_context(task_id or None), task_wait_context(
             task_id=task_id,
@@ -203,6 +208,16 @@ class AgentLoop:
                 await self.memory.mark_task_running(task_id)
 
             result = await self._process(task)
+
+            if (
+                self._postgres is not None
+                and task.source == "a2a"
+                and result.status in {"succeeded", "failed"}
+            ):
+                try:
+                    await self._postgres.complete_task(task_id, result.output[:4000])
+                except Exception:
+                    log.warning("a2a_complete_failed", task_id=task_id)
 
             if self.memory:
                 await self.memory.record_task(task, result)
@@ -307,6 +322,36 @@ class AgentLoop:
             log.info("waiting_tasks_restored", count=restored)
         return restored
 
+    async def restore_pending_tasks(self) -> int:
+        if self.memory is None or not hasattr(self.memory, "list_pending_task_records"):
+            return 0
+        restored = 0
+        rows = await self.memory.list_pending_task_records()
+        for row in rows:
+            task_id = str(row.get("task_id", "")).strip()
+            if not task_id or self.wait_registry.has_pending(task_id):
+                continue
+            metadata = dict(row.get("metadata") or {})
+            metadata["task_id"] = task_id
+            session_id = str(metadata.get("session_id", "")).strip()
+            if not session_id:
+                metadata["session_id"] = f"{row.get('source', 'api')}:{task_id}"
+            task = Task(
+                content=str(row.get("content", "")),
+                source=str(row.get("source", "api")),
+                author=str(row.get("author", "system")),
+                channel_id=self._coerce_int(metadata.get("channel_id")),
+                message_id=self._coerce_int(metadata.get("message_id")),
+                metadata=metadata,
+            )
+            if row.get("status") == "running" and hasattr(self.memory, "mark_task_queued"):
+                await self.memory.mark_task_queued(task_id, metadata=metadata)
+            await self.enqueue(task)
+            restored += 1
+        if restored:
+            log.info("pending_tasks_restored", count=restored)
+        return restored
+
     async def _summarize_context(self, task: Task, accumulated_prompt: str) -> str:
         """
         Ask the fast agent to compress accumulated tool-call history into a
@@ -353,6 +398,11 @@ class AgentLoop:
         tier = forced_tier or _classify_tier(content)
         agent = self.agents.get(tier, self.agent)
         task, tier, base_prompt = await self._context_builder.build(task)
+        task_id = self.wait_registry.ensure_task_id(task.metadata)
+        session_id = str(task.metadata.get("session_id", "")).strip()
+        if not session_id:
+            session_id = f"{task.source}:{task.channel_id}:{task.message_id or task_id}"
+            task.metadata["session_id"] = session_id
 
         log.info(
             "task_start",
@@ -363,6 +413,26 @@ class AgentLoop:
             author=task.author,
             content=task.content[:120],
         )
+
+        if self.memory and hasattr(self.memory, "ensure_session"):
+            try:
+                await self.memory.ensure_session(
+                    session_id=session_id,
+                    source=task.source,
+                    channel_id=task.channel_id,
+                    title=task.content[:120],
+                    status="active",
+                    pending_task_id=task_id,
+                    metadata={"author": task.author},
+                )
+                await self.memory.save_task_checkpoint(
+                    task_id=task_id,
+                    session_id=session_id,
+                    summary=f"Task started: {task.content[:300]}",
+                    metadata={"tier": tier, "source": task.source},
+                )
+            except Exception:
+                pass
 
         # Expire stale task journal — short window prevents old context bleeding across tasks.
         self._journal.expire_stale()
@@ -383,8 +453,17 @@ class AgentLoop:
                     role="user",
                     content=task.content,
                     channel_id=task.channel_id,
-                    metadata={"author": task.author},
+                    metadata={"author": task.author, "session_id": session_id, "task_id": task_id},
                 )
+                if hasattr(self.memory, "append_session_turn"):
+                    await self.memory.append_session_turn(
+                        session_id=session_id,
+                        role="user",
+                        content=task.content,
+                        task_id=task_id,
+                        metadata={"author": task.author},
+                    )
+                await self._maybe_promote_memory_fact(task=task)
             except Exception:
                 pass
 
@@ -424,6 +503,7 @@ class AgentLoop:
                     "channel_id": task.channel_id,
                     "message_id": task.message_id,
                     "prompt_message_id": None,
+                    "created_ts": time.time(),
                 }
                 if self.memory and task_id and hasattr(self.memory, "get_task_record") and hasattr(self.memory, "create_task_record"):
                     existing = await self.memory.get_task_record(task_id)
@@ -441,6 +521,28 @@ class AgentLoop:
                         metadata=task.metadata,
                         question=run_result.question or "",
                     )
+                    if hasattr(self.memory, "set_session_status"):
+                        await self.memory.set_session_status(
+                            session_id,
+                            status="waiting_for_user",
+                            pending_task_id=task_id,
+                        )
+                    if hasattr(self.memory, "append_session_turn") and run_result.question:
+                        await self.memory.append_session_turn(
+                            session_id=session_id,
+                            role="assistant",
+                            content=run_result.question,
+                            turn_kind="question",
+                            task_id=task_id,
+                        )
+                    if hasattr(self.memory, "save_task_checkpoint"):
+                        await self.memory.save_task_checkpoint(
+                            task_id=task_id,
+                            session_id=session_id,
+                            summary=f"Waiting for user input: {run_result.question or ''}".strip(),
+                            draft=result_output,
+                            metadata=task.metadata,
+                        )
                 self.wait_registry.suspend(
                     task_id=task_id,
                     source=task.source,
@@ -514,6 +616,38 @@ class AgentLoop:
             if answered_user:
                 self._success_count += 1
 
+            if self.memory and hasattr(self.memory, "set_session_status"):
+                try:
+                    await self.memory.set_session_status(
+                        session_id,
+                        status="completed" if answered_user else "failed",
+                        pending_task_id="",
+                    )
+                except Exception:
+                    pass
+            if self.memory and hasattr(self.memory, "save_task_checkpoint"):
+                try:
+                    await self.memory.save_task_checkpoint(
+                        task_id=task_id,
+                        session_id=session_id,
+                        summary=final_output[:1200],
+                        draft=final_output[:2000],
+                        metadata=task.metadata,
+                    )
+                except Exception:
+                    pass
+            if self.memory and hasattr(self.memory, "append_session_turn") and final_output:
+                try:
+                    await self.memory.append_session_turn(
+                        session_id=session_id,
+                        role="assistant",
+                        content=final_output,
+                        turn_kind="assistant",
+                        task_id=task_id,
+                    )
+                except Exception:
+                    pass
+
             # Save the assistant's reply to conversation history
             if self.memory and hasattr(self.memory, "save_message") and task.source == "discord" and final_output:
                 try:
@@ -521,6 +655,7 @@ class AgentLoop:
                         role="assistant",
                         content=final_output,
                         channel_id=task.channel_id,
+                        metadata={"session_id": session_id, "task_id": task_id},
                     )
                 except Exception:
                     pass
@@ -553,9 +688,39 @@ class AgentLoop:
                         "Resume this task by calling task_resume() to see progress so far."
                     ),
                 )
+                if self.memory and hasattr(self.memory, "save_task_checkpoint"):
+                    try:
+                        await self.memory.save_task_checkpoint(
+                            task_id=task.metadata.get("task_id", ""),
+                            session_id=str((task.metadata or {}).get("session_id", "")),
+                            summary="Interrupted by rate limit.",
+                            draft="",
+                            metadata=task.metadata,
+                        )
+                    except Exception:
+                        pass
             else:
                 self._journal.clear()
                 log.info("task_journal_cleared_on_crash", error=exc_str[:80])
+            if self.memory and hasattr(self.memory, "set_session_status"):
+                try:
+                    await self.memory.set_session_status(
+                        str((task.metadata or {}).get("session_id", "")),
+                        status="failed",
+                        pending_task_id="",
+                    )
+                except Exception:
+                    pass
+            if self.memory and hasattr(self.memory, "save_task_checkpoint"):
+                try:
+                    await self.memory.save_task_checkpoint(
+                        task_id=str((task.metadata or {}).get("task_id", "")),
+                        session_id=str((task.metadata or {}).get("session_id", "")),
+                        summary=f"Task failed: {exc_str[:500]}",
+                        metadata=task.metadata,
+                    )
+                except Exception:
+                    pass
 
             return TaskResult(
                 task=task,
@@ -673,3 +838,31 @@ class AgentLoop:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    async def _maybe_promote_memory_fact(self, *, task: Task) -> None:
+        if self.memory is None or not hasattr(self.memory, "save_memory_fact"):
+            return
+        text = task.content.strip()
+        lowered = text.lower()
+        if not text or len(text) > 240:
+            return
+        fact_prefixes = (
+            "remember ",
+            "use ",
+            "always ",
+            "never ",
+            "my ",
+            "for this repo",
+            "for this project",
+            "prefer ",
+        )
+        if not any(lowered.startswith(prefix) for prefix in fact_prefixes):
+            return
+        await self.memory.save_memory_fact(
+            text,
+            metadata={
+                "source": task.source,
+                "author": task.author,
+                "session_id": str((task.metadata or {}).get("session_id", "")),
+            },
+        )

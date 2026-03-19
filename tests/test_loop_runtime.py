@@ -21,6 +21,9 @@ class _Memory:
         self.saved_messages: list[tuple[str, str, int, dict | None]] = []
         self.recorded_tasks: list[TaskResult] = []
         self.rows: dict[str, dict] = {}
+        self.sessions: dict[str, dict] = {}
+        self.turns: list[tuple[str, str, str]] = []
+        self.checkpoints: dict[str, dict] = {}
 
     async def save_message(self, role: str, content: str, channel_id: int = 0, metadata=None) -> None:
         self.saved_messages.append((role, content, channel_id, metadata))
@@ -47,8 +50,53 @@ class _Memory:
         row["metadata"] = metadata
         row["question"] = question
 
+    async def mark_task_queued(self, task_id: str, *, metadata=None) -> None:
+        row = self.rows.setdefault(task_id, {"task_id": task_id})
+        row["status"] = "queued"
+        if metadata is not None:
+            row["metadata"] = metadata
+
     async def list_waiting_task_records(self) -> list[dict]:
         return [row for row in self.rows.values() if row.get("status") == "waiting_for_user"]
+
+    async def list_pending_task_records(self) -> list[dict]:
+        return [row for row in self.rows.values() if row.get("status") in {"queued", "running"}]
+
+    async def ensure_session(self, *, session_id: str, source: str, channel_id: int = 0, title: str = "", status: str = "active", pending_task_id: str = "", metadata=None) -> None:
+        self.sessions[session_id] = {
+            "session_id": session_id,
+            "source": source,
+            "channel_id": channel_id,
+            "status": status,
+            "title": title,
+            "pending_task_id": pending_task_id,
+            "metadata": metadata or {},
+        }
+
+    async def set_session_status(self, session_id: str, *, status: str | None = None, pending_task_id: str | None = None, metadata=None) -> None:
+        session = self.sessions.setdefault(session_id, {"session_id": session_id})
+        if status is not None:
+            session["status"] = status
+        if pending_task_id is not None:
+            session["pending_task_id"] = pending_task_id
+        if metadata is not None:
+            session["metadata"] = metadata
+
+    async def append_session_turn(self, *, session_id: str, role: str, content: str, turn_kind: str = "message", task_id: str = "", metadata=None) -> None:
+        self.turns.append((session_id, role, content))
+
+    async def save_task_checkpoint(self, *, task_id: str, session_id: str = "", summary: str = "", draft: str = "", notes: str = "", metadata=None) -> None:
+        self.checkpoints[task_id] = {
+            "task_id": task_id,
+            "session_id": session_id,
+            "summary": summary,
+            "draft": draft,
+            "notes": notes,
+            "metadata": metadata or {},
+        }
+
+    async def save_memory_fact(self, content: str, metadata=None) -> None:
+        self.checkpoints["memory_fact"] = {"content": content, "metadata": metadata or {}}
 
 
 class _Postgres:
@@ -226,6 +274,34 @@ async def test_restore_waiting_tasks_rebuilds_registry() -> None:
     assert suspended.question == "What environment?"
     assert suspended.channel_id == 7
     assert suspended.prompt_message_id == 42
+
+
+@pytest.mark.asyncio
+async def test_restore_pending_tasks_requeues_running_and_queued_rows() -> None:
+    memory = _Memory()
+    memory.rows["task-queued"] = {
+        "task_id": "task-queued",
+        "source": "api",
+        "author": "Josh",
+        "content": "Queued work",
+        "status": "queued",
+        "metadata": {"task_id": "task-queued", "session_id": "api:task-queued"},
+    }
+    memory.rows["task-running"] = {
+        "task_id": "task-running",
+        "source": "api",
+        "author": "Josh",
+        "content": "Running work",
+        "status": "running",
+        "metadata": {"task_id": "task-running", "session_id": "api:task-running"},
+    }
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()}, memory_store=memory)
+
+    restored = await loop.restore_pending_tasks()
+
+    assert restored == 2
+    assert loop.queue.qsize() == 2
+    assert memory.rows["task-running"]["status"] == "queued"
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ from pydantic_ai import Agent
 
 from agent.config import settings
 from agent.tools import filesystem, github, self_edit, shell
+from agent.events import current_task_id
 from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
@@ -24,7 +25,7 @@ def attach_all_tools(
 ) -> None:
     attach_shell_tools(agent)
     attach_filesystem_tools(agent)
-    attach_journal_tools(agent)
+    attach_journal_tools(agent, sqlite=sqlite)
     attach_self_edit_tools(agent)
     attach_discord_tools(agent)
     attach_github_tools(agent)
@@ -65,7 +66,7 @@ def attach_filesystem_tools(agent: Agent) -> None:  # type: ignore[type-arg]
         return filesystem.search_files(pattern, path, file_glob, context_lines)
 
 
-def attach_journal_tools(agent: Agent) -> None:  # type: ignore[type-arg]
+def attach_journal_tools(agent: Agent, *, sqlite: "SQLiteStore | None") -> None:  # type: ignore[type-arg]
     journal_path = settings.workspace_path / ".task_journal.md"
 
     @agent.tool_plain
@@ -83,6 +84,11 @@ def attach_journal_tools(agent: Agent) -> None:  # type: ignore[type-arg]
             journal_path.parent.mkdir(parents=True, exist_ok=True)
             with journal_path.open("a", encoding="utf-8") as handle:
                 handle.write(entry)
+            task_id = current_task_id()
+            if sqlite is not None and task_id:
+                loop = _asyncio.get_running_loop()
+                if loop.is_running():
+                    loop.create_task(sqlite.append_task_note(task_id, f"[{ts}] {note.strip()}"))
             try:
                 loop = _asyncio.get_running_loop()
                 if loop.is_running():
@@ -110,6 +116,16 @@ def attach_journal_tools(agent: Agent) -> None:  # type: ignore[type-arg]
     @agent.tool_plain
     def task_journal_clear() -> str:
         try:
+            task_id = current_task_id()
+            if sqlite is not None and task_id:
+                import asyncio as _asyncio
+
+                try:
+                    loop = _asyncio.get_running_loop()
+                    if loop.is_running():
+                        loop.create_task(sqlite.clear_task_checkpoint(task_id))
+                except Exception:
+                    pass
             if journal_path.exists():
                 journal_path.unlink()
             return "Task journal cleared."

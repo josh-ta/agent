@@ -185,6 +185,16 @@ class PostgresStore:
         if self._pool:
             await self._pool.close()
 
+    async def healthcheck(self) -> bool:
+        if not self._pool:
+            return False
+        try:
+            async with self._pool.acquire() as conn:
+                value = await conn.fetchval("SELECT 1")
+            return value == 1
+        except Exception:
+            return False
+
     # ── Agent registry ────────────────────────────────────────────────────────
 
     async def register_agent(self) -> None:
@@ -215,9 +225,9 @@ class PostgresStore:
         """Fetch pending tasks for the heartbeat A2A poller (returns raw dicts)."""
         return await self.tasks.get_pending_task_rows()
 
-    async def mark_task_running(self, task_id: str) -> None:
+    async def mark_task_running(self, task_id: str) -> bool:
         """Mark a shared task as running so it's not picked up twice."""
-        await self.tasks.mark_task_running(task_id)
+        return await self.tasks.mark_task_running(task_id)
 
     async def complete_task(self, task_id: str, result: str) -> str:
         """Mark a shared task as done with a result."""

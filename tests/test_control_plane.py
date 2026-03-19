@@ -15,6 +15,8 @@ class _FakeSQLite:
     def __init__(self) -> None:
         self.created: list[dict[str, object]] = []
         self.rows: dict[str, dict[str, object]] = {}
+        self.sessions: dict[str, dict[str, object]] = {}
+        self.turns: dict[str, list[dict[str, object]]] = {}
 
     async def create_task_record(
         self,
@@ -53,6 +55,69 @@ class _FakeSQLite:
         row["status"] = "queued"
         if metadata is not None:
             row["metadata"] = metadata
+
+    async def ensure_session(
+        self,
+        *,
+        session_id: str,
+        source: str,
+        channel_id: int = 0,
+        title: str = "",
+        status: str = "active",
+        pending_task_id: str = "",
+        metadata=None,
+    ) -> None:
+        self.sessions[session_id] = {
+            "session_id": session_id,
+            "source": source,
+            "channel_id": channel_id,
+            "status": status,
+            "title": title,
+            "summary": "",
+            "pending_task_id": pending_task_id,
+            "metadata": metadata or {},
+        }
+
+    async def append_session_turn(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        turn_kind: str = "message",
+        task_id: str = "",
+        metadata=None,
+    ) -> None:
+        self.turns.setdefault(session_id, []).append(
+            {
+                "session_id": session_id,
+                "role": role,
+                "content": content,
+                "turn_kind": turn_kind,
+                "task_id": task_id,
+                "metadata": metadata or {},
+            }
+        )
+        session = self.sessions.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "source": "api",
+                "channel_id": 0,
+                "status": "active",
+                "title": "",
+                "summary": "",
+                "pending_task_id": "",
+                "metadata": {},
+            },
+        )
+        session["summary"] = f"Latest turn: {content[:80]}"
+
+    async def get_session(self, session_id: str) -> dict[str, object] | None:
+        return self.sessions.get(session_id)
+
+    async def list_session_turns(self, session_id: str, limit: int = 20) -> list[dict[str, object]]:
+        return self.turns.get(session_id, [])[-limit:]
 
 
 class _FakeLoop:
@@ -96,6 +161,7 @@ def test_post_tasks_persists_and_enqueues() -> None:
         assert len(loop.enqueued) == 1
         assert loop.enqueued[0].content == "summarize repo"
         assert loop.enqueued[0].metadata["task_id"] == payload["id"]
+        assert "session_id" in loop.enqueued[0].metadata
 
 
 def test_post_tasks_rejects_blank_content() -> None:
@@ -184,6 +250,32 @@ def test_resume_waiting_task_enqueues_followup_input() -> None:
         assert loop.enqueued[0].metadata["resume_context"]["answer"] == "production"
 
 
+def test_conversation_endpoints_return_session_and_turns() -> None:
+    client, sqlite, _ = _build_app()
+    sqlite.sessions["api:task-1"] = {
+        "session_id": "api:task-1",
+        "source": "api",
+        "channel_id": 0,
+        "status": "active",
+        "title": "Investigate issue",
+        "summary": "Latest turn: investigate issue",
+        "pending_task_id": "task-1",
+        "metadata": {},
+    }
+    sqlite.turns["api:task-1"] = [
+        {"session_id": "api:task-1", "role": "user", "content": "Investigate issue", "turn_kind": "message"}
+    ]
+
+    with client:
+        session_response = client.get("/conversations/api:task-1")
+        turns_response = client.get("/conversations/api:task-1/turns")
+
+        assert session_response.status_code == 200
+        assert session_response.json()["id"] == "api:task-1"
+        assert turns_response.status_code == 200
+        assert turns_response.json()[0]["content"] == "Investigate issue"
+
+
 def test_sse_broker_filters_and_serializes_by_task_id() -> None:
     broker = SseBroker()
     subscriber_id, queue = broker.subscribe("task-1")
@@ -211,4 +303,6 @@ def test_openapi_includes_control_plane_routes() -> None:
         assert "/tasks" in paths
         assert "/tasks/{task_id}" in paths
         assert "/tasks/{task_id}/input" in paths
+        assert "/conversations/{session_id}" in paths
+        assert "/conversations/{session_id}/turns" in paths
         assert "/events" in paths

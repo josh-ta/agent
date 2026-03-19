@@ -35,6 +35,7 @@ from agent.events import (
     bridge,
 )
 from agent.loop import Task
+from agent.session_router import SessionRouter, TurnIntent
 from agent.tools import discord_tools as discord_tools_module
 
 if TYPE_CHECKING:
@@ -207,15 +208,23 @@ class MessageHandlingService:
         self._presenter = presenter
         self._bridge = event_bridge
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
+        self._active_sessions: dict[int, str] = {}
+        self._session_router = SessionRouter()
 
     def _is_answering_pending_question(
         self,
         parsed: ParsedMessage,
         message: discord.Message,
     ) -> bool:
-        del parsed
-        del message
-        return False
+        decision = self._session_router.classify_turn(
+            source="discord",
+            channel_id=parsed.channel_id,
+            message_id=parsed.message_id,
+            reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
+            content=parsed.content,
+            wait_registry=self._agent_loop.wait_registry,
+        )
+        return decision.intent == TurnIntent.ANSWER_PENDING_QUESTION
 
     async def _acknowledge_message(self, message: discord.Message, emoji: str = "👀") -> None:
         try:
@@ -271,12 +280,33 @@ class MessageHandlingService:
             return
 
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
+        decision = self._session_router.classify_turn(
+            source="discord",
+            channel_id=parsed.channel_id,
+            message_id=parsed.message_id,
+            reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
+            content=task_content,
+            metadata={
+                "session_id": self._active_sessions.get(parsed.channel_id, ""),
+            },
+            has_active_task=parsed.channel_id in self._inject_queues,
+            wait_registry=self._agent_loop.wait_registry,
+        )
         resumed_task = self._maybe_resume_waiting_discord_task(message)
         if resumed_task is not None:
             await self._acknowledge_message(message)
             task_id = str(resumed_task.metadata.get("task_id", "")).strip()
             if task_id and hasattr(self._agent_loop.memory, "mark_task_queued"):
                 await self._agent_loop.memory.mark_task_queued(task_id, metadata=resumed_task.metadata)
+            if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "append_session_turn"):
+                await self._agent_loop.memory.append_session_turn(
+                    session_id=str((resumed_task.metadata or {}).get("session_id", "")),
+                    role="user",
+                    content=message.content.strip(),
+                    turn_kind="answer",
+                    task_id=task_id,
+                    metadata={"author": getattr(message.author, "display_name", "user")},
+                )
             if allows_inline_reply(parsed.channel_id):
                 try:
                     await message.reply(
@@ -305,12 +335,28 @@ class MessageHandlingService:
 
         inject_q = self._inject_queues.get(parsed.channel_id)
         if inject_q is not None:
+            if decision.intent == TurnIntent.CANCEL_OR_PAUSE:
+                await self._acknowledge_message(message)
+                if allows_inline_reply(parsed.channel_id):
+                    try:
+                        await message.reply(
+                            "⏸️ I can't safely interrupt the running tool chain yet, but I'll stop after the current step and treat this as a pause request.",
+                            mention_author=False,
+                        )
+                    except discord.HTTPException:
+                        pass
+                await inject_q.put("User asked to pause/cancel after the current step.")
+                return
             await inject_q.put(task_content)
             await self._acknowledge_message(message)
             if allows_inline_reply(parsed.channel_id):
                 try:
                     await message.reply(
-                        "💬 Got it — I'll fold that into what I'm working on.",
+                        (
+                            "💬 Got it — I'll update the current task with that new constraint."
+                            if decision.intent == TurnIntent.CLARIFICATION_OR_NEW_CONSTRAINT
+                            else "💬 Got it — I'll fold that into what I'm working on."
+                        ),
                         mention_author=False,
                     )
                 except discord.HTTPException:
@@ -318,6 +364,23 @@ class MessageHandlingService:
             return
 
         if self._agent_loop.has_pending_work:
+            metadata = self._session_router.build_metadata(
+                source="discord",
+                channel_id=parsed.channel_id,
+                message_id=parsed.message_id,
+                reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
+                metadata={},
+            )
+            if "task_id" not in metadata:
+                metadata["task_id"] = f"discord-{parsed.channel_id}-{parsed.message_id}"
+            if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "create_task_record"):
+                await self._agent_loop.memory.create_task_record(
+                    task_id=metadata["task_id"],
+                    source="discord",
+                    author=parsed.author,
+                    content=task_content,
+                    metadata=metadata,
+                )
             await self._agent_loop.enqueue(
                 Task(
                     content=task_content,
@@ -325,6 +388,7 @@ class MessageHandlingService:
                     author=parsed.author,
                     channel_id=parsed.channel_id,
                     message_id=parsed.message_id,
+                    metadata=metadata,
                     inject_queue=asyncio.Queue(),
                 )
             )
@@ -343,12 +407,40 @@ class MessageHandlingService:
         inject_q = asyncio.Queue()
         self._inject_queues[parsed.channel_id] = inject_q
         response_future = asyncio.get_running_loop().create_future()
+        metadata = self._session_router.build_metadata(
+            source="discord",
+            channel_id=parsed.channel_id,
+            message_id=parsed.message_id,
+            reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
+            metadata={},
+        )
+        metadata["task_id"] = metadata.get("task_id") or f"discord-{parsed.channel_id}-{parsed.message_id}"
+        self._active_sessions[parsed.channel_id] = metadata["session_id"]
+        if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "create_task_record"):
+            await self._agent_loop.memory.create_task_record(
+                task_id=metadata["task_id"],
+                source="discord",
+                author=parsed.author,
+                content=task_content,
+                metadata=metadata,
+            )
+        if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "ensure_session"):
+            await self._agent_loop.memory.ensure_session(
+                session_id=metadata["session_id"],
+                source="discord",
+                channel_id=parsed.channel_id,
+                title=task_content[:120],
+                status="active",
+                pending_task_id=metadata["task_id"],
+                metadata={"author": parsed.author},
+            )
         task = Task(
             content=task_content,
             source="discord",
             author=parsed.author,
             channel_id=parsed.channel_id,
             message_id=parsed.message_id,
+            metadata=metadata,
             inject_queue=inject_q,
             response_future=response_future,
         )
@@ -365,6 +457,7 @@ class MessageHandlingService:
                 result = await response_future
         finally:
             self._inject_queues.pop(parsed.channel_id, None)
+            self._active_sessions.pop(parsed.channel_id, None)
             self._bridge.unregister(sink_tag)
 
         if result.waiting_for_user:
