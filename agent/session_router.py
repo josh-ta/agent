@@ -32,6 +32,69 @@ class TurnDecision:
 class SessionRouter:
     """Derive durable session IDs and lightweight turn intent decisions."""
 
+    _CANCEL_PREFIXES = (
+        "cancel",
+        "stop",
+        "pause",
+        "hold off",
+        "never mind",
+        "nevermind",
+        "forget it",
+        "forget that",
+        "drop it",
+        "scratch that",
+        "/cancel",
+        "/forget",
+    )
+    _CONSTRAINT_PREFIXES = (
+        "actually",
+        "update:",
+        "change:",
+        "one more thing",
+        "also",
+        "constraint:",
+        "make sure",
+        "don't",
+        "do not",
+        "without ",
+        "with ",
+    )
+    _NEW_TASK_PREFIXES = (
+        "please ",
+        "now ",
+        "go ahead and ",
+        "start ",
+        "restart ",
+        "deploy ",
+        "fix ",
+        "check ",
+        "investigate ",
+        "run ",
+        "pull ",
+        "ship ",
+        "build ",
+        "update ",
+        "review ",
+        "summarize ",
+        "search ",
+        "find ",
+        "look into ",
+        "ssh ",
+    )
+    _SAME_TASK_PHRASES = {
+        "ok",
+        "okay",
+        "sounds good",
+        "keep going",
+        "continue",
+        "continue please",
+        "yep",
+        "yes",
+        "no",
+        "thanks",
+        "thank you",
+    }
+
     def build_session(
         self,
         *,
@@ -134,16 +197,52 @@ class SessionRouter:
             if len(text.split()) <= 40:
                 return TurnDecision(session=session, intent=TurnIntent.ANSWER_PENDING_QUESTION)
 
-        if any(text.startswith(prefix) for prefix in ("cancel", "stop", "pause", "hold off", "never mind")):
+        if any(text.startswith(prefix) for prefix in self._CANCEL_PREFIXES):
             return TurnDecision(session=session, intent=TurnIntent.CANCEL_OR_PAUSE)
 
         if has_active_task:
-            if any(
-                text.startswith(prefix)
-                for prefix in ("actually", "instead", "update:", "change:", "one more thing", "also", "constraint:")
-            ):
+            if any(text.startswith(prefix) for prefix in self._CONSTRAINT_PREFIXES):
                 return TurnDecision(session=session, intent=TurnIntent.CLARIFICATION_OR_NEW_CONSTRAINT)
-            if reference_message_id is not None or len(text.split()) <= 20:
+            if self._looks_like_new_task(text):
+                return TurnDecision(session=session, intent=TurnIntent.START_NEW_TASK)
+            if reference_message_id is not None or self._looks_like_same_task_followup(text):
                 return TurnDecision(session=session, intent=TurnIntent.CONTINUE_SAME_TASK)
 
         return TurnDecision(session=session, intent=TurnIntent.START_NEW_TASK)
+
+    def _looks_like_new_task(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if any(stripped.startswith(prefix) for prefix in self._NEW_TASK_PREFIXES):
+            return True
+        words = stripped.split()
+        if not words:
+            return False
+        if words[0] in {
+            "restart",
+            "deploy",
+            "fix",
+            "check",
+            "investigate",
+            "run",
+            "pull",
+            "ship",
+            "build",
+            "update",
+            "review",
+            "summarize",
+            "search",
+            "find",
+            "ssh",
+        }:
+            return True
+        return len(words) > 20
+
+    def _looks_like_same_task_followup(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if stripped in self._SAME_TASK_PHRASES:
+            return True
+        return len(stripped.split()) <= 8 and not self._looks_like_new_task(stripped)

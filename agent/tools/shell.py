@@ -19,6 +19,7 @@ Streaming:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 
@@ -30,6 +31,43 @@ from agent.events import bridge, ShellStartEvent, ShellOutputEvent, ShellDoneEve
 log = structlog.get_logger()
 
 MAX_OUTPUT_BYTES = 10 * 1024  # 10 KB — use read_file for large files, not cat
+REMOTE_PREFLIGHT_RE = re.compile(r"(?mi)^\s*#\s*remote-preflight:\s*(?P<evidence>.+)$")
+SSH_RE = re.compile(r"(^|[\s;&(])ssh(\s|$)")
+REMOTE_GUESS_RE = re.compile(r"(?i)(/root/theticketactionapp|<your-server-ip>|example\.com)")
+
+
+def _validate_remote_command(command: str) -> str | None:
+    if not SSH_RE.search(command):
+        return None
+    if "github.com" in command:
+        return None
+    if REMOTE_GUESS_RE.search(command):
+        return "[ERROR: remote command blocked: guessed or placeholder deploy target detected.]"
+
+    match = REMOTE_PREFLIGHT_RE.search(command)
+    if match is None:
+        return (
+            "[ERROR: remote command blocked: add a first-line comment like "
+            "'# remote-preflight: workspace=/workspace/<repo>; basis=user-provided host' "
+            "after verifying the repo locally.]"
+        )
+
+    evidence = match.group("evidence").strip()
+    workspace_match = re.search(r"workspace=([^\s;]+)", evidence)
+    if workspace_match:
+        workspace_path = Path(workspace_match.group(1))
+        if not workspace_path.is_absolute():
+            workspace_path = settings.workspace_path / workspace_path
+        if not workspace_path.exists():
+            return f"[ERROR: remote command blocked: preflight workspace path not found: {workspace_path}]"
+        return None
+
+    if "/workspace" not in evidence and "user" not in evidence and "explicit" not in evidence:
+        return (
+            "[ERROR: remote command blocked: preflight comment must cite workspace evidence "
+            "or say the host/path came explicitly from the user.]"
+        )
+    return None
 
 
 async def shell_run(
@@ -67,6 +105,10 @@ async def shell_run(
             return f"[ERROR: working_dir not found: {cwd}]"
         if not cwd.is_dir():
             return f"[ERROR: working_dir is not a directory: {cwd}]"
+
+    remote_validation_error = _validate_remote_command(command)
+    if remote_validation_error is not None:
+        return remote_validation_error
 
     log.info("shell_run", command=command[:200], cwd=str(cwd), timeout=timeout)
     await bridge.emit(ShellStartEvent(command=command, cwd=str(cwd)))

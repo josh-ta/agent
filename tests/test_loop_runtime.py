@@ -68,6 +68,13 @@ class _Memory:
     async def list_pending_task_records(self) -> list[dict]:
         return [row for row in self.rows.values() if row.get("status") in {"queued", "running"}]
 
+    async def fail_task(self, task_id: str, *, error: str, metadata=None) -> None:
+        row = self.rows.setdefault(task_id, {"task_id": task_id})
+        row["status"] = "failed"
+        row["error"] = error
+        if metadata is not None:
+            row["metadata"] = metadata
+
     async def ensure_session(self, *, session_id: str, source: str, channel_id: int = 0, title: str = "", status: str = "active", pending_task_id: str = "", metadata=None) -> None:
         self.sessions[session_id] = {
             "session_id": session_id,
@@ -241,6 +248,65 @@ async def test_has_pending_work_run_once_and_resumed_task_helpers(monkeypatch: p
     )
     api_resumed = loop.build_resumed_task(suspended=api_suspended, answer="prod", author="Josh", source="discord")
     assert api_resumed.source == "discord"
+
+
+@pytest.mark.asyncio
+async def test_clear_queued_tasks_fails_removed_items_and_resolves_futures() -> None:
+    memory = _Memory()
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()}, memory_store=memory)
+    future: asyncio.Future[TaskResult] = asyncio.get_running_loop().create_future()
+    kept = Task(content="keep me", source="api", metadata={"task_id": "task-keep"})
+    removed = Task(
+        content="drop me",
+        source="discord",
+        channel_id=7,
+        metadata={"task_id": "task-drop"},
+        response_future=future,
+    )
+    await memory.create_task_record(
+        task_id="task-drop",
+        source="discord",
+        author="Josh",
+        content="drop me",
+        metadata={"task_id": "task-drop"},
+    )
+    await loop.enqueue(kept)
+    await loop.enqueue(removed)
+
+    cleared = await loop.clear_queued_tasks(source="discord", channel_id=7, reason="Cancelled by operator.")
+
+    assert [task.content for task in cleared] == ["drop me"]
+    assert [task.content for task in loop.queued_tasks()] == ["keep me"]
+    assert memory.rows["task-drop"]["status"] == "failed"
+    assert future.result().output == "Cancelled by operator."
+
+
+@pytest.mark.asyncio
+async def test_restore_pending_tasks_skips_discord_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = _Memory()
+    memory.rows["task-1"] = {
+        "task_id": "task-1",
+        "source": "discord",
+        "author": "Josh",
+        "content": "old discord task",
+        "status": "queued",
+        "metadata": {"task_id": "task-1"},
+    }
+    memory.rows["task-2"] = {
+        "task_id": "task-2",
+        "source": "api",
+        "author": "Josh",
+        "content": "api task",
+        "status": "queued",
+        "metadata": {"task_id": "task-2"},
+    }
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()}, memory_store=memory)
+
+    monkeypatch.setattr(loop_module.settings, "restore_pending_discord_tasks", False)
+    restored = await loop.restore_pending_tasks()
+
+    assert restored == 1
+    assert [task.content for task in loop.queued_tasks()] == ["api task"]
 
 
 @pytest.mark.asyncio
@@ -1092,7 +1158,7 @@ async def test_ensure_answer_required_prefers_repaired_then_repair_then_original
 
 
 @pytest.mark.asyncio
-async def test_maybe_promote_memory_fact_only_saves_preference_like_messages() -> None:
+async def test_maybe_promote_memory_fact_saves_preferences_and_operator_corrections() -> None:
     memory = _Memory()
     loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()}, memory_store=memory)
 
@@ -1114,7 +1180,17 @@ async def test_maybe_promote_memory_fact_only_saves_preference_like_messages() -
     no_memory_loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()})
     await no_memory_loop._maybe_promote_memory_fact(task=Task(content="remember this", source="discord"))
 
-    await loop._maybe_promote_memory_fact(task=Task(content="remember " + ("x" * 300), source="discord"))
+    await loop._maybe_promote_memory_fact(
+        task=Task(
+            content="the repo is available inside the /workspace directory so check the file system first and do not guess the repo or hostname",
+            source="discord",
+            author="Josh",
+        )
+    )
+    assert "file system" in memory.checkpoints["memory_fact"]["content"].lower() or "guess" in memory.checkpoints["memory_fact"]["content"].lower()
+
+    memory.checkpoints.clear()
+    await loop._maybe_promote_memory_fact(task=Task(content="remember " + ("x" * 1300), source="discord"))
     assert "memory_fact" not in memory.checkpoints
 
 

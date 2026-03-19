@@ -33,11 +33,38 @@ class _BusyLoop:
         self.has_pending_work = True
         self.queue = SimpleNamespace(qsize=lambda: 2)
         self.enqueued = None
+        self.front_enqueued = None
+        self.cleared: list[tuple[str | None, int | None, str]] = []
+        self.cancelled: list[tuple[int | None, str]] = []
         self.wait_registry = TaskWaitRegistry()
         self.memory = None
 
     async def enqueue(self, task) -> None:
         self.enqueued = task
+        response_future = getattr(task, "response_future", None)
+        if response_future is not None and not response_future.done():
+            response_future.set_result(
+                TaskResult(task=task, output="finished", success=True, elapsed_ms=1.0)
+            )
+
+    async def enqueue_front(self, task) -> None:
+        self.front_enqueued = task
+        response_future = getattr(task, "response_future", None)
+        if response_future is not None and not response_future.done():
+            response_future.set_result(
+                TaskResult(task=task, output="finished", success=True, elapsed_ms=1.0)
+            )
+
+    async def clear_queued_tasks(self, *, source=None, channel_id=None, reason="") -> list[object]:
+        self.cleared.append((source, channel_id, reason))
+        return [SimpleNamespace()] if channel_id is not None else []
+
+    async def request_cancel_active_task(self, *, channel_id=None, reason: str) -> bool:
+        self.cancelled.append((channel_id, reason))
+        return True
+
+    def describe_work(self, *, channel_id: int | None = None) -> str:
+        return "Active: deploy\nQueued: 2"
 
     def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
         metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
@@ -52,12 +79,35 @@ class _ReadyLoop:
         self.queue = SimpleNamespace(qsize=lambda: 0)
         self.wait_registry = TaskWaitRegistry()
         self.memory = None
+        self.enqueued = None
+        self.front_enqueued = None
+        self.cleared: list[tuple[str | None, int | None, str]] = []
+        self.cancelled: list[tuple[int | None, str]] = []
 
     async def enqueue(self, task) -> None:
+        self.enqueued = task
         assert task.response_future is not None
         task.response_future.set_result(
             TaskResult(task=task, output="finished", success=True, elapsed_ms=1.0)
         )
+
+    async def enqueue_front(self, task) -> None:
+        self.front_enqueued = task
+        assert task.response_future is not None
+        task.response_future.set_result(
+            TaskResult(task=task, output="finished", success=True, elapsed_ms=1.0)
+        )
+
+    async def clear_queued_tasks(self, *, source=None, channel_id=None, reason="") -> list[object]:
+        self.cleared.append((source, channel_id, reason))
+        return []
+
+    async def request_cancel_active_task(self, *, channel_id=None, reason: str) -> bool:
+        self.cancelled.append((channel_id, reason))
+        return True
+
+    def describe_work(self, *, channel_id: int | None = None) -> str:
+        return "No active or queued work."
 
     def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
         metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
@@ -106,7 +156,7 @@ async def test_message_service_queues_when_busy(fake_client, discord_channels, f
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert message.reactions == ["👀"]
-    assert "queued yours" in message.replies[0]
+    assert "queued next" in message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -148,7 +198,7 @@ async def test_message_service_busy_queue_preserves_existing_task_id_and_persist
             "metadata": {"task_id": "prebuilt-id", "session_id": "discord:101:1"},
         }
     ]
-    assert loop.enqueued.metadata["task_id"] == "prebuilt-id"
+    assert loop.front_enqueued.metadata["task_id"] == "prebuilt-id"
 
 
 @pytest.mark.asyncio
@@ -164,7 +214,104 @@ async def test_message_service_uses_next_position_when_single_item_ahead(fake_cl
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert "next up" in message.replies[0]
+    assert "queued next" in message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_message_service_status_command_uses_loop_snapshot(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _BusyLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    message = fake_message_factory(channel=discord_channels["private"], content="/status")
+
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, content="/status", channel_id=discord_channels["private"].id),
+    )
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+
+    assert message.reactions == ["👀"]
+    assert message.replies == ["Active: deploy\nQueued: 2"]
+
+
+@pytest.mark.asyncio
+async def test_message_service_replace_command_cancels_and_queues_front(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _ReadyLoop()
+    loop.has_pending_work = True
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    message = fake_message_factory(channel=discord_channels["private"], content="/replace restart the containers")
+
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(
+            MessageKind.TASK,
+            content="/replace restart the containers",
+            channel_id=discord_channels["private"].id,
+        ),
+    )
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+
+    assert loop.front_enqueued is not None
+    assert loop.front_enqueued.content == "restart the containers"
+    assert loop.cancelled
+    assert loop.cleared
+    assert "Replacing the current task" in message.replies[0]
+    assert "finished" in message.replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_message_service_replaces_active_private_task_for_new_imperative_followup(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _ReadyLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    inject_q: asyncio.Queue[str] = asyncio.Queue()
+    service._inject_queues[discord_channels["private"].id] = inject_q
+    message = fake_message_factory(channel=discord_channels["private"], content="restart the containers")
+
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, content="restart the containers", channel_id=discord_channels["private"].id),
+    )
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+
+    assert loop.front_enqueued is not None
+    assert loop.front_enqueued.content == "restart the containers"
+    assert inject_q.empty()
+    assert loop.cancelled
+    assert "Replacing the current task" in message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -195,9 +342,9 @@ async def test_message_service_enqueues_attachment_only_message(
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert service._agent_loop.enqueued is not None
-    assert service._agent_loop.enqueued.content == "Please inspect the attached file(s) and help with them."
-    attachments = service._agent_loop.enqueued.metadata["attachments"]
+    assert service._agent_loop.front_enqueued is not None
+    assert service._agent_loop.front_enqueued.content == "Please inspect the attached file(s) and help with them."
+    attachments = service._agent_loop.front_enqueued.metadata["attachments"]
     assert len(attachments) == 1
     assert attachments[0]["filename"] == "report.csv"
     assert "CSV preview" in attachments[0]["summary"]
@@ -351,8 +498,9 @@ async def test_message_service_ignores_bus_and_blank_content(
     fake_message_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = _ReadyLoop()
     service = MessageHandlingService(
-        agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
+        agent_loop=loop,  # type: ignore[arg-type]
         client=fake_client,  # type: ignore[arg-type]
         presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
     )
@@ -418,8 +566,9 @@ async def test_message_service_injects_followup_and_replies_inline(
     fake_message_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = _ReadyLoop()
     service = MessageHandlingService(
-        agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
+        agent_loop=loop,  # type: ignore[arg-type]
         client=fake_client,  # type: ignore[arg-type]
         presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
     )
@@ -446,8 +595,9 @@ async def test_message_service_injects_pause_request_for_active_task(
     fake_message_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = _ReadyLoop()
     service = MessageHandlingService(
-        agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
+        agent_loop=loop,  # type: ignore[arg-type]
         client=fake_client,  # type: ignore[arg-type]
         presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
     )
@@ -464,9 +614,9 @@ async def test_message_service_injects_pause_request_for_active_task(
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert await inject_q.get() == "User asked to pause/cancel after the current step."
+    assert loop.cancelled
     assert message.reactions == ["👀"]
-    assert "pause request" in message.replies[0]
+    assert "stop after the current step" in message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -551,7 +701,7 @@ async def test_message_service_resume_and_pause_paths_skip_inline_reply_in_comms
     )
     await service.handle_message(pause_message)  # type: ignore[arg-type]
 
-    assert await inject_q.get() == "User asked to pause/cancel after the current step."
+    assert service._agent_loop.cancelled  # type: ignore[attr-defined]
     assert pause_message.replies == []
 
 
@@ -620,7 +770,7 @@ async def test_message_service_swallow_inline_reply_failures_for_resume_pause_in
         lambda *_args: _parsed(MessageKind.TASK, content="pause this", channel_id=discord_channels["private"].id),
     )
     await service.handle_message(pause_message)  # type: ignore[arg-type]
-    assert await inject_q.get() == "User asked to pause/cancel after the current step."
+    assert service._agent_loop.cancelled  # type: ignore[attr-defined]
 
     service = MessageHandlingService(
         agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
@@ -1568,7 +1718,7 @@ async def test_discord_event_presenter_renders_text_tool_progress_and_error(fake
     await sink(TaskErrorEvent(error="boom"))
 
     assert discord_channels["private"].sent == [
-        "🟢 Starting: Investigate the failing deployment workflow",
+        "🟢 Working on it.",
         "🧠 *first \\*idea\\**",
         "💭 working",
         "🔧 `run_shell(command=pytest)`",
@@ -1601,8 +1751,7 @@ async def test_discord_event_presenter_truncates_long_start_and_formats_non_dict
     await sink(TaskStartEvent(content="x" * 200, tier="smart"))
     await sink(ToolCallStartEvent(tool_name="run_shell", call_id="1", args="y" * 300))
 
-    assert channel.sent[0].startswith("🟢 Starting: ")
-    assert channel.sent[0].endswith("...")
+    assert channel.sent[0] == "🟢 Working on it."
     assert channel.sent[1].startswith("🔧 `run_shell(")
     assert len(channel.sent[1]) < 240
 

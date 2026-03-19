@@ -183,6 +183,19 @@ def test_classify_turn_uses_cancel_pause_when_no_pending_wait() -> None:
     assert decision.intent is TurnIntent.CANCEL_OR_PAUSE
 
 
+def test_classify_turn_treats_forget_it_as_cancel() -> None:
+    router = SessionRouter()
+
+    decision = router.classify_turn(
+        source="discord",
+        channel_id=10,
+        message_id=11,
+        content="forget it",
+    )
+
+    assert decision.intent is TurnIntent.CANCEL_OR_PAUSE
+
+
 def test_classify_turn_prefers_clarification_for_active_task_prefix() -> None:
     router = SessionRouter()
 
@@ -209,6 +222,20 @@ def test_classify_turn_continues_same_task_for_short_active_followup() -> None:
     )
 
     assert decision.intent is TurnIntent.CONTINUE_SAME_TASK
+
+
+def test_classify_turn_starts_new_task_for_short_imperative_followup() -> None:
+    router = SessionRouter()
+
+    decision = router.classify_turn(
+        source="discord",
+        channel_id=10,
+        message_id=11,
+        content="restart my docker containers",
+        has_active_task=True,
+    )
+
+    assert decision.intent is TurnIntent.START_NEW_TASK
 
 
 def test_classify_turn_starts_new_task_for_long_active_followup_without_reference() -> None:

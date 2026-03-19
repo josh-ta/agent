@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     # ── Behaviour ─────────────────────────────────────────────────────────────
     heartbeat_seconds: int = Field(default=60, alias="HEARTBEAT_SECONDS")
     progress_heartbeat_seconds: int = Field(default=20, alias="PROGRESS_HEARTBEAT_SECONDS")
+    restore_pending_discord_tasks: bool = Field(
+        default=False,
+        alias="RESTORE_PENDING_DISCORD_TASKS",
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     attachment_max_bytes: int = Field(default=10_000_000, alias="ATTACHMENT_MAX_BYTES")
     attachment_text_char_cap: int = Field(default=12_000, alias="ATTACHMENT_TEXT_CHAR_CAP")

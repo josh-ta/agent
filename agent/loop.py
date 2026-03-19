@@ -153,6 +153,7 @@ class AgentLoop:
         self._success_count = 0
         # True while _process() is running — used by DiscordBot to detect concurrency
         self.is_busy = False
+        self._current_task: Task | None = None
         self._journal = TaskJournal(settings.workspace_path)
         self._context_builder = TaskContextBuilder(self.memory)
         self._run_executor = RunExecutor(
@@ -181,6 +182,96 @@ class AgentLoop:
     async def enqueue(self, task: Task) -> None:
         """Add a task to the processing queue."""
         await self.queue.put(task)
+
+    async def enqueue_front(self, task: Task) -> None:
+        """Add a task to the front of the queue."""
+        self.queue._queue.appendleft(task)  # type: ignore[attr-defined]
+
+    def current_task(self) -> Task | None:
+        return self._current_task
+
+    def queued_tasks(self) -> list[Task]:
+        return list(self.queue._queue)  # type: ignore[attr-defined]
+
+    async def clear_queued_tasks(
+        self,
+        *,
+        source: str | None = None,
+        channel_id: int | None = None,
+        reason: str = "Cancelled by operator.",
+    ) -> list[Task]:
+        kept: list[Task] = []
+        removed: list[Task] = []
+        for task in self.queued_tasks():
+            if source is not None and task.source != source:
+                kept.append(task)
+                continue
+            if channel_id is not None and task.channel_id != channel_id:
+                kept.append(task)
+                continue
+            removed.append(task)
+
+        if not removed:
+            return []
+
+        self.queue._queue.clear()  # type: ignore[attr-defined]
+        for task in kept:
+            self.queue._queue.append(task)  # type: ignore[attr-defined]
+
+        if self.memory is not None and hasattr(self.memory, "fail_task"):
+            for task in removed:
+                task_id = str((task.metadata or {}).get("task_id", "")).strip()
+                if task_id:
+                    await self.memory.fail_task(
+                        task_id,
+                        error=reason,
+                        metadata=task.metadata,
+                    )
+        for task in removed:
+            if task.response_future is not None and not task.response_future.done():
+                task.response_future.set_result(
+                    TaskResult(
+                        task=task,
+                        output=reason,
+                        success=False,
+                        status="failed",
+                        elapsed_ms=0.0,
+                    )
+                )
+        return removed
+
+    async def request_cancel_active_task(self, *, channel_id: int | None = None, reason: str) -> bool:
+        task = self._current_task
+        if task is None:
+            return False
+        if channel_id is not None and task.channel_id != channel_id:
+            return False
+        if task.inject_queue is None:
+            return False
+        await task.inject_queue.put(reason)
+        return True
+
+    def describe_work(self, *, channel_id: int | None = None) -> str:
+        lines: list[str] = []
+        active = self._current_task
+        if active is not None and (channel_id is None or active.channel_id == channel_id):
+            lines.append(f"Active: {active.content[:120]}")
+        queued = [
+            task for task in self.queued_tasks()
+            if channel_id is None or task.channel_id == channel_id
+        ]
+        if queued:
+            lines.append(f"Queued: {len(queued)}")
+            for idx, task in enumerate(queued[:5], start=1):
+                lines.append(f"{idx}. {task.content[:120]}")
+            if len(queued) > 5:
+                lines.append(f"... and {len(queued) - 5} more")
+        waiting = self.wait_registry.pending_for_channel(channel_id) if channel_id is not None else []
+        if waiting:
+            lines.append(f"Waiting for user: {len(waiting)}")
+            for item in waiting[:3]:
+                lines.append(f"- {item.question[:120]}")
+        return "\n".join(lines) if lines else "No active or queued work."
 
     @property
     def has_pending_work(self) -> bool:
@@ -245,9 +336,11 @@ class AgentLoop:
                     continue
 
                 self.is_busy = True
+                self._current_task = task
                 try:
                     await self._execute_task(task)
                 finally:
+                    self._current_task = None
                     self.is_busy = False
                 self.queue.task_done()
 
@@ -338,6 +431,9 @@ class AgentLoop:
         restored = 0
         rows = await self.memory.list_pending_task_records()
         for row in rows:
+            source = str(row.get("source", "api"))
+            if source == "discord" and not settings.restore_pending_discord_tasks:
+                continue
             task_id = str(row.get("task_id", "")).strip()
             if not task_id or self.wait_registry.has_pending(task_id):
                 continue
@@ -345,10 +441,10 @@ class AgentLoop:
             metadata["task_id"] = task_id
             session_id = str(metadata.get("session_id", "")).strip()
             if not session_id:
-                metadata["session_id"] = f"{row.get('source', 'api')}:{task_id}"
+                metadata["session_id"] = f"{source}:{task_id}"
             task = Task(
                 content=str(row.get("content", "")),
-                source=str(row.get("source", "api")),
+                source=source,
                 author=str(row.get("author", "system")),
                 channel_id=self._coerce_int(metadata.get("channel_id")),
                 message_id=self._coerce_int(metadata.get("message_id")),
@@ -858,8 +954,9 @@ class AgentLoop:
             return
         text = task.content.strip()
         lowered = text.lower()
-        if not text or len(text) > 240:
+        if not text or len(text) > 1200:
             return
+        facts: set[str] = set()
         fact_prefixes = (
             "remember ",
             "use ",
@@ -870,13 +967,26 @@ class AgentLoop:
             "for this project",
             "prefer ",
         )
-        if not any(lowered.startswith(prefix) for prefix in fact_prefixes):
+        if any(lowered.startswith(prefix) for prefix in fact_prefixes):
+            facts.add(text[:500])
+        if "/workspace" in text:
+            facts.add("Use the existing checkout in /workspace before guessing repo names, paths, or hosts.")
+        if any(phrase in lowered for phrase in ("hallucinating a repo", "guess the repo", "guess a repo", "guess the host", "guess the hostname")):
+            facts.add("Do not guess repo names, repo paths, hostnames, or VPS IPs. Inspect local files first and ask if missing.")
+        if "starting:" in lowered and "repeat" in lowered and "prompt" in lowered:
+            facts.add("Do not echo the user's full prompt back as a start message.")
+        if "check the file system first" in lowered or "read and check the file system first" in lowered:
+            facts.add("Check the local filesystem before attempting deploy, SSH, or repo-specific actions.")
+        if any(
+            phrase in lowered for phrase in ("do not guess", "don't guess", "stop guessing")
+        ):
+            facts.add(text[:500])
+        if not facts:
             return
-        await self.memory.save_memory_fact(
-            text,
-            metadata={
-                "source": task.source,
-                "author": task.author,
-                "session_id": str((task.metadata or {}).get("session_id", "")),
-            },
-        )
+        metadata = {
+            "source": task.source,
+            "author": task.author,
+            "session_id": str((task.metadata or {}).get("session_id", "")),
+        }
+        for fact in facts:
+            await self.memory.save_memory_fact(fact, metadata=metadata)

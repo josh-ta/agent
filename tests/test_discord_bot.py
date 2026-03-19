@@ -91,6 +91,36 @@ class _EventClient:
         return fn
 
 
+class _FakeResponse:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self._done = False
+
+    def is_done(self) -> bool:
+        return self._done
+
+    async def send_message(self, content: str) -> None:
+        self.sent.append(content)
+        self._done = True
+
+
+class _FakeFollowup:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, content: str) -> None:
+        self.sent.append(content)
+
+
+class _FakeInteraction:
+    def __init__(self, channel: _FakeChannel, *, user=None, interaction_id: int = 123) -> None:
+        self.channel = channel
+        self.user = user or SimpleNamespace(display_name="Josh", bot=False)
+        self.id = interaction_id
+        self.response = _FakeResponse()
+        self.followup = _FakeFollowup()
+
+
 @pytest.mark.asyncio
 async def test_free_discord_message_uses_queue_path(monkeypatch: pytest.MonkeyPatch) -> None:
     channel_id = 123
@@ -141,6 +171,80 @@ async def test_start_bot_handles_login_failure(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(bot._client, "start", _start)
 
     await bot.start_bot()
+
+
+@pytest.mark.asyncio
+async def test_handle_slash_command_routes_through_message_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    channel = _FakeChannel(101)
+    interaction = _FakeInteraction(channel)
+    seen: list[str] = []
+
+    async def fake_handle_message(message) -> None:
+        seen.append(message.content)
+        await message.reply("ok")
+
+    monkeypatch.setattr(bot._messages, "handle_message", fake_handle_message)
+
+    await bot._handle_slash_command(interaction, "status")
+
+    assert seen == ["/status"]
+    assert interaction.response.sent == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_sync_app_commands_uses_guild_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    calls: list[tuple[str, object]] = []
+
+    class _Tree:
+        def copy_global_to(self, *, guild) -> None:
+            calls.append(("copy", guild.id))
+
+        async def sync(self, *, guild=None):
+            calls.append(("sync", getattr(guild, "id", None)))
+
+    bot._tree = _Tree()  # type: ignore[assignment]
+    monkeypatch.setattr(discord_bot_module.settings, "discord_guild_id", 55)
+
+    await bot._sync_app_commands()
+
+    assert calls == [("copy", 55), ("sync", 55)]
+    assert bot._commands_synced is True
+
+
+@pytest.mark.asyncio
+async def test_sync_app_commands_global_and_failure_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    calls: list[tuple[str, object]] = []
+
+    class _Tree:
+        async def sync(self, *, guild=None):
+            calls.append(("sync", getattr(guild, "id", None)))
+
+    bot._tree = _Tree()  # type: ignore[assignment]
+    monkeypatch.setattr(discord_bot_module.settings, "discord_guild_id", 0)
+
+    await bot._sync_app_commands()
+    await bot._sync_app_commands()
+
+    assert calls == [("sync", None)]
+
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+
+    class _BrokenTree:
+        async def sync(self, *, guild=None):
+            raise RuntimeError("boom")
+
+    warnings: list[str] = []
+    bot._tree = _BrokenTree()  # type: ignore[assignment]
+    monkeypatch.setattr(discord_bot_module.settings, "discord_guild_id", 0)
+    monkeypatch.setattr(discord_bot_module.log, "warning", lambda event, **kwargs: warnings.append(event))
+
+    await bot._sync_app_commands()
+
+    assert warnings == ["discord_command_sync_failed"]
+    assert bot._commands_synced is False
 
 
 @pytest.mark.asyncio
@@ -313,6 +417,9 @@ async def test_setup_events_registers_handlers_and_routes_callbacks(monkeypatch:
     bot._client = _EventClient()
     seen: list[tuple[str, object]] = []
 
+    async def _sync_app_commands() -> None:
+        seen.append(("sync", None))
+
     async def _announce_online() -> None:
         seen.append(("ready", None))
 
@@ -321,6 +428,7 @@ async def test_setup_events_registers_handlers_and_routes_callbacks(monkeypatch:
 
     bot._announce_online = _announce_online  # type: ignore[assignment]
     bot._handle_message = _handle_message  # type: ignore[assignment]
+    bot._sync_app_commands = _sync_app_commands  # type: ignore[assignment]
 
     warnings: list[str] = []
     infos: list[str] = []
@@ -336,6 +444,6 @@ async def test_setup_events_registers_handlers_and_routes_callbacks(monkeypatch:
     await bot._client.handlers["on_disconnect"]()
     await bot._client.handlers["on_resumed"]()
 
-    assert seen == [("ready", None), ("message", 7)]
+    assert seen == [("sync", None), ("ready", None), ("message", 7)]
     assert infos == ["discord_ready", "discord_resumed"]
     assert warnings == ["discord_disconnected"]

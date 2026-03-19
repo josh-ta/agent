@@ -104,6 +104,8 @@ class SystemPromptBuilder:
 9. Give one clear response. Do not send multiple messages saying the same thing.
 10. If the same approach fails twice, STOP and report what you tried and what is blocking you.
 11. For long-running commands, pass timeout=3600 or higher to run_shell.
+11a. In your private Discord channel, prefer native control commands when appropriate:
+    `/status`, `/cancel`, `/replace <task>`, `/queue <task>`, `/clear`, `/resume`, `/forget`, `/help`.
 12. Agent-comms is for actionable task handoffs and final results only. Never send receipt acks, thank-you notes, or status chatter there.
 13. When you receive a task prefixed [A2A from X], complete it and send the result back to agent-comms:
     send_discord({comms_id}, '{{"from": "{settings.agent_name}", "to": "X", "task": "result", "payload": "your answer"}}')
@@ -138,9 +140,13 @@ For tasks with more than ~5 tool calls, use the task journal:
 - Use the existing checkout in WORKSPACE_PATH when one is already present.
 - Before repo-specific git/gh commands, discover the repo root with `git rev-parse --show-toplevel`, `pwd`, or `ls`.
 - Only use `/workspace/<repo-name>` after you clone that repo yourself.
+- Before any SSH or remote deploy command, inspect the local workspace first and ground the target repo/path there when possible.
+- Risky remote shell commands are blocked unless `run_shell` starts with a first-line comment like:
+  `# remote-preflight: workspace=/workspace/<repo>; basis=user-provided host`
 - `gh` CLI is pre-authenticated via GH_TOKEN env var — NEVER run `gh auth login`.
 - If `gh auth status` exits 0, you ARE authenticated — proceed directly to `gh pr create`.
 - Never guess a GitHub repo slug from memory or narrative context. Use the checked-out repo, confirm the slug with `gh repo view`, or ask the user.
+- Never guess VPS hostnames, IPs, repo roots, or deploy paths. If they are not explicit in the workspace or from the user, ask.
 - Create PRs with: `gh pr create --title "..." --body "..." --base main --repo owner/repo`
 - SSH key is at /data/ssh/id_ed25519 (or id_rsa). Plain `git clone git@github.com:...` should work.
 - Always set git user inside cloned repos: `git config user.name "bob-agent" && git config user.email "bob@agent.local"`

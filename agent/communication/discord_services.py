@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import discord
@@ -94,6 +95,30 @@ def allows_inline_reply(channel_id: int) -> bool:
     return channel_id != settings.discord_comms_channel_id
 
 
+@dataclass(frozen=True)
+class NativeCommand:
+    name: str
+    argument: str = ""
+
+    @property
+    def expects_task_text(self) -> bool:
+        return self.name in {"replace", "queue"}
+
+
+def parse_native_command(content: str) -> NativeCommand | None:
+    text = content.strip()
+    if not text.startswith("/"):
+        return None
+    parts = text[1:].split(None, 1)
+    if not parts:
+        return None
+    name = parts[0].strip().lower()
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    if name not in {"status", "cancel", "replace", "queue", "clear", "resume", "forget", "help"}:
+        return None
+    return NativeCommand(name=name, argument=argument)
+
+
 class DiscordEventPresenter:
     def __init__(self, client: discord.Client) -> None:
         self._client = client
@@ -125,10 +150,7 @@ class DiscordEventPresenter:
             nonlocal shell_lines, shell_msg
 
             if isinstance(event, TaskStartEvent):
-                summary = event.content.strip().replace("\n", " ")
-                if len(summary) > 160:
-                    summary = summary[:157] + "..."
-                await _send(f"🟢 Starting: {summary}")
+                await _send("🟢 Working on it.")
                 return
 
             if isinstance(event, ThinkingEndEvent):
@@ -216,8 +238,311 @@ class MessageHandlingService:
         self._waiting_sink_tag = f"discord_waiting_prompt_{id(self)}"
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
         self._active_sessions: dict[int, str] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._session_router = SessionRouter()
         self._bridge.register(self._waiting_sink_tag, self._make_waiting_prompt_sink())
+
+    @staticmethod
+    def _command_help_text() -> str:
+        return (
+            "## Commands\n"
+            "- `/status` — show active, queued, and waiting work\n"
+            "- `/cancel` — stop the current task after the next safe step\n"
+            "- `/replace <task>` — cancel current work and run a new task next\n"
+            "- `/queue <task>` — add a task to the back of the queue\n"
+            "- `/clear` — drop queued tasks in this channel\n"
+            "- `/resume` — repeat the current waiting question\n"
+            "- `/forget` — discard the current task and queued stale work\n"
+            "- `/help` — show this help"
+        )
+
+    @staticmethod
+    def _is_forget_request(text: str) -> bool:
+        lowered = text.strip().lower()
+        return lowered.startswith(("forget it", "forget that", "never mind", "nevermind", "scratch that", "/forget"))
+
+    def _is_private_channel(self, channel_id: int) -> bool:
+        return channel_id == settings.discord_agent_channel_id
+
+    def _build_task_metadata(
+        self,
+        *,
+        parsed: ParsedMessage,
+        message: discord.Message,
+        attachment_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = self._session_router.build_metadata(
+            source="discord",
+            channel_id=parsed.channel_id,
+            message_id=parsed.message_id,
+            reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
+            metadata=attachment_metadata,
+        )
+        metadata["task_id"] = metadata.get("task_id") or f"discord-{parsed.channel_id}-{parsed.message_id}"
+        return metadata
+
+    async def _persist_task_record(
+        self,
+        *,
+        metadata: dict[str, Any],
+        parsed: ParsedMessage,
+        task_content: str,
+    ) -> None:
+        if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "create_task_record"):
+            await self._agent_loop.memory.create_task_record(
+                task_id=metadata["task_id"],
+                source="discord",
+                author=parsed.author,
+                content=task_content,
+                metadata=metadata,
+            )
+
+    async def _enqueue_deferred_task(
+        self,
+        *,
+        parsed: ParsedMessage,
+        message: discord.Message,
+        task_content: str,
+        attachment_metadata: dict[str, Any],
+        front: bool = False,
+    ) -> Task:
+        metadata = self._build_task_metadata(
+            parsed=parsed,
+            message=message,
+            attachment_metadata=attachment_metadata,
+        )
+        await self._persist_task_record(
+            metadata=metadata,
+            parsed=parsed,
+            task_content=task_content,
+        )
+        response_future = asyncio.get_running_loop().create_future()
+        task = Task(
+            content=task_content,
+            source="discord",
+            author=parsed.author,
+            channel_id=parsed.channel_id,
+            message_id=parsed.message_id,
+            metadata=metadata,
+            inject_queue=asyncio.Queue(),
+            response_future=response_future,
+        )
+        if front and hasattr(self._agent_loop, "enqueue_front"):
+            await self._agent_loop.enqueue_front(task)
+        else:
+            await self._agent_loop.enqueue(task)
+        if self._is_private_channel(parsed.channel_id):
+            waiter = asyncio.create_task(
+                self._wait_for_deferred_result(
+                    parsed=parsed,
+                    message=message,
+                    response_future=response_future,
+                )
+            )
+            self._background_tasks.add(waiter)
+            waiter.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _clear_queued_channel_tasks(self, *, channel_id: int, reason: str) -> int:
+        if not hasattr(self._agent_loop, "clear_queued_tasks"):
+            return 0
+        removed = await self._agent_loop.clear_queued_tasks(
+            source="discord",
+            channel_id=channel_id,
+            reason=reason,
+        )
+        return len(removed)
+
+    async def _request_cancel_active_task(self, *, channel_id: int, reason: str) -> bool:
+        if hasattr(self._agent_loop, "request_cancel_active_task"):
+            return await self._agent_loop.request_cancel_active_task(
+                channel_id=channel_id,
+                reason=reason,
+            )
+        inject_q = self._inject_queues.get(channel_id)
+        if inject_q is None:
+            return False
+        await inject_q.put(reason)
+        return True
+
+    async def _reply_safe(self, message: discord.Message, content: str) -> None:
+        if not allows_inline_reply(message.channel.id):
+            return
+        try:
+            await message.reply(content, mention_author=False)
+        except discord.HTTPException:
+            pass
+
+    async def _wait_for_deferred_result(
+        self,
+        *,
+        parsed: ParsedMessage,
+        message: discord.Message,
+        response_future: asyncio.Future[TaskResult],
+    ) -> None:
+        try:
+            result = await response_future
+        except Exception as exc:
+            await self._reply_safe(message, f"❌ {exc}")
+            return
+        await self._handle_task_result(parsed=parsed, message=message, result=result)
+
+    async def _handle_task_result(
+        self,
+        *,
+        parsed: ParsedMessage,
+        message: discord.Message,
+        result: TaskResult,
+    ) -> None:
+        if result.waiting_for_user:
+            task_id = str(result.task.metadata.get("task_id", "")).strip()
+            suspended = self._agent_loop.wait_registry.get(task_id) if task_id else None
+            prompt_message_id = suspended.prompt_message_id if suspended is not None else None
+            if prompt_message_id is None:
+                prompt_message_id = await self._send_waiting_prompt(
+                    message,
+                    result.question or "I need more information.",
+                )
+            if task_id and prompt_message_id is not None and (suspended is None or suspended.prompt_message_id is None):
+                await self._record_waiting_prompt(
+                    task_id=task_id,
+                    metadata=result.task.metadata,
+                    question=result.question or "",
+                    prompt_message_id=prompt_message_id,
+                )
+            await self._mark_task_waiting(message)
+            return
+
+        delivery_confirmed = False
+        if result.user_visible_reply_sent:
+            if result.attachments:
+                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
+            else:
+                delivery_confirmed = True
+        elif not result.output:
+            if result.attachments:
+                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
+        else:
+            delivery_confirmed = await self.send_reply(parsed, result.output, message, attachments=result.attachments)
+
+        await self._mark_task_finished(message, success=bool(result.success and delivery_confirmed))
+
+    async def _handle_native_command(
+        self,
+        *,
+        message: discord.Message,
+        parsed: ParsedMessage,
+        command: NativeCommand,
+        task_content: str,
+        attachment_metadata: dict[str, Any],
+    ) -> bool:
+        if not self._is_private_channel(parsed.channel_id):
+            return False
+
+        await self._acknowledge_message(message)
+
+        if command.name == "help":
+            await self._reply_safe(message, self._command_help_text())
+            return True
+
+        if command.name == "status":
+            if hasattr(self._agent_loop, "describe_work"):
+                status = self._agent_loop.describe_work(channel_id=parsed.channel_id)
+            else:
+                waiting = len(self._agent_loop.wait_registry.pending_for_channel(parsed.channel_id))
+                queue_size = self._agent_loop.queue.qsize() if hasattr(self._agent_loop, "queue") else 0
+                active = "yes" if getattr(self._agent_loop, "has_pending_work", False) else "no"
+                status = f"Active: {active}\nQueued: {queue_size}\nWaiting for user: {waiting}"
+            await self._reply_safe(message, status)
+            return True
+
+        if command.name == "resume":
+            waiting = self._agent_loop.wait_registry.pending_for_channel(parsed.channel_id)
+            if len(waiting) == 1:
+                await self._reply_safe(message, f"❓ {waiting[0].question}")
+            elif len(waiting) > 1:
+                await self._reply_safe(message, "💬 I have more than one suspended question. Reply directly to the specific one you mean.")
+            else:
+                await self._reply_safe(message, "💬 There is no suspended question to resume right now.")
+            return True
+
+        if command.name == "clear":
+            removed = await self._clear_queued_channel_tasks(
+                channel_id=parsed.channel_id,
+                reason="Cleared by operator command.",
+            )
+            await self._reply_safe(
+                message,
+                f"🧹 Cleared {removed} queued task{'s' if removed != 1 else ''}."
+                if removed
+                else "💬 There were no queued tasks to clear.",
+            )
+            return True
+
+        if command.name in {"cancel", "forget"}:
+            removed = await self._clear_queued_channel_tasks(
+                channel_id=parsed.channel_id,
+                reason="Cancelled by operator command.",
+            )
+            cancel_reason = (
+                "Operator issued /forget. Stop after the current safe step, discard the old task, and acknowledge cancellation."
+                if command.name == "forget"
+                else "Operator issued /cancel. Stop after the current safe step and acknowledge cancellation."
+            )
+            cancelled = await self._request_cancel_active_task(
+                channel_id=parsed.channel_id,
+                reason=cancel_reason,
+            )
+            if cancelled:
+                await self._reply_safe(
+                    message,
+                    (
+                        "🛑 I’ll stop after the current safe step and discard the stale work."
+                        if command.name == "forget"
+                        else "⏸️ I’ll stop after the current safe step."
+                    ),
+                )
+            elif removed:
+                await self._reply_safe(message, f"🧹 Cleared {removed} queued task{'s' if removed != 1 else ''}.")
+            else:
+                await self._reply_safe(message, "💬 There is no active or queued task to cancel.")
+            return True
+
+        if command.name in {"replace", "queue"} and not task_content.strip():
+            await self._reply_safe(message, f"Usage: `/{command.name} <task>`")
+            return True
+
+        if command.name == "queue":
+            await self._enqueue_deferred_task(
+                parsed=parsed,
+                message=message,
+                task_content=task_content,
+                attachment_metadata=attachment_metadata,
+                front=False,
+            )
+            await self._reply_safe(message, "📝 Queued that task.")
+            return True
+
+        if command.name == "replace":
+            await self._clear_queued_channel_tasks(
+                channel_id=parsed.channel_id,
+                reason="Replaced by a newer operator task.",
+            )
+            await self._request_cancel_active_task(
+                channel_id=parsed.channel_id,
+                reason="Operator issued /replace. Stop after the current safe step and hand off to the replacement task.",
+            )
+            await self._enqueue_deferred_task(
+                parsed=parsed,
+                message=message,
+                task_content=task_content,
+                attachment_metadata=attachment_metadata,
+                front=True,
+            )
+            await self._reply_safe(message, "⏭️ Replacing the current task. Your new task is next.")
+            return True
+
+        return False
 
     def _is_answering_pending_question(
         self,
@@ -380,15 +705,32 @@ class MessageHandlingService:
         if parsed.kind in {MessageKind.IGNORE, MessageKind.BUS}:
             return
 
-        task_content = (
+        raw_task_content = (
             a2a_to_task_content(parsed.a2a_payload)
             if parsed.kind == MessageKind.A2A and parsed.a2a_payload
             else parsed.content
         )
+        native_command = (
+            parse_native_command(raw_task_content)
+            if parsed.kind == MessageKind.TASK and self._is_private_channel(parsed.channel_id)
+            else None
+        )
+        base_content = native_command.argument if native_command and native_command.expects_task_text else raw_task_content
         task_content, attachment_metadata, combined_content = await self._build_task_input(
             message,
-            base_content=task_content,
+            base_content=base_content,
         )
+        if native_command is not None:
+            handled = await self._handle_native_command(
+                message=message,
+                parsed=parsed,
+                command=native_command,
+                task_content=task_content,
+                attachment_metadata=attachment_metadata,
+            )
+            if handled:
+                return
+
         if not task_content.strip():
             return
 
@@ -451,93 +793,105 @@ class MessageHandlingService:
         if inject_q is not None:
             if decision.intent == TurnIntent.CANCEL_OR_PAUSE:
                 await self._acknowledge_message(message)
-                if allows_inline_reply(parsed.channel_id):
-                    try:
-                        await message.reply(
-                            "⏸️ I can't safely interrupt the running tool chain yet, but I'll stop after the current step and treat this as a pause request.",
-                            mention_author=False,
-                        )
-                    except discord.HTTPException:
-                        pass
-                await inject_q.put("User asked to pause/cancel after the current step.")
+                forget_request = self._is_forget_request(combined_content)
+                if forget_request:
+                    await self._clear_queued_channel_tasks(
+                        channel_id=parsed.channel_id,
+                        reason="Discarded after operator said to forget the task.",
+                    )
+                await self._request_cancel_active_task(
+                    channel_id=parsed.channel_id,
+                    reason=(
+                        "Operator said to forget the current task. Stop after the current safe step, discard stale work, and acknowledge cancellation."
+                        if forget_request
+                        else "User asked to pause/cancel after the current step."
+                    ),
+                )
+                await self._reply_safe(
+                    message,
+                    (
+                        "🛑 I’ll stop after the current step and discard the stale work."
+                        if forget_request
+                        else "⏸️ I can't safely interrupt the running tool chain yet, but I'll stop after the current step."
+                    ),
+                )
+                return
+            if self._is_private_channel(parsed.channel_id) and decision.intent == TurnIntent.START_NEW_TASK:
+                await self._clear_queued_channel_tasks(
+                    channel_id=parsed.channel_id,
+                    reason="Replaced by a newer operator task.",
+                )
+                await self._request_cancel_active_task(
+                    channel_id=parsed.channel_id,
+                    reason="Operator sent a new task. Stop after the current safe step and hand off to the replacement task.",
+                )
+                await self._enqueue_deferred_task(
+                    parsed=parsed,
+                    message=message,
+                    task_content=task_content,
+                    attachment_metadata=attachment_metadata,
+                    front=True,
+                )
+                await self._acknowledge_message(message)
+                await self._reply_safe(message, "⏭️ Replacing the current task. Your new task is next.")
                 return
             await inject_q.put(combined_content)
             await self._acknowledge_message(message)
-            if allows_inline_reply(parsed.channel_id):
-                try:
-                    await message.reply(
-                        (
-                            "💬 Got it — I'll update the current task with that new constraint."
-                            if decision.intent == TurnIntent.CLARIFICATION_OR_NEW_CONSTRAINT
-                            else "💬 Got it — I'll fold that into what I'm working on."
-                        ),
-                        mention_author=False,
-                    )
-                except discord.HTTPException:
-                    pass
+            await self._reply_safe(
+                message,
+                (
+                    "💬 Got it — I'll update the current task with that new constraint."
+                    if decision.intent == TurnIntent.CLARIFICATION_OR_NEW_CONSTRAINT
+                    else "💬 Got it — I'll fold that into what I'm working on."
+                ),
+            )
             return
 
         if self._agent_loop.has_pending_work:
-            metadata = self._session_router.build_metadata(
-                source="discord",
-                channel_id=parsed.channel_id,
-                message_id=parsed.message_id,
-                reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
-                metadata=attachment_metadata,
-            )
-            if "task_id" not in metadata:
-                metadata["task_id"] = f"discord-{parsed.channel_id}-{parsed.message_id}"
-            if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "create_task_record"):
-                await self._agent_loop.memory.create_task_record(
-                    task_id=metadata["task_id"],
-                    source="discord",
-                    author=parsed.author,
-                    content=task_content,
-                    metadata=metadata,
-                )
-            await self._agent_loop.enqueue(
-                Task(
-                    content=task_content,
-                    source="discord",
-                    author=parsed.author,
+            if self._is_private_channel(parsed.channel_id) and decision.intent == TurnIntent.START_NEW_TASK:
+                await self._clear_queued_channel_tasks(
                     channel_id=parsed.channel_id,
-                    message_id=parsed.message_id,
-                    metadata=metadata,
-                    inject_queue=asyncio.Queue(),
+                    reason="Replaced by a newer operator task.",
                 )
+                await self._enqueue_deferred_task(
+                    parsed=parsed,
+                    message=message,
+                    task_content=task_content,
+                    attachment_metadata=attachment_metadata,
+                    front=True,
+                )
+                await self._acknowledge_message(message)
+                await self._reply_safe(message, "⏭️ Your new task is queued next.")
+                return
+            await self._enqueue_deferred_task(
+                parsed=parsed,
+                message=message,
+                task_content=task_content,
+                attachment_metadata=attachment_metadata,
+                front=False,
             )
             await self._acknowledge_message(message)
-            if allows_inline_reply(parsed.channel_id):
-                position = f"#{self._agent_loop.queue.qsize()}" if self._agent_loop.queue.qsize() > 1 else "next"
-                try:
-                    await message.reply(
-                        f"⏸️ I'm still working on the previous task — queued yours ({position} up).",
-                        mention_author=False,
-                    )
-                except discord.HTTPException:
-                    pass
+            position = f"#{self._agent_loop.queue.qsize()}" if self._agent_loop.queue.qsize() > 1 else "next"
+            await self._reply_safe(
+                message,
+                f"⏸️ I'm still working on the previous task — queued yours ({position} up).",
+            )
             return
 
         inject_q = asyncio.Queue()
         self._inject_queues[parsed.channel_id] = inject_q
         response_future = asyncio.get_running_loop().create_future()
-        metadata = self._session_router.build_metadata(
-            source="discord",
-            channel_id=parsed.channel_id,
-            message_id=parsed.message_id,
-            reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
-                metadata=attachment_metadata,
+        metadata = self._build_task_metadata(
+            parsed=parsed,
+            message=message,
+            attachment_metadata=attachment_metadata,
         )
-        metadata["task_id"] = metadata.get("task_id") or f"discord-{parsed.channel_id}-{parsed.message_id}"
         self._active_sessions[parsed.channel_id] = metadata["session_id"]
-        if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "create_task_record"):
-            await self._agent_loop.memory.create_task_record(
-                task_id=metadata["task_id"],
-                source="discord",
-                author=parsed.author,
-                content=task_content,
-                metadata=metadata,
-            )
+        await self._persist_task_record(
+            metadata=metadata,
+            parsed=parsed,
+            task_content=task_content,
+        )
         if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "ensure_session"):
             await self._agent_loop.memory.ensure_session(
                 session_id=metadata["session_id"],
@@ -574,38 +928,7 @@ class MessageHandlingService:
             self._active_sessions.pop(parsed.channel_id, None)
             self._bridge.unregister(sink_tag)
 
-        if result.waiting_for_user:
-            task_id = str(result.task.metadata.get("task_id", "")).strip()
-            suspended = self._agent_loop.wait_registry.get(task_id) if task_id else None
-            prompt_message_id = suspended.prompt_message_id if suspended is not None else None
-            if prompt_message_id is None:
-                prompt_message_id = await self._send_waiting_prompt(
-                    message,
-                    result.question or "I need more information.",
-                )
-            if task_id and prompt_message_id is not None and (suspended is None or suspended.prompt_message_id is None):
-                await self._record_waiting_prompt(
-                    task_id=task_id,
-                    metadata=result.task.metadata,
-                    question=result.question or "",
-                    prompt_message_id=prompt_message_id,
-                )
-            await self._mark_task_waiting(message)
-            return
-
-        delivery_confirmed = False
-        if result.user_visible_reply_sent:
-            if result.attachments:
-                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
-            else:
-                delivery_confirmed = True
-        elif not result.output:
-            if result.attachments:
-                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
-        else:
-            delivery_confirmed = await self.send_reply(parsed, result.output, message, attachments=result.attachments)
-
-        await self._mark_task_finished(message, success=bool(result.success and delivery_confirmed))
+        await self._handle_task_result(parsed=parsed, message=message, result=result)
 
     async def send_reply(
         self,
