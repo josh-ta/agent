@@ -11,7 +11,7 @@ from types import ModuleType, SimpleNamespace
 
 
 _COUNTER = itertools.count()
-_BRIDGE_PATH = Path("/Users/josh/Projects/agent/mcps/browser/mcp_bridge.py")
+_BRIDGE_PATH = Path(__file__).resolve().parents[1] / "mcps" / "browser" / "mcp_bridge.py"
 
 
 @dataclass

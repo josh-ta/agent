@@ -259,9 +259,19 @@ class SQLiteStore:
 
     async def close(self) -> None:
         if self._db:
-            await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            await self._db.close()
-            self._db = None
+            db = self._db
+            try:
+                try:
+                    await db.rollback()
+                except Exception as exc:
+                    log.debug("sqlite_rollback_on_close_failed", error=str(exc))
+                try:
+                    await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception as exc:
+                    log.debug("sqlite_checkpoint_on_close_failed", error=str(exc))
+            finally:
+                await db.close()
+                self._db = None
 
     # ── Conversations ─────────────────────────────────────────────────────────
 

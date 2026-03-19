@@ -299,6 +299,7 @@ class SQLiteMemoryRepository:
     async def save_memory_fact(self, content: str, metadata: dict[str, Any] | None = None) -> int:
         self._store._check()
         assert self._store._db
+        db = self._store._db
         cur = await self._store._db.execute(
             "INSERT INTO memory_facts (content, metadata, ts) VALUES (?,?,?)",
             (content, json.dumps(metadata or {}), time.time()),
@@ -310,12 +311,16 @@ class SQLiteMemoryRepository:
             try:
                 embedding = await embed_text(content)
                 if embedding is not None:
-                    await self._store._db.execute(
+                    await db.execute(
                         "INSERT OR REPLACE INTO memory_vec(fact_id, embedding) VALUES (?, ?)",
                         (fact_id, json.dumps(embedding)),
                     )
-                    await self._store._db.commit()
+                    await db.commit()
             except Exception as exc:
+                try:
+                    await db.rollback()
+                except Exception as rollback_exc:
+                    log.debug("memory_vec_insert_rollback_failed", error=str(rollback_exc))
                 log.warning("memory_vec_insert_failed", error=str(exc))
 
         return fact_id
@@ -527,6 +532,10 @@ class SQLiteMaintenance:
             await self._store._db.execute("INSERT INTO lessons_fts(lessons_fts) VALUES ('rebuild')")
             await self._store._db.commit()
         except Exception as exc:
+            try:
+                await self._store._db.rollback()
+            except Exception as rollback_exc:
+                log.debug("fts_rebuild_rollback_failed", error=str(rollback_exc))
             log.warning("fts_rebuild_failed", error=str(exc))
 
         await self._store._db.execute("PRAGMA wal_checkpoint(PASSIVE)")

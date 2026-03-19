@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 from types import ModuleType
@@ -22,6 +23,25 @@ class _ExecuteFailProxy:
             self._failed = True
             raise RuntimeError(f"forced failure for {self._needle}")
         return self._db.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+
+class _ExecuteRollbackFailProxy:
+    def __init__(self, db, *, needle: str) -> None:
+        self._db = db
+        self._needle = needle
+        self._failed = False
+
+    def execute(self, sql: str, *args, **kwargs):
+        if self._needle in sql and not self._failed:
+            self._failed = True
+            raise RuntimeError(f"forced failure for {self._needle}")
+        return self._db.execute(sql, *args, **kwargs)
+
+    async def rollback(self) -> None:
+        raise RuntimeError("rollback failed")
 
     def __getattr__(self, name: str):
         return getattr(self._db, name)
@@ -288,7 +308,7 @@ async def test_save_memory_fact_vector_success_and_stats_fallback(monkeypatch: p
     await sqlite_store._db.commit()
 
     async def fake_embed(_text: str):
-        return [0.1, 0.2]
+        return [0.1] * 1536
 
     monkeypatch.setattr(sqlite_components, "embed_text", fake_embed)
     fact_id = await sqlite_store.memory_facts.save_memory_fact("Remember this fact")
@@ -337,10 +357,54 @@ async def test_save_memory_fact_skips_vector_insert_when_embedding_none(monkeypa
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_save_memory_fact_swallows_vector_insert_and_rollback_failures(
+    monkeypatch: pytest.MonkeyPatch, sqlite_store
+) -> None:
+    original_db = sqlite_store._db
+    assert original_db is not None
+    sqlite_store._has_vec = True
+    sqlite_store._db = _ExecuteRollbackFailProxy(original_db, needle="INSERT OR REPLACE INTO memory_vec")
+
+    async def fake_embed(_text: str):
+        return [0.1] * 1536
+
+    monkeypatch.setattr(sqlite_components, "embed_text", fake_embed)
+    try:
+        fact_id = await sqlite_store.memory_facts.save_memory_fact("Remember this fact")
+    finally:
+        sqlite_store._db = original_db
+
+    async with original_db.execute("SELECT content FROM memory_facts WHERE id=?", (fact_id,)) as cur:
+        row = await cur.fetchone()
+    assert row["content"] == "Remember this fact"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_cleanup_updates_meta_even_when_fts_rebuild_fails(sqlite_store) -> None:
     original_db = sqlite_store._db
     assert original_db is not None
     sqlite_store._db = _ExecuteFailProxy(original_db, needle="INSERT INTO memory_fts(memory_fts)")
+
+    try:
+        await sqlite_store.maintenance.cleanup()
+    finally:
+        sqlite_store._db = original_db
+
+    assert sqlite_store._last_cleanup_ts > 0
+    async with original_db.execute(
+        "SELECT value FROM _meta WHERE key='last_cleanup_ts'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_cleanup_swallows_fts_rebuild_and_rollback_failures(sqlite_store) -> None:
+    original_db = sqlite_store._db
+    assert original_db is not None
+    sqlite_store._db = _ExecuteRollbackFailProxy(original_db, needle="INSERT INTO memory_fts(memory_fts)")
 
     try:
         await sqlite_store.maintenance.cleanup()
@@ -403,7 +467,10 @@ async def test_cleanup_prunes_orphan_vectors_and_skips_recent_vacuum(monkeypatch
         )
         """
     )
-    await sqlite_store._db.execute("INSERT OR REPLACE INTO memory_vec(fact_id, embedding) VALUES (?, ?)", (999, "[0.1,0.2]"))
+    await sqlite_store._db.execute(
+        "INSERT OR REPLACE INTO memory_vec(fact_id, embedding) VALUES (?, ?)",
+        (999, json.dumps([0.1] * 1536)),
+    )
     now = time.time()
     await sqlite_store._db.execute(
         "INSERT OR REPLACE INTO _meta(key,value) VALUES('last_vacuum_ts',?)",

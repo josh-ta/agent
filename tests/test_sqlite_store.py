@@ -78,6 +78,24 @@ class _FakeInitDb:
         return None
 
 
+class _CloseErrorDb:
+    def __init__(self) -> None:
+        self.closed = False
+        self.rollback_calls = 0
+        self.execute_calls: list[str] = []
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+        raise RuntimeError("rollback failed")
+
+    async def execute(self, sql: str, *args, **kwargs):
+        self.execute_calls.append(sql)
+        raise RuntimeError("checkpoint failed")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_sqlite_store_saves_messages_and_returns_history(sqlite_store) -> None:
@@ -515,6 +533,20 @@ async def test_sqlite_store_recent_lessons_and_close_edge_paths(sqlite_store, is
     fresh = SQLiteStore(isolated_paths["workspace"] / "fresh.db")
     with pytest.raises(RuntimeError, match="call await init"):
         await fresh.get_stats()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_store_close_swallows_rollback_and_checkpoint_failures() -> None:
+    store = SQLiteStore("close-errors.db")
+    db = _CloseErrorDb()
+    store._db = db
+
+    await store.close()
+
+    assert db.rollback_calls == 1
+    assert db.execute_calls == ["PRAGMA wal_checkpoint(TRUNCATE)"]
+    assert db.closed is True
+    assert store._db is None
 
 
 @pytest.mark.asyncio
