@@ -55,13 +55,13 @@ class RuntimeDeps:
 class BridgeConfig:
     port: int
     proxy_settings: dict[str, str] | None
-    agent_secrets_path: str
     locale: str
     timezone: str
     latitude: float
     longitude: float
     viewport: dict[str, int]
     user_agent: str
+    agent_secrets_path: str = "/data/agent-secrets.json"
 
 
 def parse_proxy_settings(
