@@ -29,6 +29,7 @@ from agent.events import (
     ShellOutputEvent,
     ShellStartEvent,
     TaskErrorEvent,
+    TaskWaitingEvent,
     TaskStartEvent,
     TextTurnEndEvent,
     ThinkingEndEvent,
@@ -212,9 +213,11 @@ class MessageHandlingService:
         self._client = client
         self._presenter = presenter
         self._bridge = event_bridge
+        self._waiting_sink_tag = f"discord_waiting_prompt_{id(self)}"
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
         self._active_sessions: dict[int, str] = {}
         self._session_router = SessionRouter()
+        self._bridge.register(self._waiting_sink_tag, self._make_waiting_prompt_sink())
 
     def _is_answering_pending_question(
         self,
@@ -243,16 +246,83 @@ class MessageHandlingService:
     async def _mark_task_waiting(self, message: discord.Message) -> None:
         await self._acknowledge_message(message, "⏸️")
 
+    async def _send_waiting_prompt_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        question: str,
+    ) -> int | None:
+        try:
+            sent = await channel.send(f"❓ {question}")  # type: ignore[union-attr]
+            return getattr(sent, "id", None)
+        except discord.HTTPException:
+            return None
+
     async def _send_waiting_prompt(self, message: discord.Message, question: str) -> int | None:
         try:
             sent = await message.reply(f"❓ {question}", mention_author=False)
             return getattr(sent, "id", None)
         except discord.HTTPException:
-            try:
-                sent = await message.channel.send(f"❓ {question}")
-                return getattr(sent, "id", None)
-            except discord.HTTPException:
-                return None
+            return await self._send_waiting_prompt_to_channel(message.channel, question)
+
+    async def _record_waiting_prompt(
+        self,
+        *,
+        task_id: str,
+        metadata: dict[str, Any] | None,
+        question: str,
+        prompt_message_id: int,
+    ) -> None:
+        self._agent_loop.wait_registry.bind_prompt_message(task_id, prompt_message_id)
+        wait_state = dict((metadata or {}).get("wait_state") or {})
+        wait_state["prompt_message_id"] = prompt_message_id
+        if metadata is not None:
+            metadata["wait_state"] = wait_state
+
+        suspended = self._agent_loop.wait_registry.get(task_id)
+        if suspended is not None:
+            suspended.prompt_message_id = prompt_message_id
+            suspended_wait_state = dict(suspended.metadata.get("wait_state") or {})
+            suspended_wait_state["prompt_message_id"] = prompt_message_id
+            suspended.metadata["wait_state"] = suspended_wait_state
+
+        if self._agent_loop.memory is not None and hasattr(self._agent_loop.memory, "mark_task_waiting"):
+            await self._agent_loop.memory.mark_task_waiting(
+                task_id,
+                metadata=metadata or (suspended.metadata if suspended is not None else {"wait_state": wait_state}),
+                question=question,
+            )
+
+    def _make_waiting_prompt_sink(self):  # type: ignore[return]
+        async def sink(event: AgentEvent) -> None:
+            if not isinstance(event, TaskWaitingEvent):
+                return
+            if event.deliver_inline_reply or event.source != "discord":
+                return
+
+            task_id = str(event.task_id or "").strip()
+            if not task_id:
+                return
+            suspended = self._agent_loop.wait_registry.get(task_id)
+            if suspended is None or suspended.prompt_message_id is not None:
+                return
+
+            channel = self._client.get_channel(event.channel_id or suspended.channel_id)
+            if channel is None:
+                return
+
+            question = event.question or suspended.question or "I need more information."
+            prompt_message_id = await self._send_waiting_prompt_to_channel(channel, question)
+            if prompt_message_id is None:
+                return
+
+            await self._record_waiting_prompt(
+                task_id=task_id,
+                metadata=suspended.metadata,
+                question=question,
+                prompt_message_id=prompt_message_id,
+            )
+
+        return sink
 
     async def _build_task_input(
         self,
@@ -505,22 +575,21 @@ class MessageHandlingService:
             self._bridge.unregister(sink_tag)
 
         if result.waiting_for_user:
-            prompt_message_id = await self._send_waiting_prompt(message, result.question or "I need more information.")
             task_id = str(result.task.metadata.get("task_id", "")).strip()
-            if task_id and prompt_message_id is not None:
-                self._agent_loop.wait_registry.bind_prompt_message(task_id, prompt_message_id)
-                wait_state = dict(result.task.metadata.get("wait_state") or {})
-                wait_state["prompt_message_id"] = prompt_message_id
-                result.task.metadata["wait_state"] = wait_state
-                if (
-                    self._agent_loop.memory is not None
-                    and hasattr(self._agent_loop.memory, "mark_task_waiting")
-                ):
-                    await self._agent_loop.memory.mark_task_waiting(
-                        task_id,
-                        metadata=result.task.metadata,
-                        question=result.question or "",
-                    )
+            suspended = self._agent_loop.wait_registry.get(task_id) if task_id else None
+            prompt_message_id = suspended.prompt_message_id if suspended is not None else None
+            if prompt_message_id is None:
+                prompt_message_id = await self._send_waiting_prompt(
+                    message,
+                    result.question or "I need more information.",
+                )
+            if task_id and prompt_message_id is not None and (suspended is None or suspended.prompt_message_id is None):
+                await self._record_waiting_prompt(
+                    task_id=task_id,
+                    metadata=result.task.metadata,
+                    question=result.question or "",
+                    prompt_message_id=prompt_message_id,
+                )
             await self._mark_task_waiting(message)
             return
 

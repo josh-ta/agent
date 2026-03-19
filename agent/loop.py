@@ -570,6 +570,10 @@ class AgentLoop:
                     TaskWaitingEvent(
                         question=run_result.question or "",
                         timeout_s=run_result.timeout_s,
+                        task_id=task_id,
+                        source=task.source,
+                        channel_id=task.channel_id,
+                        deliver_inline_reply=task.response_future is not None,
                     )
                 )
                 return TaskResult(

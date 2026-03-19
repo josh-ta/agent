@@ -177,6 +177,9 @@ class TaskWaitingEvent:
     question: str
     timeout_s: int
     task_id: str | None = None
+    source: str = ""
+    channel_id: int = 0
+    deliver_inline_reply: bool = False
     kind: str = field(default="task_waiting", init=False)
 
 

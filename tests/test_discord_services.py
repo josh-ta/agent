@@ -17,9 +17,11 @@ from agent.events import (
     ShellStartEvent,
     TaskErrorEvent,
     TaskStartEvent,
+    TaskWaitingEvent,
     TextTurnEndEvent,
     ThinkingEndEvent,
     ToolCallStartEvent,
+    bridge,
 )
 from agent.loop import TaskResult
 from agent.task_waits import TaskWaitRegistry
@@ -981,6 +983,80 @@ async def test_message_service_waiting_without_prompt_id_skips_binding_and_memor
     assert pending[0].prompt_message_id is None
     assert loop.memory.waiting_calls == 0
     assert message.reactions == ["👀", "⏸️"]
+
+
+@pytest.mark.asyncio
+async def test_background_waiting_event_prompts_channel_and_persists_prompt_id(
+    fake_client,
+    discord_channels,
+) -> None:
+    class _MemorySpy:
+        def __init__(self) -> None:
+            self.waiting: list[dict] = []
+
+        async def mark_task_waiting(self, task_id: str, *, metadata: dict, question: str) -> None:
+            self.waiting.append({"task_id": task_id, "metadata": dict(metadata), "question": question})
+
+    loop = _ReadyLoop()
+    loop.memory = _MemorySpy()
+    MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    loop.wait_registry.suspend(
+        task_id="task-wait",
+        source="discord",
+        author="Josh",
+        content="deploy it",
+        channel_id=discord_channels["private"].id,
+        message_id=7,
+        metadata={
+            "task_id": "task-wait",
+            "wait_state": {
+                "question": "Which environment?",
+                "timeout_s": 90,
+                "channel_id": discord_channels["private"].id,
+                "message_id": 7,
+                "prompt_message_id": None,
+            },
+        },
+        question="Which environment?",
+        timeout_s=90,
+        base_prompt="",
+        tier="smart",
+    )
+
+    await bridge.emit(
+        TaskWaitingEvent(
+            question="Which environment?",
+            timeout_s=90,
+            task_id="task-wait",
+            source="discord",
+            channel_id=discord_channels["private"].id,
+            deliver_inline_reply=False,
+        )
+    )
+
+    pending = loop.wait_registry.pending_for_channel(discord_channels["private"].id)
+    assert discord_channels["private"].sent == ["❓ Which environment?"]
+    assert pending[0].prompt_message_id == 1
+    assert loop.memory.waiting == [
+        {
+            "task_id": "task-wait",
+            "metadata": {
+                "task_id": "task-wait",
+                "wait_state": {
+                    "question": "Which environment?",
+                    "timeout_s": 90,
+                    "channel_id": discord_channels["private"].id,
+                    "message_id": 7,
+                    "prompt_message_id": 1,
+                },
+            },
+            "question": "Which environment?",
+        }
+    ]
 
 
 @pytest.mark.asyncio
