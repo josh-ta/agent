@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from agent.events import EventBridge, ProgressEvent
@@ -65,3 +67,25 @@ async def test_event_bridge_applies_task_context_to_events() -> None:
         await bridge.emit(ProgressEvent(message="working"))
 
     assert seen == ["task-123"]
+
+
+@pytest.mark.asyncio
+async def test_event_bridge_times_out_slow_sink_without_blocking_fast_sink() -> None:
+    bridge = EventBridge(sink_timeout_s=0.1)
+    seen: list[str] = []
+    slow_started = asyncio.Event()
+
+    async def slow_sink(event) -> None:
+        slow_started.set()
+        await asyncio.sleep(60)
+
+    async def fast_sink(event) -> None:
+        seen.append(event.message)
+
+    bridge.register("slow", slow_sink)
+    bridge.register("fast", fast_sink)
+
+    await bridge.emit(ProgressEvent(message="still works"))
+
+    assert slow_started.is_set()
+    assert seen == ["still works"]

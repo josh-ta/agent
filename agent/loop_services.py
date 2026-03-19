@@ -34,6 +34,9 @@ from agent.attachment_ingest import inline_prompt_parts_from_metadata, render_at
 from agent.config import settings
 from agent.events import (
     ProgressEvent,
+    ShellDoneEvent,
+    ShellOutputEvent,
+    ShellStartEvent,
     TextDeltaEvent,
     TextTurnEndEvent,
     ThinkingDeltaEvent,
@@ -271,11 +274,20 @@ class RunExecutor:
         journal: TaskJournal | None = None,
         summarize_context: Callable[["Task", str], Awaitable[str]] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        progress_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        model_event_idle_timeout_s: float | None = None,
     ) -> None:
         self._bridge = event_bridge
         self._journal = journal or TaskJournal(settings.workspace_path)
         self._summarize_context = summarize_context
         self._sleep = sleep
+        self._progress_sleep = progress_sleep
+        configured_timeout = (
+            settings.model_event_idle_timeout_seconds
+            if model_event_idle_timeout_s is None
+            else model_event_idle_timeout_s
+        )
+        self._model_event_idle_timeout_s = max(1.0, float(configured_timeout))
 
     async def run(
         self,
@@ -310,16 +322,41 @@ class RunExecutor:
 
             try:
                 progress_watchdog = loop.create_task(self._progress_watchdog(progress_state))
+                activity_sink_tag = f"run_executor_activity_{id(progress_state)}"
+                if hasattr(self._bridge, "register"):
+                    self._bridge.register(
+                        activity_sink_tag,
+                        self._make_activity_sink(
+                            progress_state=progress_state,
+                            task_id=str((task.metadata or {}).get("task_id", "")).strip() or None,
+                        ),
+                    )
                 async with agent.run_mcp_servers():
                     thinking_buf: list[str] = []
                     text_buf: list[str] = []
                     is_final = False
-
-                    async for event in agent.run_stream_events(
+                    event_stream = agent.run_stream_events(
                         self._compose_user_prompt(prompt, task),
                         message_history=message_history or [],
                         usage_limits=UsageLimits(request_limit=None),
-                    ):
+                    )
+                    event_iter = event_stream.__aiter__()
+
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(
+                                anext(event_iter),
+                                timeout=self._model_event_idle_timeout_s,
+                            )
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError as exc:
+                            await self._close_event_stream(event_iter)
+                            timeout_message = self._model_timeout_message(progress_state)
+                            self._journal.append("MODEL TURN TIMEOUT", timeout_message)
+                            await self._bridge.emit(ProgressEvent(message=f"⌛ {timeout_message}"))
+                            raise RuntimeError(timeout_message) from exc
+
                         self._mark_progress_activity(progress_state)
                         if isinstance(event, PartDeltaEvent) and isinstance(event.delta, ThinkingPartDelta):
                             delta = event.delta.content_delta
@@ -486,10 +523,46 @@ class RunExecutor:
 
                 raise
             finally:
+                if 'activity_sink_tag' in locals() and hasattr(self._bridge, "unregister"):
+                    self._bridge.unregister(activity_sink_tag)
                 if progress_watchdog is not None:
                     progress_watchdog.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await progress_watchdog
+
+    @staticmethod
+    async def _close_event_stream(event_iter: object) -> None:
+        aclose = getattr(event_iter, "aclose", None)
+        if aclose is None:
+            return
+        with contextlib.suppress(Exception):
+            await aclose()
+
+    def _model_timeout_message(self, progress_state: dict[str, object]) -> str:
+        activity = str(progress_state.get("activity") or "waiting for the model")
+        return (
+            "Model turn timed out after "
+            f"{self._model_event_idle_timeout_s:.0f}s without a new model event while {activity}."
+        )
+
+    def _make_activity_sink(
+        self,
+        *,
+        progress_state: dict[str, object],
+        task_id: str | None,
+    ):
+        async def sink(event: object) -> None:
+            event_task_id = getattr(event, "task_id", None)
+            if task_id is not None and event_task_id not in {None, task_id}:
+                return
+            if isinstance(event, ShellStartEvent):
+                self._set_progress_activity(progress_state, "waiting on shell command output")
+            elif isinstance(event, ShellOutputEvent):
+                self._set_progress_activity(progress_state, "streaming shell output")
+            elif isinstance(event, ShellDoneEvent):
+                self._set_progress_activity(progress_state, "reviewing shell results")
+
+        return sink
 
     @staticmethod
     def _parse_tool_args(raw_args: object) -> object:
@@ -598,7 +671,7 @@ class RunExecutor:
     async def _progress_watchdog(self, progress_state: dict[str, object]) -> None:
         interval_s = max(1, int(settings.progress_heartbeat_seconds))
         while True:
-            await self._sleep(interval_s)
+            await self._progress_sleep(interval_s)
             now = asyncio.get_running_loop().time()
             last_activity_at = float(progress_state["last_activity_at"])
             if now - last_activity_at < interval_s:

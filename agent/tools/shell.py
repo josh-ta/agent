@@ -19,6 +19,7 @@ Streaming:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 from pathlib import Path
@@ -137,30 +138,39 @@ async def shell_run(
                 output_chunks.append(raw_line)
                 total_bytes += len(raw_line)
 
+        reader_task = asyncio.create_task(_read_stream())
+
+        def _remaining_timeout() -> float:
+            return max(0.0, timeout - (time.monotonic() - start_time))
+
         try:
-            await asyncio.wait_for(_read_stream(), timeout=timeout)
-            await proc.wait()
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            remaining = _remaining_timeout()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(asyncio.shield(reader_task), timeout=remaining)
         except asyncio.TimeoutError:
             timed_out = True
             proc.kill()
-            # Drain any remaining output after kill — bounded to 5s to avoid hanging
-            async def _drain_after_kill() -> None:
-                try:
-                    assert proc.stdout is not None
-                    async for raw_line in proc.stdout:
-                        await bridge.emit(ShellOutputEvent(chunk=raw_line.decode("utf-8", errors="replace")))
-                        output_chunks.append(raw_line)
-                        total_bytes += len(raw_line)
-                except Exception:
-                    pass
             try:
-                await asyncio.wait_for(_drain_after_kill(), timeout=5)
+                await asyncio.wait_for(proc.wait(), timeout=3)
             except asyncio.TimeoutError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(reader_task), timeout=5)
+            except asyncio.TimeoutError:
+                reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader_task
+            except Exception:
                 pass
             try:
                 await asyncio.wait_for(proc.communicate(), timeout=3)
             except asyncio.TimeoutError:
                 pass
+        else:
+            if not reader_task.done():
+                await reader_task
 
         elapsed_s = time.monotonic() - start_time
         exit_code = proc.returncode if proc.returncode is not None else -1

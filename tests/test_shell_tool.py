@@ -225,11 +225,15 @@ async def test_shell_run_timeout_drain_and_communicate_timeouts(monkeypatch: pyt
     async def fake_wait_for(awaitable, timeout):
         calls["wait_for"] += 1
         if calls["wait_for"] == 1:
-            awaitable.close()
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
             raise asyncio.TimeoutError
         if calls["wait_for"] == 2:
             return await awaitable
-        awaitable.close()
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
         raise asyncio.TimeoutError
 
     monkeypatch.setattr(shell_module.settings, "workspace_path", isolated_paths["workspace"])
@@ -265,10 +269,14 @@ async def test_shell_run_timeout_handles_drain_timeout(monkeypatch: pytest.Monke
     async def fake_wait_for(awaitable, timeout):
         calls["wait_for"] += 1
         if calls["wait_for"] == 1:
-            awaitable.close()
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
             raise asyncio.TimeoutError
         if calls["wait_for"] == 2:
-            awaitable.close()
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
             raise asyncio.TimeoutError
         return await awaitable
 
@@ -279,3 +287,46 @@ async def test_shell_run_timeout_handles_drain_timeout(monkeypatch: pytest.Monke
     result = await shell_run("echo hi", timeout=1)
 
     assert result.startswith("[TIMEOUT after 1s]")
+
+
+@pytest.mark.asyncio
+async def test_shell_run_times_out_when_process_exits_but_stream_never_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_paths,
+) -> None:
+    class _Stdout:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(60)
+            raise StopAsyncIteration
+
+    class _Proc:
+        def __init__(self) -> None:
+            self.stdout = _Stdout()
+            self.returncode = 0
+            self.kill_called = False
+
+        def kill(self) -> None:
+            self.kill_called = True
+            self.returncode = 143
+
+        async def wait(self) -> None:
+            return None
+
+        async def communicate(self):
+            return (b"", b"")
+
+    proc = _Proc()
+
+    async def fake_create_subprocess_shell(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(shell_module.settings, "workspace_path", isolated_paths["workspace"])
+    monkeypatch.setattr(shell_module.asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+
+    result = await shell_run("echo hi", timeout=1)
+
+    assert result.startswith("[TIMEOUT after 1s]")
+    assert proc.kill_called is True

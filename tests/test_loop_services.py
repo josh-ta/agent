@@ -219,6 +219,17 @@ class _SlowFinalAgent:
         yield final
 
 
+class _HungStreamAgent:
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        del prompt, message_history, usage_limits
+        await asyncio.sleep(60)
+        if False:
+            yield None
+
+
 class _ContextOverflowAgent:
     def __init__(self) -> None:
         self.calls = 0
@@ -772,6 +783,26 @@ async def test_run_executor_emits_idle_progress_when_task_goes_quiet(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_run_executor_times_out_stalled_model_turn() -> None:
+    bridge = _Bridge()
+    executor = RunExecutor(event_bridge=bridge, model_event_idle_timeout_s=1)
+    agent = _HungStreamAgent()
+
+    with pytest.raises(RuntimeError, match="Model turn timed out"):
+        await executor.run(
+            task=Task(content="hang forever"),
+            agent=agent,  # type: ignore[arg-type]
+            base_prompt="hang forever",
+            tier="smart",
+        )
+
+    assert any(
+        isinstance(event, ProgressEvent) and "Model turn timed out" in event.message
+        for event in bridge.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_executor_progress_watchdog_skips_recent_activity(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "progress_heartbeat_seconds", 1)
     bridge = _Bridge()
@@ -790,7 +821,7 @@ async def test_run_executor_progress_watchdog_skips_recent_activity(monkeypatch:
             raise asyncio.CancelledError
 
     monkeypatch.setattr(asyncio, "get_running_loop", lambda: _Loop())
-    executor = RunExecutor(event_bridge=bridge, sleep=fake_sleep)
+    executor = RunExecutor(event_bridge=bridge, progress_sleep=fake_sleep)
 
     with pytest.raises(asyncio.CancelledError):
         await executor._progress_watchdog({"last_activity_at": 0.0, "activity": "thinking"})

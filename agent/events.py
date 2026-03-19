@@ -45,6 +45,8 @@ from typing import Any, Awaitable, Callable, Iterator, Union
 
 import structlog
 
+from agent.config import settings
+
 log = structlog.get_logger()
 
 SinkFn = Callable[["AgentEvent"], Awaitable[None]]
@@ -236,12 +238,14 @@ class EventBridge:
     and logged — they never propagate back to the emitter.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, sink_timeout_s: float | None = None) -> None:
         self._sinks: dict[str, SinkFn] = {}
         self._task_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
             "agent_task_id",
             default=None,
         )
+        configured_timeout = settings.event_sink_timeout_seconds if sink_timeout_s is None else sink_timeout_s
+        self._sink_timeout_s = max(0.1, float(configured_timeout))
 
     def register(self, tag: str, sink: SinkFn) -> None:
         """Register a sink under a unique tag. Replaces any existing sink with that tag."""
@@ -267,16 +271,24 @@ class EventBridge:
                 setattr(event, "task_id", task_id)
         if not self._sinks:
             return
-        sinks = list(self._sinks.values())
-        results = await asyncio.gather(
-            *(s(event) for s in sinks),
-            return_exceptions=True,
-        )
+        sinks = list(self._sinks.items())
+
+        async def _deliver(tag: str, sink: SinkFn) -> Exception | None:
+            try:
+                await asyncio.wait_for(sink(event), timeout=self._sink_timeout_s)
+            except asyncio.TimeoutError:
+                return TimeoutError(f"sink '{tag}' timed out after {self._sink_timeout_s:.1f}s")
+            except Exception as exc:
+                return exc
+            return None
+
+        results = await asyncio.gather(*(_deliver(tag, sink) for tag, sink in sinks))
         for i, result in enumerate(results):
-            if isinstance(result, Exception):
+            if result is not None:
                 log.warning(
                     "event_sink_error",
                     event_kind=event.kind,
+                    sink_tag=sinks[i][0],
                     sink_index=i,
                     error=str(result),
                 )
