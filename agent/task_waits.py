@@ -12,7 +12,7 @@ import structlog
 log = structlog.get_logger()
 
 
-@dataclass(frozen=True)
+@dataclass
 class UserInputRequired(Exception):
     question: str
     timeout_s: int = 300

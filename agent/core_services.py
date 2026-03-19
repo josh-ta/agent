@@ -127,7 +127,9 @@ For tasks with more than ~5 tool calls, use the task journal:
 - After a rate limit or interruption, resume with task_resume().
 
 ## Git / GitHub
-- Clone repos to /workspace/<repo-name> (NOT /tmp).
+- Use the existing checkout in WORKSPACE_PATH when one is already present.
+- Before repo-specific git/gh commands, discover the repo root with `git rev-parse --show-toplevel`, `pwd`, or `ls`.
+- Only use `/workspace/<repo-name>` after you clone that repo yourself.
 - `gh` CLI is pre-authenticated via GH_TOKEN env var — NEVER run `gh auth login`.
 - If `gh auth status` exits 0, you ARE authenticated — proceed directly to `gh pr create`.
 - Never guess a GitHub repo slug from memory or narrative context. Use the checked-out repo, confirm the slug with `gh repo view`, or ask the user.

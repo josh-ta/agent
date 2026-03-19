@@ -57,12 +57,16 @@ async def shell_run(
     Returns:
         Combined output string with exit code appended.
     """
-    cwd = Path(working_dir) if working_dir else settings.workspace_path
     if not working_dir:
-        cwd.mkdir(parents=True, exist_ok=True)
-    elif not cwd.exists():
         cwd = settings.workspace_path
         cwd.mkdir(parents=True, exist_ok=True)
+    else:
+        requested = Path(working_dir)
+        cwd = requested if requested.is_absolute() else settings.workspace_path / requested
+        if not cwd.exists():
+            return f"[ERROR: working_dir not found: {cwd}]"
+        if not cwd.is_dir():
+            return f"[ERROR: working_dir is not a directory: {cwd}]"
 
     log.info("shell_run", command=command[:200], cwd=str(cwd), timeout=timeout)
     await bridge.emit(ShellStartEvent(command=command, cwd=str(cwd)))

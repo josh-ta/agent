@@ -33,3 +33,21 @@ async def test_shell_run_tail_lines_mode(isolated_paths) -> None:
     assert "line-3" in result
     assert "line-4" in result
     assert "line-0" not in result
+
+
+@pytest.mark.asyncio
+async def test_shell_run_resolves_relative_working_dir_against_workspace(isolated_paths) -> None:
+    subdir = isolated_paths["workspace"] / "repo"
+    subdir.mkdir()
+
+    result = await shell_run("pwd", working_dir="repo", timeout=5)
+
+    assert str(subdir) in result
+    assert "[exit code: 0]" in result
+
+
+@pytest.mark.asyncio
+async def test_shell_run_errors_for_missing_explicit_working_dir(isolated_paths) -> None:
+    result = await shell_run("pwd", working_dir="missing-repo", timeout=5)
+
+    assert result == f"[ERROR: working_dir not found: {isolated_paths['workspace'] / 'missing-repo'}]"

@@ -518,6 +518,18 @@ async def test_run_executor_returns_waiting_result_for_user_question() -> None:
     assert result.timeout_s == 120
 
 
+def test_user_input_required_allows_traceback_assignment() -> None:
+    exc = UserInputRequired("Which environment should I use?", timeout_s=120)
+
+    try:
+        raise RuntimeError("boom")
+    except RuntimeError as err:
+        exc.__traceback__ = err.__traceback__
+
+    assert str(exc) == "Which environment should I use?"
+    assert exc.timeout_s == 120
+
+
 @pytest.mark.asyncio
 async def test_run_executor_raises_after_exhausting_bad_args_retries() -> None:
     bridge = _Bridge()

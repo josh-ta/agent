@@ -37,7 +37,7 @@ streaming automatically appear in your private channel — never in comms or bus
 
 Post a JSON message to `#agent-comms` using the channel ID from your system prompt:
 ```
-send_discord(AGENT_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "barbara", "task": "Fix the frontend ESLint errors in /workspace/TicketActionApp/frontend", "payload": ""}')
+send_discord(AGENT_COMMS_CHANNEL_ID, '{"from": "YOUR_NAME", "to": "barbara", "task": "Fix the frontend ESLint errors in the checked-out frontend repo (discover the repo root first)", "payload": ""}')
 ```
 
 The channel IDs are listed in your system prompt under **Discord Channels** — use those exact numbers.

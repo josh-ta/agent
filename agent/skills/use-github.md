@@ -75,10 +75,10 @@ gh_issue_comment(42, "I looked into this — the root cause is X. PR incoming.",
 ```
 
 ## Shell fallback
-For anything not covered above, use `run_shell` with `gh` or `git` directly:
+For anything not covered above, use `run_shell` with `gh` or `git` directly. Discover the real repo root first unless you just cloned the repo yourself:
 ```
-run_shell("cd /workspace/repo && gh pr create --title '...' --body '...'")
-run_shell("cd /workspace/repo && git log --oneline -10")
+run_shell('ROOT="$(git rev-parse --show-toplevel)" && cd "$ROOT" && gh pr create --title "..." --body "..."')
+run_shell('ROOT="$(git rev-parse --show-toplevel)" && cd "$ROOT" && git log --oneline -10')
 ```
 
 ## Auth Check
@@ -88,7 +88,9 @@ run_shell("gh auth status")
 
 ## Tips
 - Always `cd` into the repo dir before raw git commands.
-- Clone repos to `/workspace/<repo-name>` (not `/tmp`).
+- Prefer the existing checkout in `WORKSPACE_PATH` when present.
+- Discover the repo root with `git rev-parse --show-toplevel` before repo-specific commands.
+- Only use `/workspace/<repo-name>` immediately after cloning that repo yourself.
 - Set git identity once per clone: `git config user.name "bob-agent" && git config user.email "bob@agent.local"`
 - `gh` CLI is pre-authenticated via `GH_TOKEN` — never run `gh auth login`.
 - Follow conventional commits: `type(scope): description`
