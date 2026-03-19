@@ -937,6 +937,32 @@ async def test_run_executor_raises_after_exhausting_bad_args_retries() -> None:
     assert all(isinstance(event, ProgressEvent) for event in bridge.events)
 
 
+@pytest.mark.asyncio
+async def test_task_context_builder_includes_attachment_context() -> None:
+    builder = TaskContextBuilder(None)
+    task = Task(
+        content="summarize the upload",
+        metadata={
+            "attachments": [
+                {
+                    "filename": "report.csv",
+                    "content_type": "text/csv",
+                    "size_bytes": 22,
+                    "saved_path": "/tmp/report.csv",
+                    "summary": "CSV preview:\nname | value",
+                    "inline_part": None,
+                }
+            ]
+        },
+    )
+
+    _, _, prompt = await builder.build(task)
+
+    assert "## Attachments" in prompt
+    assert "report.csv" in prompt
+    assert "/tmp/report.csv" in prompt
+
+
 def test_run_executor_helper_methods_cover_parsing_visibility_and_attachment_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "discord_comms_channel_id", 303)
     monkeypatch.setattr(settings, "discord_bus_channel_id", 202)
@@ -951,6 +977,11 @@ def test_run_executor_helper_methods_cover_parsing_visibility_and_attachment_ext
     assert RunExecutor._is_successful_send_discord_result("[ERROR] nope") is False
     assert RunExecutor._tool_name_from_result_event(SimpleNamespace(tool_name="from-event"), SimpleNamespace()) == "from-event"
     assert RunExecutor._tool_name_from_result_event(SimpleNamespace(tool_name=""), SimpleNamespace(tool_name="from-result")) == "from-result"
+    assert RunExecutor._sanitize_tool_args("secret_set", {"name": "LOGIN_PASSWORD", "value": "hunter2"}) == {
+        "name": "LOGIN_PASSWORD",
+        "value": "[REDACTED]",
+    }
+    assert RunExecutor._sanitize_tool_result("secret_get", "hunter2") == "[REDACTED secret value]"
     assert RunExecutor._iter_text_values(
         {
             "a": "plain",
@@ -996,6 +1027,38 @@ def test_run_executor_helper_methods_cover_more_edge_cases() -> None:
     assert RunExecutor._iter_text_values(_TextValue()) == ["plain"]
     assert RunExecutor._iter_text_values(SimpleNamespace(content=["deep"])) == ["deep"]
     assert RunExecutor._drain_queue(_QueueRace()) == []
+
+
+def test_run_executor_compose_user_prompt_loads_inline_attachment(tmp_path: Path) -> None:
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    task = Task(
+        content="look at the image",
+        metadata={
+            "attachments": [
+                {
+                    "filename": "shot.png",
+                    "content_type": "image/png",
+                    "size_bytes": 8,
+                    "saved_path": str(image_path),
+                    "summary": "Image metadata: PNG 1x1 (RGBA).",
+                    "inline_part": {
+                        "path": str(image_path),
+                        "media_type": "image/png",
+                        "identifier": "shot.png",
+                        "vendor_metadata": {"detail": "high"},
+                    },
+                }
+            ]
+        },
+    )
+
+    prompt = RunExecutor._compose_user_prompt("look at the image", task)
+
+    assert isinstance(prompt, list)
+    assert prompt[0] == "look at the image"
+    assert prompt[1].media_type == "image/png"
+    assert prompt[1].data == b"\x89PNG\r\n\x1a\n"
 
 
 @pytest.mark.asyncio

@@ -79,12 +79,13 @@ class DiscordBot:
 
     async def start_bot(self) -> None:
         """Connect to Discord and run the bot indefinitely."""
-        if not settings.discord_bot_token:
+        token = settings.secret_value(settings.discord_bot_token)
+        if not token:
             log.error("no_discord_token")
             return
 
         try:
-            await self._client.start(settings.discord_bot_token)
+            await self._client.start(token)
         except discord.LoginFailure:
             log.error("discord_login_failed")
         except asyncio.CancelledError:

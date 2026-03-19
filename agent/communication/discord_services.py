@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import discord
 import structlog
 
+from agent.attachment_ingest import ingest_discord_attachments
 from agent.communication.message_router import (
     MessageKind,
     ParsedMessage,
@@ -62,6 +63,10 @@ SILENT_TOOLS = frozenset(
         "skill_list",
         "skill_read",
         "db_stats",
+        "secret_list",
+        "secret_set",
+        "secret_get",
+        "secret_delete",
     }
 )
 
@@ -249,7 +254,36 @@ class MessageHandlingService:
             except discord.HTTPException:
                 return None
 
-    def _maybe_resume_waiting_discord_task(self, message: discord.Message) -> Task | None:
+    async def _build_task_input(
+        self,
+        message: discord.Message,
+        *,
+        base_content: str,
+    ) -> tuple[str, dict[str, Any], str]:
+        task_content = base_content.strip()
+        attachment_metadata: dict[str, Any] = {}
+        combined_content = task_content
+        attachments = getattr(message, "attachments", None) or []
+        if attachments:
+            bundle = await ingest_discord_attachments(
+                attachments,
+                root=settings.attachments_path,
+                storage_key=f"discord-{message.channel.id}-{message.id}",
+                max_bytes=settings.attachment_max_bytes,
+                text_char_cap=settings.attachment_text_char_cap,
+            )
+            if bundle.metadata:
+                attachment_metadata["attachments"] = bundle.metadata
+                if not task_content:
+                    task_content = "Please inspect the attached file(s) and help with them."
+                combined_content = (
+                    f"{task_content}\n\n---\n\n{bundle.prompt_text}"
+                    if bundle.prompt_text
+                    else task_content
+                )
+        return task_content, attachment_metadata, combined_content
+
+    async def _maybe_resume_waiting_discord_task(self, message: discord.Message) -> Task | None:
         reference = getattr(getattr(message, "reference", None), "message_id", None)
         suspended = self._agent_loop.wait_registry.pop_for_discord_reply(
             channel_id=message.channel.id,
@@ -257,11 +291,16 @@ class MessageHandlingService:
         )
         if suspended is None:
             return None
+        answer, attachment_metadata, combined_answer = await self._build_task_input(
+            message,
+            base_content=message.content,
+        )
         return self._agent_loop.build_resumed_task(
             suspended=suspended,
-            answer=message.content.strip(),
+            answer=combined_answer or answer,
             author=getattr(message.author, "display_name", "user"),
             source="discord",
+            metadata_overrides=attachment_metadata,
         )
 
     async def handle_message(self, message: discord.Message) -> None:
@@ -276,6 +315,10 @@ class MessageHandlingService:
             if parsed.kind == MessageKind.A2A and parsed.a2a_payload
             else parsed.content
         )
+        task_content, attachment_metadata, combined_content = await self._build_task_input(
+            message,
+            base_content=task_content,
+        )
         if not task_content.strip():
             return
 
@@ -285,14 +328,15 @@ class MessageHandlingService:
             channel_id=parsed.channel_id,
             message_id=parsed.message_id,
             reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
-            content=task_content,
+            content=combined_content,
             metadata={
                 "session_id": self._active_sessions.get(parsed.channel_id, ""),
+                **attachment_metadata,
             },
             has_active_task=parsed.channel_id in self._inject_queues,
             wait_registry=self._agent_loop.wait_registry,
         )
-        resumed_task = self._maybe_resume_waiting_discord_task(message)
+        resumed_task = await self._maybe_resume_waiting_discord_task(message)
         if resumed_task is not None:
             await self._acknowledge_message(message)
             task_id = str(resumed_task.metadata.get("task_id", "")).strip()
@@ -302,7 +346,7 @@ class MessageHandlingService:
                 await self._agent_loop.memory.append_session_turn(
                     session_id=str((resumed_task.metadata or {}).get("session_id", "")),
                     role="user",
-                    content=message.content.strip(),
+                    content=combined_content,
                     turn_kind="answer",
                     task_id=task_id,
                     metadata={"author": getattr(message.author, "display_name", "user")},
@@ -347,7 +391,7 @@ class MessageHandlingService:
                         pass
                 await inject_q.put("User asked to pause/cancel after the current step.")
                 return
-            await inject_q.put(task_content)
+            await inject_q.put(combined_content)
             await self._acknowledge_message(message)
             if allows_inline_reply(parsed.channel_id):
                 try:
@@ -369,7 +413,7 @@ class MessageHandlingService:
                 channel_id=parsed.channel_id,
                 message_id=parsed.message_id,
                 reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
-                metadata={},
+                metadata=attachment_metadata,
             )
             if "task_id" not in metadata:
                 metadata["task_id"] = f"discord-{parsed.channel_id}-{parsed.message_id}"
@@ -412,7 +456,7 @@ class MessageHandlingService:
             channel_id=parsed.channel_id,
             message_id=parsed.message_id,
             reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
-            metadata={},
+                metadata=attachment_metadata,
         )
         metadata["task_id"] = metadata.get("task_id") or f"discord-{parsed.channel_id}-{parsed.message_id}"
         self._active_sessions[parsed.channel_id] = metadata["session_id"]

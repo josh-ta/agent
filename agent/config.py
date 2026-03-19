@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,10 +17,10 @@ class Settings(BaseSettings):
     )
 
     # ── LLM ───────────────────────────────────────────────────────────────────
-    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
-    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    mistral_api_key: str = Field(default="", alias="MISTRAL_API_KEY")
-    xai_api_key: str = Field(default="", alias="XAI_API_KEY")
+    anthropic_api_key: SecretStr = Field(default=SecretStr(""), alias="ANTHROPIC_API_KEY")
+    openai_api_key: SecretStr = Field(default=SecretStr(""), alias="OPENAI_API_KEY")
+    mistral_api_key: SecretStr = Field(default=SecretStr(""), alias="MISTRAL_API_KEY")
+    xai_api_key: SecretStr = Field(default=SecretStr(""), alias="XAI_API_KEY")
     agent_model: str = Field(default="claude-haiku-4-5", alias="AGENT_MODEL")
     # Embedding model used for semantic memory search (requires OPENAI_API_KEY)
     embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     agent_name: str = Field(default="agent-1", alias="AGENT_NAME")
 
     # ── Discord ───────────────────────────────────────────────────────────────
-    discord_bot_token: str = Field(default="", alias="DISCORD_BOT_TOKEN")
+    discord_bot_token: SecretStr = Field(default=SecretStr(""), alias="DISCORD_BOT_TOKEN")
     discord_agent_channel_id: int = Field(default=0, alias="DISCORD_AGENT_CHANNEL_ID")
     discord_bus_channel_id: int = Field(default=0, alias="DISCORD_BUS_CHANNEL_ID")
     discord_comms_channel_id: int = Field(default=0, alias="DISCORD_COMMS_CHANNEL_ID")
@@ -74,6 +74,11 @@ class Settings(BaseSettings):
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     workspace_path: Path = Field(default=Path("/workspace"), alias="WORKSPACE_PATH")
+    attachments_path: Path = Field(default=Path("/data/attachments"), alias="ATTACHMENTS_PATH")
+    agent_secrets_path: Path = Field(
+        default=Path("/data/agent-secrets.json"),
+        alias="AGENT_SECRETS_PATH",
+    )
     skills_path: Path = Field(
         default=Path("/app/agent/skills"), alias="SKILLS_PATH"
     )
@@ -91,6 +96,8 @@ class Settings(BaseSettings):
     heartbeat_seconds: int = Field(default=60, alias="HEARTBEAT_SECONDS")
     progress_heartbeat_seconds: int = Field(default=20, alias="PROGRESS_HEARTBEAT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    attachment_max_bytes: int = Field(default=10_000_000, alias="ATTACHMENT_MAX_BYTES")
+    attachment_text_char_cap: int = Field(default=12_000, alias="ATTACHMENT_TEXT_CHAR_CAP")
 
     # ── Retention / cleanup ───────────────────────────────────────────────────
     # SQLite
@@ -135,7 +142,7 @@ class Settings(BaseSettings):
 
     @property
     def has_discord(self) -> bool:
-        return bool(self.discord_bot_token)
+        return bool(self.secret_value(self.discord_bot_token))
 
     @property
     def has_postgres(self) -> bool:
@@ -144,7 +151,13 @@ class Settings(BaseSettings):
     @property
     def has_embeddings(self) -> bool:
         """True when we can generate embeddings (needs OpenAI key)."""
-        return bool(self.openai_api_key)
+        return bool(self.secret_value(self.openai_api_key))
+
+    @staticmethod
+    def secret_value(value: SecretStr | str) -> str:
+        if isinstance(value, SecretStr):
+            return value.get_secret_value()
+        return value
 
 
 # Singleton

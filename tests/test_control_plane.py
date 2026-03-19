@@ -130,8 +130,18 @@ class _FakeLoop:
     async def enqueue(self, task: Task) -> None:
         self.enqueued.append(task)
 
-    def build_resumed_task(self, *, suspended: SuspendedTask, answer: str, author: str, source: str) -> Task:
+    def build_resumed_task(
+        self,
+        *,
+        suspended: SuspendedTask,
+        answer: str,
+        author: str,
+        source: str,
+        metadata_overrides=None,
+    ) -> Task:
         metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         return Task(content=suspended.content, source=source, author=author, metadata=metadata)
 
 

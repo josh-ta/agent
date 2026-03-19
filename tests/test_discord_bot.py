@@ -73,8 +73,10 @@ class _FakeLoop:
     async def _process(self, task) -> TaskResult:  # pragma: no cover - should never be called
         raise AssertionError("DiscordBot should enqueue work instead of calling _process directly")
 
-    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
         metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 

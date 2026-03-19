@@ -689,7 +689,7 @@ async def _embed(text: str) -> list[float] | None:
         return None
     try:
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(api_key=settings.secret_value(settings.openai_api_key))
         resp = await client.embeddings.create(
             model=settings.embedding_model,
             input=text,

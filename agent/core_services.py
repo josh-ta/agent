@@ -116,6 +116,14 @@ class SystemPromptBuilder:
     d. Poll read_discord({comms_id}) periodically until you see their result ("task": "result").
     e. Combine both results in your final reply.
     Do not delegate trivial work, solo work, or work you have already started.
+16. Secrets are available via secret tools and secret-aware browser tools:
+    - Never reveal secret values in Discord, task notes, memory, files, or final answers.
+    - Never paste secrets into shell commands when a secret-aware tool can do the job.
+    - Use secret_list() to discover names, secret_get(name) only when raw text is unavoidable,
+      and browser_fill_secret/browser_type_secret for login forms.
+17. If the user message includes attachments, inspect the attachment summary/path context first.
+    Use read_file on saved attachment paths when you need deeper inspection. Images and PDFs may
+    already be attached to the model input, so reason over them directly when helpful.
 
 ## Long tasks — checkpointing (IMPORTANT)
 For tasks with more than ~5 tool calls, use the task journal:
@@ -191,19 +199,19 @@ class ModelFactory:
             return self._build_openai_compatible_model(
                 model_string.split(":", 1)[1],
                 base_url=settings.xai_base_url,
-                api_key=settings.xai_api_key,
+                api_key=settings.secret_value(settings.xai_api_key),
             )
         if model_string.startswith("mistral:"):
             return self._build_openai_compatible_model(
                 model_string.split(":", 1)[1],
                 base_url=settings.mistral_base_url,
-                api_key=settings.mistral_api_key,
+                api_key=settings.secret_value(settings.mistral_api_key),
             )
         if model_string.startswith("openai:") and settings.openai_base_url:
             return self._build_openai_compatible_model(
                 model_string.split(":", 1)[1],
                 base_url=settings.openai_base_url,
-                api_key=settings.openai_api_key,
+                api_key=settings.secret_value(settings.openai_api_key),
             )
         return model_string
 

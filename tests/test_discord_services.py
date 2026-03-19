@@ -23,7 +23,7 @@ from agent.events import (
 )
 from agent.loop import TaskResult
 from agent.task_waits import TaskWaitRegistry
-from tests.conftest import FakeChannel, FakeSentMessage
+from tests.conftest import FakeChannel, FakeDiscordAttachment, FakeSentMessage
 
 
 class _BusyLoop:
@@ -37,8 +37,10 @@ class _BusyLoop:
     async def enqueue(self, task) -> None:
         self.enqueued = task
 
-    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
         metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
@@ -55,8 +57,10 @@ class _ReadyLoop:
             TaskResult(task=task, output="finished", success=True, elapsed_ms=1.0)
         )
 
-    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
         metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
@@ -159,6 +163,43 @@ async def test_message_service_uses_next_position_when_single_item_ahead(fake_cl
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert "next up" in message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_message_service_enqueues_attachment_only_message(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(settings, "attachments_path", tmp_path)
+    service = MessageHandlingService(
+        agent_loop=_BusyLoop(),  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    message = fake_message_factory(
+        channel=discord_channels["private"],
+        content="",
+        attachments=[
+            FakeDiscordAttachment(
+                filename="report.csv",
+                data=b"name,value\nfoo,1\nbar,2\n",
+                content_type="text/csv",
+            )
+        ],
+    )
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+
+    assert service._agent_loop.enqueued is not None
+    assert service._agent_loop.enqueued.content == "Please inspect the attached file(s) and help with them."
+    attachments = service._agent_loop.enqueued.metadata["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0]["filename"] == "report.csv"
+    assert "CSV preview" in attachments[0]["summary"]
+    assert message.reactions == ["👀"]
 
 
 @pytest.mark.asyncio
@@ -1010,8 +1051,10 @@ async def test_message_service_skips_sending_reply_for_empty_or_already_sent_res
         async def enqueue(self, task) -> None:
             task.response_future.set_result(results.pop(0))
 
-        def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+        def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
             metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+            if metadata_overrides:
+                metadata.update(metadata_overrides)
             return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
     service = MessageHandlingService(
@@ -1069,8 +1112,10 @@ async def test_message_service_sends_attachment_only_results_through_send_reply(
         async def enqueue(self, task) -> None:
             task.response_future.set_result(results.pop(0))
 
-        def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+        def build_resumed_task(self, *, suspended, answer: str, author: str, source: str, metadata_overrides=None):
             metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+            if metadata_overrides:
+                metadata.update(metadata_overrides)
             return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
     service = MessageHandlingService(

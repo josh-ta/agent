@@ -268,12 +268,22 @@ class AgentLoop:
         task = Task(content=content, source=source)
         return await self._process(task)
 
-    def build_resumed_task(self, *, suspended: SuspendedTask, answer: str, author: str, source: str) -> Task:
+    def build_resumed_task(
+        self,
+        *,
+        suspended: SuspendedTask,
+        answer: str,
+        author: str,
+        source: str,
+        metadata_overrides: dict[str, Any] | None = None,
+    ) -> Task:
         metadata = self.wait_registry.build_resumed_metadata(
             suspended,
             answer=answer,
             resumed_from=source,
         )
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         return Task(
             content=suspended.content,
             source=suspended.source if suspended.source != "api" else source,

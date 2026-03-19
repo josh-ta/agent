@@ -6,6 +6,7 @@ import structlog
 from pydantic_ai import Agent
 
 from agent.config import settings
+from agent.secret_store import SecretNotFoundError, SecretStore, SecretStoreError, mask_secret
 from agent.tools import filesystem, github, self_edit, shell
 from agent.events import current_task_id
 from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
@@ -30,6 +31,7 @@ def attach_all_tools(
     attach_discord_tools(agent)
     attach_github_tools(agent)
     attach_database_tools(agent, sqlite=sqlite, postgres=postgres)
+    attach_secret_tools(agent)
     log.info("tools_attached_to_agent")
 
 
@@ -245,6 +247,43 @@ def attach_github_tools(agent: Agent) -> None:  # type: ignore[type-arg]
     @agent.tool_plain
     async def gh_ci_rerun(run_id: str, failed_only: bool = True, repo: str = "") -> str:
         return await github.ci_rerun(run_id, failed_only, repo or None)
+
+
+def attach_secret_tools(agent: Agent) -> None:  # type: ignore[type-arg]
+    def _store() -> SecretStore:
+        return SecretStore(settings.agent_secrets_path)
+
+    @agent.tool_plain
+    def secret_list() -> str:
+        names = _store().list_names()
+        if not names:
+            return "(no secrets stored)"
+        return "## Stored secrets\n" + "\n".join(f"- {name}" for name in names)
+
+    @agent.tool_plain
+    def secret_set(name: str, value: str) -> str:
+        try:
+            _store().set(name, value)
+            return f"Stored secret `{name}` = {mask_secret(value)}"
+        except (SecretStoreError, ValueError) as exc:
+            return f"[ERROR: {exc}]"
+
+    @agent.tool_plain
+    def secret_get(name: str) -> str:
+        try:
+            return _store().get(name)
+        except SecretNotFoundError:
+            return f"[ERROR: secret not found: {name}]"
+        except (SecretStoreError, ValueError) as exc:
+            return f"[ERROR: {exc}]"
+
+    @agent.tool_plain
+    def secret_delete(name: str) -> str:
+        try:
+            removed = _store().delete(name)
+            return f"Deleted secret `{name}`." if removed else f"[ERROR: secret not found: {name}]"
+        except (SecretStoreError, ValueError) as exc:
+            return f"[ERROR: {exc}]"
 
 
 def attach_database_tools(

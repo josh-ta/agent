@@ -30,6 +30,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import UsageLimits
 
+from agent.attachment_ingest import inline_prompt_parts_from_metadata, render_attachment_context
 from agent.config import settings
 from agent.events import (
     ProgressEvent,
@@ -127,6 +128,7 @@ class TaskContextBuilder:
         channel_context = await self._load_channel_history(normalized_task) if not session_context else ""
         resume_context = self._load_resume_context(normalized_task)
         checkpoint_context = await self._load_checkpoint_context(normalized_task)
+        attachment_context = self._load_attachment_context(normalized_task)
 
         parts: list[str] = []
         if session_context:
@@ -141,6 +143,8 @@ class TaskContextBuilder:
             parts.append(checkpoint_context)
         if resume_context:
             parts.append(resume_context)
+        if attachment_context:
+            parts.append(attachment_context)
         parts.append(normalized_task.content)
         return normalized_task, tier, "\n\n---\n\n".join(parts)
 
@@ -251,6 +255,13 @@ class TaskContextBuilder:
             parts.append(f"User answer: {answer}")
         return "\n".join(parts)
 
+    @staticmethod
+    def _load_attachment_context(task: "Task") -> str:
+        attachments = (task.metadata or {}).get("attachments")
+        if not isinstance(attachments, list):
+            return ""
+        return render_attachment_context(attachments)
+
 
 class RunExecutor:
     def __init__(
@@ -305,7 +316,7 @@ class RunExecutor:
                     is_final = False
 
                     async for event in agent.run_stream_events(
-                        prompt,
+                        self._compose_user_prompt(prompt, task),
                         message_history=message_history or [],
                         usage_limits=UsageLimits(request_limit=None),
                     ):
@@ -344,7 +355,7 @@ class RunExecutor:
                                 ToolCallStartEvent(
                                     tool_name=tool_name,
                                     call_id=event.part.tool_call_id,
-                                    args=parsed_args,
+                                    args=self._sanitize_tool_args(tool_name, parsed_args),
                                 )
                             )
                         elif isinstance(event, FunctionToolResultEvent):
@@ -364,7 +375,7 @@ class RunExecutor:
                                 ToolResultEvent(
                                     tool_name=tool_name,
                                     call_id=getattr(ret, "tool_call_id", ""),
-                                    result=result_str[:500],
+                                    result=self._sanitize_tool_result(tool_name, result_str),
                                 )
                             )
 
@@ -488,6 +499,29 @@ class RunExecutor:
             except Exception:
                 return raw_args
         return raw_args
+
+    @staticmethod
+    def _compose_user_prompt(base_prompt: str, task: "Task") -> str | list[object]:
+        attachment_parts = inline_prompt_parts_from_metadata((task.metadata or {}).get("attachments", []))
+        if not attachment_parts:
+            return base_prompt
+        return [base_prompt, *attachment_parts]
+
+    @staticmethod
+    def _sanitize_tool_args(tool_name: str, args: object) -> object:
+        if tool_name == "secret_set" and isinstance(args, dict):
+            return {"name": args.get("name", ""), "value": "[REDACTED]"}
+        if tool_name in {"secret_get", "secret_delete"} and isinstance(args, dict):
+            return {"name": args.get("name", "")}
+        return args
+
+    @staticmethod
+    def _sanitize_tool_result(tool_name: str, result: str) -> str:
+        if tool_name == "secret_get":
+            return "[REDACTED secret value]"
+        if tool_name == "secret_set":
+            return "Stored secret [REDACTED]"
+        return result[:500]
 
     @staticmethod
     def _is_user_visible_discord_send(task: "Task", tool_name: str, args: object) -> bool:

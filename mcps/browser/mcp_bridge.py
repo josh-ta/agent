@@ -17,6 +17,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -24,6 +25,8 @@ from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
 from playwright.async_api import async_playwright
+
+from agent.secret_store import SecretNotFoundError, SecretStore
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,7 @@ class RuntimeDeps:
 class BridgeConfig:
     port: int
     proxy_settings: dict[str, str] | None
+    agent_secrets_path: str
     locale: str
     timezone: str
     latitude: float
@@ -107,6 +111,7 @@ def build_config(env: Mapping[str, str], argv: Sequence[str]) -> BridgeConfig:
             proxy_user=env.get("PROXY_USERNAME", ""),
             proxy_pass=env.get("PROXY_PASSWORD", ""),
         ),
+        agent_secrets_path=env.get("AGENT_SECRETS_PATH", "/data/agent-secrets.json"),
         locale=env.get("BROWSER_LOCALE", "en-US"),
         timezone=env.get("BROWSER_TIMEZONE", "America/New_York"),
         latitude=float(env.get("BROWSER_GEO_LAT", "40.7128")),
@@ -154,6 +159,7 @@ DEPS = load_optional_deps()
 
 PORT = CONFIG.port
 _PROXY_SETTINGS = CONFIG.proxy_settings
+_SECRETS_PATH = CONFIG.agent_secrets_path
 _LOCALE = CONFIG.locale
 _TIMEZONE = CONFIG.timezone
 _LAT = CONFIG.latitude
@@ -341,6 +347,30 @@ def _tool_specs() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "browser_fill_secret",
+            "description": "Clear a form field and fill it from a stored secret by name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                },
+                "required": ["selector", "secret_name"],
+            },
+        },
+        {
+            "name": "browser_type_secret",
+            "description": "Type into a form field using a stored secret by name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "secret_name": {"type": "string"},
+                },
+                "required": ["selector", "secret_name"],
+            },
+        },
+        {
             "name": "browser_scroll",
             "description": "Scroll the page or a specific element. Use direction='down'/'up'/'left'/'right' and amount in pixels, or supply a selector to scroll an element into view.",
             "inputSchema": {
@@ -364,6 +394,14 @@ def _tool_specs() -> list[dict[str, Any]]:
 
 def _text_result(text: str) -> list[TextContent]:
     return [TextContent(type="text", text=text)]
+
+
+def _read_secret(secret_name: str) -> str:
+    store = SecretStore(Path(_SECRETS_PATH))
+    try:
+        return store.get(secret_name)
+    except SecretNotFoundError as exc:
+        raise ValueError(f"Secret not found: {secret_name}") from exc
 
 
 def format_accessibility_tree(snapshot: dict[str, Any], limit: int = 8000) -> str:
@@ -431,6 +469,20 @@ async def _tool_fill(page: Any, arguments: dict[str, Any]) -> str:
     return f"Filled '{selector}' with provided value"
 
 
+async def _tool_fill_secret(page: Any, arguments: dict[str, Any]) -> str:
+    selector = arguments["selector"]
+    secret_name = arguments["secret_name"]
+    await page.fill(selector, _read_secret(secret_name), timeout=10000)
+    return f"Filled '{selector}' from secret '{secret_name}'"
+
+
+async def _tool_type_secret(page: Any, arguments: dict[str, Any]) -> str:
+    selector = arguments["selector"]
+    secret_name = arguments["secret_name"]
+    await page.fill(selector, _read_secret(secret_name), timeout=10000)
+    return f"Typed into '{selector}' from secret '{secret_name}'"
+
+
 async def _tool_scroll(page: Any, arguments: dict[str, Any]) -> str:
     selector = arguments.get("selector", "")
     if selector:
@@ -455,6 +507,8 @@ TOOL_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "browser_evaluate": _tool_evaluate,
     "browser_snapshot": _tool_snapshot,
     "browser_fill": _tool_fill,
+    "browser_fill_secret": _tool_fill_secret,
+    "browser_type_secret": _tool_type_secret,
     "browser_scroll": _tool_scroll,
 }
 

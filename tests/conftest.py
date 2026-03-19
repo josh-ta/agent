@@ -53,6 +53,20 @@ class FakeHistoryMessage:
 
 
 @dataclass
+class FakeDiscordAttachment:
+    filename: str
+    data: bytes
+    content_type: str = "application/octet-stream"
+
+    @property
+    def size(self) -> int:
+        return len(self.data)
+
+    async def read(self) -> bytes:
+        return self.data
+
+
+@dataclass
 class FakeChannel:
     id: int
     sent: list[str] = field(default_factory=list)
@@ -98,6 +112,7 @@ class FakeDiscordMessage:
     reply_messages: list[FakeSentMessage] = field(default_factory=list)
     reactions: list[str] = field(default_factory=list)
     reference: FakeMessageReference | None = None
+    attachments: list[FakeDiscordAttachment] = field(default_factory=list)
 
     async def reply(self, content: str, mention_author: bool = False) -> FakeSentMessage:
         self.replies.append(content)
@@ -197,6 +212,7 @@ def fake_message_factory() -> Any:
         content: str,
         author: FakeAuthor | None = None,
         mentions: list[Any] | None = None,
+        attachments: list[FakeDiscordAttachment] | None = None,
         message_id: int = 1,
     ) -> FakeDiscordMessage:
         return FakeDiscordMessage(
@@ -205,6 +221,7 @@ def fake_message_factory() -> Any:
             author=author or FakeAuthor(),
             id=message_id,
             mentions=mentions or [],
+            attachments=attachments or [],
         )
 
     return _factory

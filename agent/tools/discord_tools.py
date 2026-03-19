@@ -209,13 +209,13 @@ async def ask_user(question: str, timeout: int = 300) -> str:
                 for msg in candidates:
                     ref = getattr(msg, "reference", None)
                     if ref and getattr(ref, "message_id", None) == sent.id:
-                        log.info("ask_user_replied", elapsed_s=elapsed, reply=msg.content[:80])
+                        log.info("ask_user_replied", elapsed_s=elapsed)
                         return msg.content
 
                 distinct_authors = {msg.author.id for msg in candidates}
                 if len(distinct_authors) == 1 and candidates:
                     reply = candidates[-1]
-                    log.info("ask_user_replied", elapsed_s=elapsed, reply=reply.content[:80])
+                    log.info("ask_user_replied", elapsed_s=elapsed)
                     return reply.content
             except Exception as exc:
                 return f"[ERROR reading reply: {exc}]"
