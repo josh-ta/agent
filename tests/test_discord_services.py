@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import discord
 import pytest
 
 import agent.communication.discord_services as discord_services_module
 import agent.tools.discord_tools as discord_tools_module
-from agent.communication.discord_services import DiscordEventPresenter, MAX_REPLY_LEN, MessageHandlingService
+from agent.communication.discord_services import DiscordEventPresenter, MAX_REPLY_LEN, MessageHandlingService, NativeCommand
 from agent.communication.message_router import MessageKind, ParsedMessage
 from agent.config import settings
 from agent.events import (
@@ -242,6 +243,12 @@ async def test_message_service_status_command_uses_loop_snapshot(
 
     assert message.reactions == ["👀"]
     assert message.replies == ["Active: deploy\nQueued: 2"]
+
+
+def test_parse_native_command_rejects_blank_and_unknown_values() -> None:
+    assert discord_services_module.parse_native_command("/   ") is None
+    assert discord_services_module.parse_native_command("/wat") is None
+    assert discord_services_module.parse_native_command("status") is None
 
 
 @pytest.mark.asyncio
@@ -617,6 +624,213 @@ async def test_message_service_injects_pause_request_for_active_task(
     assert loop.cancelled
     assert message.reactions == ["👀"]
     assert "stop after the current step" in message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_message_service_native_command_helper_paths(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+) -> None:
+    loop = _ReadyLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["private"].id)
+
+    help_message = fake_message_factory(channel=discord_channels["private"], content="/help")
+    handled = await service._handle_native_command(
+        message=help_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="help"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert handled is True
+    assert "/replace <task>" in help_message.replies[0]
+
+    queue_message = fake_message_factory(channel=discord_channels["private"], content="/queue run tests")
+    handled = await service._handle_native_command(
+        message=queue_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="queue", argument="run tests"),
+        task_content="run tests",
+        attachment_metadata={},
+    )
+    await asyncio.sleep(0)
+    assert handled is True
+    assert loop.enqueued is not None
+    assert queue_message.replies[0] == "📝 Queued that task."
+    assert queue_message.replies[-1] == "finished"
+
+    usage_message = fake_message_factory(channel=discord_channels["private"], content="/queue")
+    handled = await service._handle_native_command(
+        message=usage_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="queue"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert handled is True
+    assert usage_message.replies == ["Usage: `/queue <task>`"]
+
+    public_message = fake_message_factory(channel=discord_channels["bus"], content="/help")
+    public_parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["bus"].id)
+    handled = await service._handle_native_command(
+        message=public_message,  # type: ignore[arg-type]
+        parsed=public_parsed,
+        command=NativeCommand(name="help"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert handled is False
+
+
+@pytest.mark.asyncio
+async def test_message_service_resume_and_cancel_command_branches(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+) -> None:
+    class _LoopNoCancel(_ReadyLoop):
+        async def clear_queued_tasks(self, *, source=None, channel_id=None, reason="") -> list[object]:
+            self.cleared.append((source, channel_id, reason))
+            return []
+
+        async def request_cancel_active_task(self, *, channel_id=None, reason: str) -> bool:
+            self.cancelled.append((channel_id, reason))
+            return False
+
+    loop = _LoopNoCancel()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["private"].id)
+
+    none_waiting = fake_message_factory(channel=discord_channels["private"], content="/resume")
+    await service._handle_native_command(
+        message=none_waiting,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="resume"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert "no suspended question" in none_waiting.replies[0]
+
+    loop.wait_registry.suspend(
+        task_id="task-one",
+        source="discord",
+        author="Josh",
+        content="deploy",
+        channel_id=discord_channels["private"].id,
+        message_id=1,
+        metadata={"task_id": "task-one"},
+        question="Which environment?",
+        timeout_s=300,
+        base_prompt="prompt",
+        tier="smart",
+    )
+    one_waiting = fake_message_factory(channel=discord_channels["private"], content="/resume")
+    await service._handle_native_command(
+        message=one_waiting,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="resume"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert one_waiting.replies == ["❓ Which environment?"]
+
+    loop.wait_registry.suspend(
+        task_id="task-two",
+        source="discord",
+        author="Josh",
+        content="deploy",
+        channel_id=discord_channels["private"].id,
+        message_id=2,
+        metadata={"task_id": "task-two"},
+        question="Which cluster?",
+        timeout_s=300,
+        base_prompt="prompt",
+        tier="smart",
+    )
+    many_waiting = fake_message_factory(channel=discord_channels["private"], content="/resume")
+    await service._handle_native_command(
+        message=many_waiting,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="resume"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert "more than one suspended question" in many_waiting.replies[0]
+
+    cancel_message = fake_message_factory(channel=discord_channels["private"], content="/cancel")
+    await service._handle_native_command(
+        message=cancel_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="cancel"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert "no active or queued task" in cancel_message.replies[0]
+
+    forget_message = fake_message_factory(channel=discord_channels["private"], content="/forget")
+    await service._handle_native_command(
+        message=forget_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="forget"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert "no active or queued task" in forget_message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_message_service_helper_fallbacks_and_exception_paths(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+) -> None:
+    loop = _ReadyLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+
+    service._agent_loop = SimpleNamespace(wait_registry=TaskWaitRegistry(), queue=SimpleNamespace(qsize=lambda: 0), has_pending_work=False)
+    assert await service._clear_queued_channel_tasks(channel_id=101, reason="x") == 0
+
+    service._inject_queues[101] = asyncio.Queue()
+    assert await service._request_cancel_active_task(channel_id=101, reason="stop") is True
+    assert await service._inject_queues[101].get() == "stop"
+    assert await service._request_cancel_active_task(channel_id=999, reason="stop") is False
+
+    comms_message = fake_message_factory(channel=discord_channels["comms"], content="hello")
+    await service._reply_safe(comms_message, "ignored")  # type: ignore[arg-type]
+    assert comms_message.replies == []
+
+    class _RaisingMessage:
+        channel = SimpleNamespace(id=discord_channels["private"].id)
+
+        async def reply(self, *_args, **_kwargs):
+            response = SimpleNamespace(status=400, reason="bad")
+            raise discord.HTTPException(response, "bad")
+
+    await service._reply_safe(_RaisingMessage(), "ignored")  # type: ignore[arg-type]
+
+    message = fake_message_factory(channel=discord_channels["private"], content="hello")
+    future: asyncio.Future[TaskResult] = asyncio.get_running_loop().create_future()
+    future.set_exception(RuntimeError("boom"))
+    await service._wait_for_deferred_result(
+        parsed=_parsed(MessageKind.TASK, channel_id=discord_channels["private"].id),
+        message=message,  # type: ignore[arg-type]
+        response_future=future,
+    )
+    assert message.replies == ["❌ boom"]
 
 
 @pytest.mark.asyncio

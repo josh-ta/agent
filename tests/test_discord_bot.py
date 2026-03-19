@@ -8,7 +8,7 @@ import pytest
 
 import agent.communication.discord_bot as discord_bot_module
 import agent.communication.discord_services as discord_services_module
-from agent.communication.discord_bot import DiscordBot
+from agent.communication.discord_bot import DiscordBot, _SlashCommandMessage
 from agent.communication.message_router import MessageKind, ParsedMessage
 from agent.loop import TaskResult
 from agent.task_waits import TaskWaitRegistry
@@ -193,6 +193,56 @@ async def test_handle_slash_command_routes_through_message_service(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_registered_slash_commands_route_expected_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    channel = _FakeChannel(101)
+    interaction = _FakeInteraction(channel)
+    seen: list[tuple[str, str]] = []
+
+    async def fake_handle_slash_command(_interaction, name: str, argument: str = "") -> None:
+        seen.append((name, argument))
+
+    monkeypatch.setattr(bot, "_handle_slash_command", fake_handle_slash_command)
+
+    for command in bot._tree.get_commands():
+        if command.name in {"queue", "replace"}:
+            await command.callback(interaction, "do work")
+        else:
+            await command.callback(interaction)
+
+    assert seen == [
+        ("status", ""),
+        ("cancel", ""),
+        ("forget", ""),
+        ("clear", ""),
+        ("resume", ""),
+        ("help", ""),
+        ("queue", "do work"),
+        ("replace", "do work"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_slash_command_ignores_missing_channel_or_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    seen: list[str] = []
+
+    async def fake_handle_message(message) -> None:
+        seen.append(message.content)
+
+    monkeypatch.setattr(bot._messages, "handle_message", fake_handle_message)
+
+    missing_user = _FakeInteraction(_FakeChannel(101))
+    missing_user.user = None
+    await bot._handle_slash_command(missing_user, "status")
+    interaction = _FakeInteraction(_FakeChannel(101))
+    interaction.channel = None
+    await bot._handle_slash_command(interaction, "status")
+
+    assert seen == []
+
+
+@pytest.mark.asyncio
 async def test_sync_app_commands_uses_guild_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
     calls: list[tuple[str, object]] = []
@@ -245,6 +295,29 @@ async def test_sync_app_commands_global_and_failure_paths(monkeypatch: pytest.Mo
 
     assert warnings == ["discord_command_sync_failed"]
     assert bot._commands_synced is False
+
+
+@pytest.mark.asyncio
+async def test_slash_command_message_uses_followup_and_channel_fallback() -> None:
+    channel = _FakeChannel(101)
+    interaction = _FakeInteraction(channel)
+    message = _SlashCommandMessage(interaction=interaction, content="/status")
+
+    await message.reply("first")
+    assert interaction.response.sent == ["first"]
+
+    await message.reply("second")
+    assert interaction.followup.sent == ["second"]
+
+    interaction_no_followup = _FakeInteraction(channel)
+    interaction_no_followup.response._done = True
+    interaction_no_followup.followup = None
+    message = _SlashCommandMessage(interaction=interaction_no_followup, content="/status")
+    await message.reply("third")
+    await message.add_reaction("👀")
+
+    assert channel.sent[-1] == "third"
+    assert message.reactions == ["👀"]
 
 
 @pytest.mark.asyncio

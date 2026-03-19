@@ -338,3 +338,58 @@ async def test_attach_database_tools_with_single_backend() -> None:
     assert "memory_search" not in postgres_agent.funcs
     assert "Postgres (shared)" in await postgres_agent.funcs["db_stats"]()
     assert "SQLite (local)" not in await postgres_agent.funcs["db_stats"]()
+
+
+def test_attach_secret_tools_covers_success_empty_and_error_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = _Agent()
+    state = {"names": [], "values": {}, "mode": "ok"}
+
+    class _SecretStore:
+        def __init__(self, path) -> None:
+            self.path = path
+
+        def list_names(self):
+            if state["mode"] == "list_error":
+                raise toolsets.SecretStoreError("list failed")
+            return list(state["names"])
+
+        def set(self, name: str, value: str) -> None:
+            if state["mode"] == "set_error":
+                raise toolsets.SecretStoreError("set failed")
+            if state["mode"] == "set_value_error":
+                raise ValueError("bad name")
+            state["values"][name] = value
+            if name not in state["names"]:
+                state["names"].append(name)
+
+        def get(self, name: str) -> str:
+            if state["mode"] == "get_error":
+                raise toolsets.SecretStoreError("get failed")
+            if name not in state["values"]:
+                raise toolsets.SecretNotFoundError(name)
+            return state["values"][name]
+
+        def delete(self, name: str) -> bool:
+            if state["mode"] == "delete_error":
+                raise toolsets.SecretStoreError("delete failed")
+            return state["values"].pop(name, None) is not None
+
+    monkeypatch.setattr(toolsets, "SecretStore", _SecretStore)
+    toolsets.attach_secret_tools(agent)  # type: ignore[arg-type]
+
+    assert agent.funcs["secret_list"]() == "(no secrets stored)"
+    assert "Stored secret `TOKEN`" in agent.funcs["secret_set"]("TOKEN", "hunter2")
+    assert "## Stored secrets" in agent.funcs["secret_list"]()
+    assert agent.funcs["secret_get"]("TOKEN") == "hunter2"
+    assert agent.funcs["secret_delete"]("TOKEN") == "Deleted secret `TOKEN`."
+    assert agent.funcs["secret_delete"]("TOKEN") == "[ERROR: secret not found: TOKEN]"
+    assert agent.funcs["secret_get"]("TOKEN") == "[ERROR: secret not found: TOKEN]"
+
+    state["mode"] = "set_error"
+    assert "set failed" in agent.funcs["secret_set"]("TOKEN", "value")
+    state["mode"] = "set_value_error"
+    assert "bad name" in agent.funcs["secret_set"]("TOKEN", "value")
+    state["mode"] = "get_error"
+    assert "get failed" in agent.funcs["secret_get"]("TOKEN")
+    state["mode"] = "delete_error"
+    assert "delete failed" in agent.funcs["secret_delete"]("TOKEN")
