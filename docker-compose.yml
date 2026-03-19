@@ -56,6 +56,9 @@ services:
       - BROWSER_TIMEZONE=${BROWSER_TIMEZONE:-America/New_York}
       - BROWSER_GEO_LAT=${BROWSER_GEO_LAT:-40.7128}
       - BROWSER_GEO_LON=${BROWSER_GEO_LON:--74.0060}
+      - AGENT_SECRETS_PATH=${AGENT_SECRETS_PATH:-/data/agent-secrets.json}
+    volumes:
+      - agent_data:/data
     ports:
       - "6080:6080"   # noVNC web viewer (human observation)
       - "5900:5900"   # Raw VNC

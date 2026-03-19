@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import importlib.util
 import itertools
+import json
 import runpy
 import sys
 from dataclasses import dataclass
@@ -76,7 +78,12 @@ class _FakeSseServerTransport:
         self.post_calls.append((scope, receive, send))
 
 
-def _load_bridge(monkeypatch, *, env: dict[str, str] | None = None):
+def _load_bridge(
+    monkeypatch,
+    *,
+    env: dict[str, str] | None = None,
+    block_agent_secret_store: bool = False,
+):
     env = env or {}
     for key in (
         "PROXY_URL",
@@ -125,6 +132,15 @@ def _load_bridge(monkeypatch, *, env: dict[str, str] | None = None):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    if block_agent_secret_store:
+        original_import = builtins.__import__
+
+        def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "agent.secret_store":
+                raise ImportError(name)
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
     spec.loader.exec_module(module)
     return module
 
@@ -261,6 +277,52 @@ def test_context_and_init_helpers(monkeypatch) -> None:
     assert kwargs["viewport"] == {"width": 100, "height": 200}
     assert "'fr-FR'" in script
     assert "'fr'" in script
+
+
+def test_read_secret_falls_back_without_agent_package(monkeypatch, tmp_path) -> None:
+    bridge = _load_bridge(monkeypatch, block_agent_secret_store=True)
+    secrets_path = tmp_path / "agent-secrets.json"
+    secrets_path.write_text(json.dumps({"login/password": "hunter2"}), encoding="utf-8")
+    monkeypatch.setattr(bridge, "_SECRETS_PATH", str(secrets_path))
+
+    assert bridge._read_secret("login/password") == "hunter2"
+    assert bridge.SecretStore(secrets_path).get(" login/password ") == "hunter2"
+
+
+def test_secret_store_fallback_rejects_invalid_inputs(monkeypatch, tmp_path) -> None:
+    bridge = _load_bridge(monkeypatch, block_agent_secret_store=True)
+
+    try:
+        bridge.SecretStore(tmp_path / "missing.json").get("demo")
+    except bridge.SecretNotFoundError as exc:
+        assert str(exc) == "'demo'"
+    else:
+        raise AssertionError("expected missing secret to raise SecretNotFoundError")
+
+    try:
+        bridge.SecretStore(tmp_path / "missing.json").get("bad name!")
+    except ValueError as exc:
+        assert "invalid" in str(exc)
+    else:
+        raise AssertionError("expected invalid secret name to raise ValueError")
+
+    invalid_store = tmp_path / "invalid.json"
+    invalid_store.write_text("[]", encoding="utf-8")
+    try:
+        bridge.SecretStore(invalid_store).get("demo")
+    except ValueError as exc:
+        assert "JSON object" in str(exc)
+    else:
+        raise AssertionError("expected non-object secret store to raise ValueError")
+
+    bad_value_store = tmp_path / "bad-value.json"
+    bad_value_store.write_text(json.dumps({"demo": 123}), encoding="utf-8")
+    try:
+        bridge.SecretStore(bad_value_store).get("demo")
+    except bridge.SecretNotFoundError as exc:
+        assert str(exc) == "'demo'"
+    else:
+        raise AssertionError("expected non-string secret values to raise SecretNotFoundError")
 
 
 def test_list_tools_exposes_expected_browser_tool_names(monkeypatch) -> None:

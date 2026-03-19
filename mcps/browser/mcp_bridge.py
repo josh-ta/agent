@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
+import json
 import os as _os
 import re
 import sys
@@ -26,7 +27,33 @@ from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
 from playwright.async_api import async_playwright
 
-from agent.secret_store import SecretNotFoundError, SecretStore
+try:
+    from agent.secret_store import SecretNotFoundError, SecretStore
+except ImportError:
+    _SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+
+    class SecretNotFoundError(KeyError):
+        """Raised when a named secret is missing."""
+
+    class SecretStore:
+        """Minimal secret reader fallback for the standalone browser image."""
+
+        def __init__(self, path: Path) -> None:
+            self._path = path
+
+        def get(self, name: str) -> str:
+            normalized = name.strip()
+            if not normalized or not _SECRET_NAME_RE.fullmatch(normalized):
+                raise ValueError("Secret name is invalid.")
+            if not self._path.exists():
+                raise SecretNotFoundError(normalized)
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("Secret store must contain a JSON object.")
+            value = raw.get(normalized)
+            if not isinstance(value, str):
+                raise SecretNotFoundError(normalized)
+            return value
 
 
 @dataclass(frozen=True)
