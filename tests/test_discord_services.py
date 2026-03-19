@@ -22,6 +22,7 @@ from agent.events import (
     ToolCallStartEvent,
 )
 from agent.loop import TaskResult
+from agent.task_waits import TaskWaitRegistry
 from tests.conftest import FakeChannel, FakeSentMessage
 
 
@@ -30,21 +31,33 @@ class _BusyLoop:
         self.has_pending_work = True
         self.queue = SimpleNamespace(qsize=lambda: 2)
         self.enqueued = None
+        self.wait_registry = TaskWaitRegistry()
+        self.memory = None
 
     async def enqueue(self, task) -> None:
         self.enqueued = task
+
+    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+        metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
 class _ReadyLoop:
     def __init__(self) -> None:
         self.has_pending_work = False
         self.queue = SimpleNamespace(qsize=lambda: 0)
+        self.wait_registry = TaskWaitRegistry()
+        self.memory = None
 
     async def enqueue(self, task) -> None:
         assert task.response_future is not None
         task.response_future.set_result(
             TaskResult(task=task, output="finished", success=True, elapsed_ms=1.0)
         )
+
+    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+        metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
 def _parsed(
@@ -99,18 +112,32 @@ async def test_message_service_uses_next_position_when_single_item_ahead(fake_cl
 
 
 @pytest.mark.asyncio
-async def test_message_service_treats_pending_question_answer_as_in_place_reply(
+async def test_message_service_resumes_suspended_task_from_reply(
     fake_client,
     discord_channels,
     fake_message_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = _BusyLoop()
     service = MessageHandlingService(
-        agent_loop=_BusyLoop(),  # type: ignore[arg-type]
+        agent_loop=loop,  # type: ignore[arg-type]
         client=fake_client,  # type: ignore[arg-type]
         presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
     )
-    discord_tools_module._pending_question_ids[discord_channels["private"].id] = {42}
+    loop.wait_registry.suspend(
+        task_id="task-1",
+        source="discord",
+        author="Josh",
+        content="skip it",
+        channel_id=discord_channels["private"].id,
+        message_id=1,
+        metadata={"task_id": "task-1"},
+        question="Which environment?",
+        timeout_s=300,
+        base_prompt="prompt",
+        tier="smart",
+    )
+    loop.wait_registry.bind_prompt_message("task-1", 42)
     message = fake_message_factory(channel=discord_channels["private"], content="skip it")
     message.reference = SimpleNamespace(message_id=42)
 
@@ -123,9 +150,8 @@ async def test_message_service_treats_pending_question_answer_as_in_place_reply(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert message.reactions == ["👀"]
-    assert message.replies == ["💬 Got it — using that answer now."]
-    assert service._agent_loop.enqueued is None
-    discord_tools_module._pending_question_ids.clear()
+    assert message.replies == ["💬 Got it — resuming from your answer now."]
+    assert service._agent_loop.enqueued is not None
 
 
 @pytest.mark.asyncio
@@ -233,6 +259,72 @@ async def test_message_service_reacts_when_accepting_new_task(
 
 
 @pytest.mark.asyncio
+async def test_message_service_prompts_and_marks_waiting_for_user(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _WaitingLoop(_ReadyLoop):
+        async def enqueue(self, task) -> None:
+            assert task.response_future is not None
+            task.metadata["task_id"] = "task-wait"
+            task.metadata["wait_state"] = {
+                "question": "Which environment?",
+                "timeout_s": 90,
+                "channel_id": task.channel_id,
+                "message_id": task.message_id,
+                "prompt_message_id": None,
+            }
+            self.wait_registry.suspend(
+                task_id="task-wait",
+                source=task.source,
+                author=task.author,
+                content=task.content,
+                channel_id=task.channel_id,
+                message_id=task.message_id,
+                metadata=task.metadata,
+                question="Which environment?",
+                timeout_s=90,
+                base_prompt="",
+                tier="smart",
+            )
+            task.response_future.set_result(
+                TaskResult(
+                    task=task,
+                    output="",
+                    success=None,
+                    status="waiting_for_user",
+                    elapsed_ms=1.0,
+                    waiting_for_user=True,
+                    question="Which environment?",
+                    timeout_s=90,
+                )
+            )
+
+    loop = _WaitingLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, content="please help", channel_id=discord_channels["private"].id),
+    )
+    message = fake_message_factory(channel=discord_channels["private"], content="please help")
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+
+    assert "Which environment?" in message.replies[0]
+    assert message.reactions == ["👀", "⏸️"]
+    pending = loop.wait_registry.pending_for_channel(discord_channels["private"].id)
+    assert len(pending) == 1
+    assert pending[0].prompt_message_id == 1
+
+
+@pytest.mark.asyncio
 async def test_message_service_skips_sending_reply_for_empty_or_already_sent_results(
     fake_client,
     discord_channels,
@@ -241,13 +333,13 @@ async def test_message_service_skips_sending_reply_for_empty_or_already_sent_res
 ) -> None:
     results = [
         TaskResult(task=SimpleNamespace(), output="", success=True, elapsed_ms=1.0),
-        TaskResult(task=SimpleNamespace(), output="done", success=True, elapsed_ms=1.0, discord_replied=True),
+        TaskResult(task=SimpleNamespace(), output="done", success=True, elapsed_ms=1.0, user_visible_reply_sent=True),
         TaskResult(
             task=SimpleNamespace(),
             output="done",
             success=True,
             elapsed_ms=1.0,
-            discord_replied=True,
+            user_visible_reply_sent=True,
             attachments=[discord_tools_module.DiscordAttachment(filename="browser-screenshot-1.png", data=b"png")],
         ),
     ]
@@ -256,17 +348,24 @@ async def test_message_service_skips_sending_reply_for_empty_or_already_sent_res
     class _Loop:
         has_pending_work = False
         queue = SimpleNamespace(qsize=lambda: 0)
+        wait_registry = TaskWaitRegistry()
+        memory = None
 
         async def enqueue(self, task) -> None:
             task.response_future.set_result(results.pop(0))
+
+        def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+            metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+            return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
     service = MessageHandlingService(
         agent_loop=_Loop(),  # type: ignore[arg-type]
         client=fake_client,  # type: ignore[arg-type]
         presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
     )
-    async def fake_send_reply(*args, **kwargs) -> None:
+    async def fake_send_reply(*args, **kwargs) -> bool:
         sent.append("reply")
+        return True
 
     monkeypatch.setattr(
         service,
@@ -304,8 +403,9 @@ async def test_message_service_sends_a2a_result_to_comms_and_bus(fake_client, di
     )
     message = fake_message_factory(channel=discord_channels["private"], content="hello")
 
-    await service.send_reply(parsed, "result payload", message)  # type: ignore[arg-type]
+    delivered = await service.send_reply(parsed, "result payload", message)  # type: ignore[arg-type]
 
+    assert delivered is True
     assert '"task": "result"' in discord_channels["comms"].sent[0]
     assert "completed task from peer-1" in discord_channels["bus"].sent[0]
 
@@ -331,8 +431,9 @@ async def test_message_service_send_reply_handles_a2a_failure(fake_client, disco
     fake_client.channels[discord_channels["comms"].id] = _ExplodingChannel(id=discord_channels["comms"].id)
     monkeypatch.setattr(discord_services_module.discord, "HTTPException", RuntimeError)
 
-    await service.send_reply(parsed, "result payload", message)  # type: ignore[arg-type]
+    delivered = await service.send_reply(parsed, "result payload", message)  # type: ignore[arg-type]
 
+    assert delivered is False
     assert "completed task from peer-1" in discord_channels["bus"].sent[0]
 
 
@@ -350,8 +451,9 @@ async def test_message_service_send_reply_for_bus_posts_status_and_private_copy(
     parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["bus"].id)
     message = fake_message_factory(channel=discord_channels["bus"], content="hello")
 
-    await service.send_reply(parsed, "bus output", message)  # type: ignore[arg-type]
+    delivered = await service.send_reply(parsed, "bus output", message)  # type: ignore[arg-type]
 
+    assert delivered is True
     assert discord_channels["bus"].sent[0].startswith(f"**{settings.agent_name}**:")
     assert discord_channels["private"].sent[0] == "bus output"
 
@@ -371,8 +473,9 @@ async def test_message_service_send_reply_splits_private_reply(
     message = fake_message_factory(channel=discord_channels["private"], content="hello")
     output = "x" * (MAX_REPLY_LEN + 20)
 
-    await service.send_reply(parsed, output, message)  # type: ignore[arg-type]
+    delivered = await service.send_reply(parsed, output, message)  # type: ignore[arg-type]
 
+    assert delivered is True
     assert message.replies == ["x" * MAX_REPLY_LEN]
     assert discord_channels["private"].sent == ["x" * 20]
 
@@ -391,13 +494,14 @@ async def test_message_service_send_reply_uploads_screenshot_attachments(
     parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["private"].id)
     message = fake_message_factory(channel=discord_channels["private"], content="hello")
 
-    await service.send_reply(
+    delivered = await service.send_reply(
         parsed,
         "screenshot attached",
         message,  # type: ignore[arg-type]
         attachments=[discord_tools_module.DiscordAttachment(filename="browser-screenshot-1.png", data=b"png")],
     )
 
+    assert delivered is True
     assert message.replies == ["screenshot attached"]
     assert discord_channels["private"].sent_files == ["browser-screenshot-1.png"]
 

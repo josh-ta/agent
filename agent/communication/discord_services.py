@@ -213,15 +213,9 @@ class MessageHandlingService:
         parsed: ParsedMessage,
         message: discord.Message,
     ) -> bool:
-        if parsed.channel_id != settings.discord_agent_channel_id:
-            return False
-        if not self._agent_loop.has_pending_work:
-            return False
-        if not discord_tools_module.has_pending_question(parsed.channel_id):
-            return False
-        if discord_tools_module.is_pending_question_reply(message):
-            return True
-        return getattr(message, "reference", None) is None
+        del parsed
+        del message
+        return False
 
     async def _acknowledge_message(self, message: discord.Message, emoji: str = "👀") -> None:
         try:
@@ -231,6 +225,35 @@ class MessageHandlingService:
 
     async def _mark_task_finished(self, message: discord.Message, *, success: bool) -> None:
         await self._acknowledge_message(message, "🏁" if success else "❌")
+
+    async def _mark_task_waiting(self, message: discord.Message) -> None:
+        await self._acknowledge_message(message, "⏸️")
+
+    async def _send_waiting_prompt(self, message: discord.Message, question: str) -> int | None:
+        try:
+            sent = await message.reply(f"❓ {question}", mention_author=False)
+            return getattr(sent, "id", None)
+        except discord.HTTPException:
+            try:
+                sent = await message.channel.send(f"❓ {question}")
+                return getattr(sent, "id", None)
+            except discord.HTTPException:
+                return None
+
+    def _maybe_resume_waiting_discord_task(self, message: discord.Message) -> Task | None:
+        reference = getattr(getattr(message, "reference", None), "message_id", None)
+        suspended = self._agent_loop.wait_registry.pop_for_discord_reply(
+            channel_id=message.channel.id,
+            reference_message_id=reference,
+        )
+        if suspended is None:
+            return None
+        return self._agent_loop.build_resumed_task(
+            suspended=suspended,
+            answer=message.content.strip(),
+            author=getattr(message.author, "display_name", "user"),
+            source="discord",
+        )
 
     async def handle_message(self, message: discord.Message) -> None:
         assert self._client.user
@@ -248,16 +271,36 @@ class MessageHandlingService:
             return
 
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
-        if self._is_answering_pending_question(parsed, message):
+        resumed_task = self._maybe_resume_waiting_discord_task(message)
+        if resumed_task is not None:
             await self._acknowledge_message(message)
+            task_id = str(resumed_task.metadata.get("task_id", "")).strip()
+            if task_id and hasattr(self._agent_loop.memory, "mark_task_queued"):
+                await self._agent_loop.memory.mark_task_queued(task_id, metadata=resumed_task.metadata)
             if allows_inline_reply(parsed.channel_id):
                 try:
                     await message.reply(
-                        "💬 Got it — using that answer now.",
+                        "💬 Got it — resuming from your answer now.",
                         mention_author=False,
                     )
                 except discord.HTTPException:
                     pass
+            await self._agent_loop.enqueue(resumed_task)
+            return
+
+        if (
+            parsed.channel_id == settings.discord_agent_channel_id
+            and getattr(message, "reference", None) is None
+            and len(self._agent_loop.wait_registry.pending_for_channel(parsed.channel_id)) > 1
+        ):
+            await self._acknowledge_message(message)
+            try:
+                await message.reply(
+                    "💬 I have more than one suspended question. Reply directly to the specific question you mean.",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
             return
 
         inject_q = self._inject_queues.get(parsed.channel_id)
@@ -324,18 +367,39 @@ class MessageHandlingService:
             self._inject_queues.pop(parsed.channel_id, None)
             self._bridge.unregister(sink_tag)
 
-        await self._mark_task_finished(message, success=result.success)
-
-        if result.discord_replied:
-            if result.attachments:
-                await self.send_reply(parsed, "", message, attachments=result.attachments)
+        if result.waiting_for_user:
+            prompt_message_id = await self._send_waiting_prompt(message, result.question or "I need more information.")
+            task_id = str(result.task.metadata.get("task_id", "")).strip()
+            if task_id and prompt_message_id is not None:
+                self._agent_loop.wait_registry.bind_prompt_message(task_id, prompt_message_id)
+                wait_state = dict(result.task.metadata.get("wait_state") or {})
+                wait_state["prompt_message_id"] = prompt_message_id
+                result.task.metadata["wait_state"] = wait_state
+                if (
+                    self._agent_loop.memory is not None
+                    and hasattr(self._agent_loop.memory, "mark_task_waiting")
+                ):
+                    await self._agent_loop.memory.mark_task_waiting(
+                        task_id,
+                        metadata=result.task.metadata,
+                        question=result.question or "",
+                    )
+            await self._mark_task_waiting(message)
             return
-        if not result.output:
-            if result.attachments:
-                await self.send_reply(parsed, "", message, attachments=result.attachments)
-            return
 
-        await self.send_reply(parsed, result.output, message, attachments=result.attachments)
+        delivery_confirmed = False
+        if result.user_visible_reply_sent:
+            if result.attachments:
+                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
+            else:
+                delivery_confirmed = True
+        elif not result.output:
+            if result.attachments:
+                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
+        else:
+            delivery_confirmed = await self.send_reply(parsed, result.output, message, attachments=result.attachments)
+
+        await self._mark_task_finished(message, success=bool(result.success and delivery_confirmed))
 
     async def send_reply(
         self,
@@ -343,13 +407,14 @@ class MessageHandlingService:
         output: str,
         original_message: discord.Message,
         attachments: list[discord_tools_module.DiscordAttachment] | None = None,
-    ) -> None:
+    ) -> bool:
         is_a2a = parsed.kind == MessageKind.A2A and parsed.a2a_payload is not None
         is_bus = parsed.channel_id == settings.discord_bus_channel_id
         attachments = attachments or []
 
         if is_a2a:
             from_agent = parsed.a2a_payload.get("from", "")
+            delivered = False
             if from_agent and settings.discord_comms_channel_id:
                 comms = self._client.get_channel(settings.discord_comms_channel_id)
                 if comms is not None:
@@ -364,10 +429,11 @@ class MessageHandlingService:
                                 }
                             )
                         )  # type: ignore[union-attr]
+                        delivered = True
                     except discord.HTTPException as exc:
                         log.warning("a2a_reply_failed", error=str(exc))
             await self.post_bus_status(f"**{settings.agent_name}** completed task from {from_agent or 'unknown'}.")
-            return
+            return delivered or not from_agent
 
         if is_bus:
             await self.post_bus_status(f"**{settings.agent_name}**: {output[:300]}")
@@ -376,7 +442,7 @@ class MessageHandlingService:
                 await self._presenter.send_chunked(private_channel, output)  # type: ignore[arg-type]
                 if attachments:
                     await self._presenter.send_attachments(private_channel, attachments)  # type: ignore[arg-type]
-            return
+            return True
 
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
         target = private_channel or original_message.channel
@@ -390,8 +456,10 @@ class MessageHandlingService:
                 await self._presenter.send_chunked(target, output)  # type: ignore[arg-type]
             if attachments:
                 await self._presenter.send_attachments(target, attachments)  # type: ignore[arg-type]
+            return True
         except discord.HTTPException as exc:
             log.error("discord_send_failed", error=str(exc))
+            return False
 
     async def post_bus_status(self, message: str) -> None:
         if not settings.discord_bus_channel_id:

@@ -11,6 +11,7 @@ import agent.communication.discord_services as discord_services_module
 from agent.communication.discord_bot import DiscordBot
 from agent.communication.message_router import MessageKind, ParsedMessage
 from agent.loop import TaskResult
+from agent.task_waits import TaskWaitRegistry
 
 
 class _NullTyping:
@@ -54,6 +55,8 @@ class _FakeLoop:
         self.has_pending_work = False
         self.queue = SimpleNamespace(qsize=lambda: 0)
         self.enqueued = None
+        self.wait_registry = TaskWaitRegistry()
+        self.memory = None
 
     async def enqueue(self, task) -> None:
         self.enqueued = task
@@ -69,6 +72,10 @@ class _FakeLoop:
 
     async def _process(self, task) -> TaskResult:  # pragma: no cover - should never be called
         raise AssertionError("DiscordBot should enqueue work instead of calling _process directly")
+
+    def build_resumed_task(self, *, suspended, answer: str, author: str, source: str):
+        metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
 @pytest.mark.asyncio

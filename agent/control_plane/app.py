@@ -20,7 +20,7 @@ from agent.events import AgentEvent, TaskQueuedEvent, bridge
 from agent.loop import Task
 
 
-TaskState = Literal["queued", "running", "succeeded", "failed"]
+TaskState = Literal["queued", "running", "waiting_for_user", "succeeded", "failed"]
 ErrorCode = Literal[
     "invalid_request",
     "task_not_found",
@@ -58,6 +58,13 @@ class CreateTaskResponse(BaseModel):
     status: TaskState
 
 
+class ResumeTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=20000)
+    author: str = Field(default="api", min_length=1, max_length=200)
+
+
 class TaskResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -74,6 +81,7 @@ class TaskResponse(BaseModel):
     success: bool | None = None
     elapsed_ms: float | None = None
     tool_calls: int | None = None
+    question: str | None = None
 
 
 class ApiError(Exception):
@@ -309,6 +317,56 @@ def create_app(
             )
         return _task_response_from_row(row)
 
+    @app.post(
+        "/tasks/{task_id}/input",
+        response_model=CreateTaskResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        responses=ERROR_RESPONSES,
+        tags=["tasks"],
+    )
+    async def resume_task(request: Request, task_id: str, payload: ResumeTaskRequest) -> CreateTaskResponse:
+        runtime = _require_runtime(request.app)
+        row = await runtime.sqlite.get_task_record(task_id)
+        if row is None:
+            raise ApiError(
+                status_code=status.HTTP_404_NOT_FOUND,
+                error_code="task_not_found",
+                message=f"Task '{task_id}' was not found.",
+            )
+        if row["status"] != "waiting_for_user":
+            raise ApiError(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                error_code="invalid_request",
+                message=f"Task '{task_id}' is not waiting for user input.",
+            )
+
+        suspended = runtime.loop.wait_registry.get(task_id)
+        if suspended is None:
+            raise ApiError(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                error_code="service_unavailable",
+                message=f"Task '{task_id}' is waiting, but no resumable state is currently loaded.",
+            )
+
+        answer = payload.content.strip()
+        if not answer:
+            raise ApiError(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                error_code="invalid_request",
+                message="Resume content must not be blank.",
+            )
+
+        resumed = runtime.loop.build_resumed_task(
+            suspended=runtime.loop.wait_registry.pop(task_id) or suspended,
+            answer=answer,
+            author=payload.author,
+            source="api",
+        )
+        await runtime.sqlite.mark_task_queued(task_id, metadata=resumed.metadata)
+        await runtime.loop.enqueue(resumed)
+        await bridge.emit(TaskQueuedEvent(task_id=task_id, content=resumed.content, source="api"))
+        return CreateTaskResponse(id=task_id, status="queued")
+
     @app.get(
         "/events",
         responses={
@@ -397,11 +455,12 @@ def _task_response_from_row(row: dict[str, Any]) -> TaskResponse:
         error=row.get("error"),
         success=(
             None
-            if row["status"] in {"queued", "running"}
+            if row["status"] in {"queued", "running", "waiting_for_user"}
             else bool(row["success"])
         ),
         elapsed_ms=row.get("elapsed_ms"),
         tool_calls=row.get("tool_calls"),
+        question=((row.get("metadata") or {}).get("wait_state") or {}).get("question"),
     )
 
 

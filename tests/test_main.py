@@ -97,6 +97,11 @@ async def test_build_runtime_wires_sqlite_only(monkeypatch: pytest.MonkeyPatch, 
             self.agents = agents
             self.memory_store = memory_store
             self.postgres_store = postgres_store
+            self.restored = 0
+
+        async def restore_waiting_tasks(self) -> int:
+            self.restored += 1
+            return 0
 
     monkeypatch.setattr(settings, "postgres_url", "")
     monkeypatch.setattr(sqlite_store_module, "SQLiteStore", _SQLiteStore)
@@ -112,6 +117,7 @@ async def test_build_runtime_wires_sqlite_only(monkeypatch: pytest.MonkeyPatch, 
     assert runtime.bot is None
     assert runtime.loop.postgres_store is None
     assert runtime.loop.memory_store.__class__.__name__ == "_SQLiteStore"
+    assert runtime.loop.restored == 1
     assert ("sqlite_path", isolated_paths["workspace"] / "agent.db") in calls
     assert ("sqlite_init", None) in calls
     assert ("register_all", ("_SQLiteStore", None)) in calls
@@ -155,6 +161,11 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
             self.agents = agents
             self.memory_store = memory_store
             self.postgres_store = postgres_store
+            self.restored = 0
+
+        async def restore_waiting_tasks(self) -> int:
+            self.restored += 1
+            return 0
 
     class _Bot:
         def __init__(self, loop) -> None:
@@ -175,6 +186,7 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
     assert runtime.bot is not None
     assert runtime.bot.loop is runtime.loop
     assert runtime.loop.postgres_store is runtime.postgres
+    assert runtime.loop.restored == 1
     assert ("sqlite_init", isolated_paths["workspace"] / "agent.db") in calls
     assert ("postgres_init", "postgresql://example") in calls
     assert ("register_agent", "postgresql://example") in calls

@@ -6,8 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 import agent.loop as loop_module
-from agent.events import TaskDoneEvent, TaskErrorEvent, TaskStartEvent
+from agent.events import TaskDoneEvent, TaskErrorEvent, TaskStartEvent, TaskWaitingEvent
 from agent.loop import AgentLoop, Task, TaskResult
+from agent.loop_services import RunResult
 
 
 class _StubAgent:
@@ -19,12 +20,35 @@ class _Memory:
     def __init__(self) -> None:
         self.saved_messages: list[tuple[str, str, int, dict | None]] = []
         self.recorded_tasks: list[TaskResult] = []
+        self.rows: dict[str, dict] = {}
 
     async def save_message(self, role: str, content: str, channel_id: int = 0, metadata=None) -> None:
         self.saved_messages.append((role, content, channel_id, metadata))
 
     async def record_task(self, task: Task, result: TaskResult) -> None:
         self.recorded_tasks.append(result)
+
+    async def create_task_record(self, *, task_id: str, source: str, author: str, content: str, metadata=None) -> None:
+        self.rows[task_id] = {
+            "task_id": task_id,
+            "source": source,
+            "author": author,
+            "content": content,
+            "status": "queued",
+            "metadata": metadata or {},
+        }
+
+    async def get_task_record(self, task_id: str):
+        return self.rows.get(task_id)
+
+    async def mark_task_waiting(self, task_id: str, *, metadata: dict, question: str) -> None:
+        row = self.rows.setdefault(task_id, {"task_id": task_id})
+        row["status"] = "waiting_for_user"
+        row["metadata"] = metadata
+        row["question"] = question
+
+    async def list_waiting_task_records(self) -> list[dict]:
+        return [row for row in self.rows.values() if row.get("status") == "waiting_for_user"]
 
 
 class _Postgres:
@@ -130,10 +154,11 @@ async def test_process_success_emits_events_and_persists(event_collector, monkey
         return normalized_task, "smart", "prompt"
 
     async def fake_run(**kwargs):
-        return "done", 2, False
+        return RunResult(output="done", tool_calls=2)
 
     monkeypatch.setattr(loop._context_builder, "build", fake_build)
     monkeypatch.setattr(loop._run_executor, "run", fake_run)
+    monkeypatch.setattr(loop, "_ensure_answer_required", lambda **kwargs: asyncio.sleep(0, result=("done", True)))
 
     result = await loop._process(Task(content="Fix parser", source="discord", author="Josh", channel_id=7))
 
@@ -144,6 +169,63 @@ async def test_process_success_emits_events_and_persists(event_collector, monkey
     assert postgres.calls[0][0] == "start"
     assert postgres.calls[1][0] == "done"
     assert [type(event) for event in event_collector] == [TaskStartEvent, TaskDoneEvent]
+
+
+@pytest.mark.asyncio
+async def test_process_waiting_marks_task_as_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = _Memory()
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()}, memory_store=memory)
+    normalized_task = Task(content="Fix parser", source="discord", author="Josh", channel_id=7)
+
+    async def fake_build(task: Task):
+        return normalized_task, "smart", "prompt"
+
+    async def fake_run(**kwargs):
+        return RunResult(waiting_for_user=True, question="What environment?", timeout_s=90)
+
+    monkeypatch.setattr(loop._context_builder, "build", fake_build)
+    monkeypatch.setattr(loop._run_executor, "run", fake_run)
+
+    result = await loop._process(Task(content="Fix parser", source="discord", author="Josh", channel_id=7))
+
+    assert result.status == "waiting_for_user"
+    assert result.success is None
+    assert result.question == "What environment?"
+    wait_state = memory.rows[result.task.metadata["task_id"]]["metadata"]["wait_state"]
+    assert wait_state["channel_id"] == 7
+    assert wait_state["prompt_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_restore_waiting_tasks_rebuilds_registry() -> None:
+    memory = _Memory()
+    memory.rows["task-1"] = {
+        "task_id": "task-1",
+        "source": "discord",
+        "author": "Josh",
+        "content": "Fix parser",
+        "status": "waiting_for_user",
+        "metadata": {
+            "task_id": "task-1",
+            "wait_state": {
+                "question": "What environment?",
+                "timeout_s": 90,
+                "channel_id": 7,
+                "message_id": 11,
+                "prompt_message_id": 42,
+            },
+        },
+    }
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()}, memory_store=memory)
+
+    restored = await loop.restore_waiting_tasks()
+
+    assert restored == 1
+    suspended = loop.wait_registry.get("task-1")
+    assert suspended is not None
+    assert suspended.question == "What environment?"
+    assert suspended.channel_id == 7
+    assert suspended.prompt_message_id == 42
 
 
 @pytest.mark.asyncio

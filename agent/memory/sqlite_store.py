@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     author      TEXT NOT NULL DEFAULT 'system',
     content     TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'completed',
+    metadata    TEXT DEFAULT '{}',
     result      TEXT,
     error       TEXT,
     success     INTEGER NOT NULL DEFAULT 0,
@@ -256,8 +257,17 @@ class SQLiteStore:
     async def mark_task_running(self, task_id: str) -> None:
         await self.tasks.mark_task_running(task_id)
 
+    async def mark_task_waiting(self, task_id: str, *, metadata: dict[str, Any], question: str) -> None:
+        await self.tasks.mark_task_waiting(task_id, metadata=metadata, question=question)
+
+    async def mark_task_queued(self, task_id: str, *, metadata: dict[str, Any] | None = None) -> None:
+        await self.tasks.mark_task_queued(task_id, metadata=metadata)
+
     async def get_task_record(self, task_id: str) -> dict[str, Any] | None:
         return await self.tasks.get_task_record(task_id)
+
+    async def list_waiting_task_records(self) -> list[dict[str, Any]]:
+        return await self.tasks.list_waiting_task_records()
 
     # ── Memory facts ──────────────────────────────────────────────────────────
 

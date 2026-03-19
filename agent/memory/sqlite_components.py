@@ -63,6 +63,8 @@ class SQLiteTaskRepository:
             migrations.append(("ALTER TABLE tasks ADD COLUMN task_id TEXT", None))
         if "status" not in columns:
             migrations.append(("ALTER TABLE tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'", None))
+        if "metadata" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN metadata TEXT DEFAULT '{}'", None))
         if "error" not in columns:
             migrations.append(("ALTER TABLE tasks ADD COLUMN error TEXT", None))
         if "created_ts" not in columns:
@@ -86,6 +88,7 @@ class SQLiteTaskRepository:
             SET
                 created_ts = COALESCE(created_ts, ts),
                 updated_ts = COALESCE(updated_ts, ts),
+                metadata = COALESCE(metadata, '{}'),
                 finished_ts = CASE
                     WHEN status IN ('succeeded', 'failed') THEN COALESCE(finished_ts, ts)
                     ELSE finished_ts
@@ -118,15 +121,14 @@ class SQLiteTaskRepository:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        del metadata
         self._store._check()
         assert self._store._db
         now = time.time()
         await self._store._db.execute(
             """INSERT INTO tasks
-               (task_id, source, author, content, status, success, created_ts, updated_ts, ts)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (task_id, source, author, content, "queued", 0, now, now, now),
+               (task_id, source, author, content, status, metadata, success, created_ts, updated_ts, ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, source, author, content, "queued", json.dumps(metadata or {}), 0, now, now, now),
         )
         await self._store._db.commit()
 
@@ -156,6 +158,7 @@ class SQLiteTaskRepository:
                        author=?,
                        content=?,
                        status=?,
+                       metadata=?,
                        result=?,
                        error=?,
                        success=?,
@@ -169,14 +172,15 @@ class SQLiteTaskRepository:
                     task.source,
                     task.author,
                     task.content,
-                    "succeeded" if result.success else "failed",
-                    result.output if result.success else None,
-                    None if result.success else result.output,
-                    int(result.success),
+                    result.status,
+                    json.dumps(task.metadata or {}),
+                    result.output if result.status == "succeeded" else None,
+                    result.output if result.status == "failed" else None,
+                    1 if result.status == "succeeded" else 0,
                     result.elapsed_ms,
                     result.tool_calls,
                     now,
-                    now,
+                    now if result.status in {"succeeded", "failed"} else None,
                     now,
                     task_id,
                 ),
@@ -184,23 +188,65 @@ class SQLiteTaskRepository:
         else:
             await self._store._db.execute(
                 """INSERT INTO tasks
-                   (source, author, content, status, result, error, success, elapsed_ms, tool_calls, created_ts, finished_ts, updated_ts, ts)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (source, author, content, status, metadata, result, error, success, elapsed_ms, tool_calls, created_ts, finished_ts, updated_ts, ts)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     task.source,
                     task.author,
                     task.content,
-                    "succeeded" if result.success else "failed",
-                    result.output if result.success else None,
-                    None if result.success else result.output,
-                    int(result.success),
+                    result.status,
+                    json.dumps(task.metadata or {}),
+                    result.output if result.status == "succeeded" else None,
+                    result.output if result.status == "failed" else None,
+                    1 if result.status == "succeeded" else 0,
                     result.elapsed_ms,
                     result.tool_calls,
                     now,
-                    now,
+                    now if result.status in {"succeeded", "failed"} else None,
                     now,
                     now,
                 ),
+            )
+        await self._store._db.commit()
+
+    async def mark_task_waiting(self, task_id: str, *, metadata: dict[str, Any], question: str) -> None:
+        self._store._check()
+        assert self._store._db
+        now = time.time()
+        await self._store._db.execute(
+            """UPDATE tasks
+               SET status='waiting_for_user',
+                   metadata=?,
+                   result=NULL,
+                   error=?,
+                   success=0,
+                   finished_ts=NULL,
+                   updated_ts=?
+               WHERE task_id=?""",
+            (json.dumps(metadata), question, now, task_id),
+        )
+        await self._store._db.commit()
+
+    async def mark_task_queued(self, task_id: str, *, metadata: dict[str, Any] | None = None) -> None:
+        self._store._check()
+        assert self._store._db
+        now = time.time()
+        if metadata is None:
+            await self._store._db.execute(
+                """UPDATE tasks
+                   SET status='queued',
+                       updated_ts=?
+                   WHERE task_id=?""",
+                (now, task_id),
+            )
+        else:
+            await self._store._db.execute(
+                """UPDATE tasks
+                   SET status='queued',
+                       metadata=?,
+                       updated_ts=?
+                   WHERE task_id=?""",
+                (json.dumps(metadata), now, task_id),
             )
         await self._store._db.commit()
 
@@ -209,14 +255,43 @@ class SQLiteTaskRepository:
         assert self._store._db
         async with self._store._db.execute(
             """SELECT task_id, source, author, content, status, result, error, success,
-                      elapsed_ms, tool_calls, created_ts, started_ts, finished_ts, updated_ts
+                      metadata, elapsed_ms, tool_calls, created_ts, started_ts, finished_ts, updated_ts
                FROM tasks
                WHERE task_id=?
                LIMIT 1""",
             (task_id,),
         ) as cur:
             row = await cur.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data["metadata"] = json.loads(data.get("metadata") or "{}")
+        except Exception:
+            data["metadata"] = {}
+        return data
+
+    async def list_waiting_task_records(self) -> list[dict[str, Any]]:
+        self._store._check()
+        assert self._store._db
+        async with self._store._db.execute(
+            """SELECT task_id, source, author, content, status, result, error, success,
+                      metadata, elapsed_ms, tool_calls, created_ts, started_ts, finished_ts, updated_ts
+               FROM tasks
+               WHERE status='waiting_for_user'
+               ORDER BY updated_ts ASC, created_ts ASC"""
+        ) as cur:
+            rows = await cur.fetchall()
+
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            data = dict(row)
+            try:
+                data["metadata"] = json.loads(data.get("metadata") or "{}")
+            except Exception:
+                data["metadata"] = {}
+            records.append(data)
+        return records
 
 
 class SQLiteMemoryRepository:

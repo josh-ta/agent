@@ -73,6 +73,38 @@ async def test_sqlite_store_persists_api_task_lifecycle(sqlite_store) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_sqlite_store_lists_waiting_tasks(sqlite_store) -> None:
+    await sqlite_store.create_task_record(
+        task_id="task-wait",
+        source="discord",
+        author="tester",
+        content="Need clarification",
+        metadata={"task_id": "task-wait"},
+    )
+    await sqlite_store.mark_task_waiting(
+        "task-wait",
+        metadata={
+            "task_id": "task-wait",
+            "wait_state": {
+                "question": "Which environment?",
+                "timeout_s": 90,
+                "channel_id": 101,
+                "message_id": 55,
+                "prompt_message_id": 66,
+            },
+        },
+        question="Which environment?",
+    )
+
+    rows = await sqlite_store.list_waiting_task_records()
+
+    assert len(rows) == 1
+    assert rows[0]["task_id"] == "task-wait"
+    assert rows[0]["metadata"]["wait_state"]["prompt_message_id"] == 66
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_sqlite_store_cleanup_applies_retention(monkeypatch: pytest.MonkeyPatch, sqlite_store) -> None:
     monkeypatch.setattr("agent.memory.sqlite_components.settings.retention_memory_facts_max", 1)
     monkeypatch.setattr("agent.memory.sqlite_components.settings.retention_lessons_max", 1)

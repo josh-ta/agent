@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from agent.control_plane.app import SseBroker, create_app
 from agent.events import ProgressEvent, TaskQueuedEvent, bridge
 from agent.loop import Task
+from agent.task_waits import SuspendedTask, TaskWaitRegistry
 
 
 class _FakeSQLite:
@@ -47,13 +48,24 @@ class _FakeSQLite:
     async def get_task_record(self, task_id: str) -> dict[str, object] | None:
         return self.rows.get(task_id)
 
+    async def mark_task_queued(self, task_id: str, *, metadata=None) -> None:
+        row = self.rows[task_id]
+        row["status"] = "queued"
+        if metadata is not None:
+            row["metadata"] = metadata
+
 
 class _FakeLoop:
     def __init__(self) -> None:
         self.enqueued: list[Task] = []
+        self.wait_registry = TaskWaitRegistry()
 
     async def enqueue(self, task: Task) -> None:
         self.enqueued.append(task)
+
+    def build_resumed_task(self, *, suspended: SuspendedTask, answer: str, author: str, source: str) -> Task:
+        metadata = self.wait_registry.build_resumed_metadata(suspended, answer=answer, resumed_from=source)
+        return Task(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
 def _build_app() -> tuple[TestClient, _FakeSQLite, _FakeLoop]:
@@ -131,6 +143,47 @@ def test_get_task_returns_typed_not_found_error() -> None:
         assert response.json()["error_code"] == "task_not_found"
 
 
+def test_resume_waiting_task_enqueues_followup_input() -> None:
+    client, sqlite, loop = _build_app()
+    sqlite.rows["task-1"] = {
+        "task_id": "task-1",
+        "source": "api",
+        "author": "tester",
+        "content": "do thing",
+        "status": "waiting_for_user",
+        "result": None,
+        "error": None,
+        "success": 0,
+        "elapsed_ms": None,
+        "tool_calls": None,
+        "created_ts": 1.0,
+        "started_ts": 2.0,
+        "finished_ts": None,
+        "updated_ts": 3.0,
+        "metadata": {"task_id": "task-1", "wait_state": {"question": "Which env?"}},
+    }
+    loop.wait_registry.suspend(
+        task_id="task-1",
+        source="api",
+        author="tester",
+        content="do thing",
+        channel_id=0,
+        message_id=0,
+        metadata={"task_id": "task-1"},
+        question="Which env?",
+        timeout_s=300,
+        base_prompt="prompt",
+        tier="smart",
+    )
+
+    with client:
+        response = client.post("/tasks/task-1/input", json={"content": "production", "author": "tester"})
+
+        assert response.status_code == 202
+        assert response.json()["status"] == "queued"
+        assert loop.enqueued[0].metadata["resume_context"]["answer"] == "production"
+
+
 def test_sse_broker_filters_and_serializes_by_task_id() -> None:
     broker = SseBroker()
     subscriber_id, queue = broker.subscribe("task-1")
@@ -157,4 +210,5 @@ def test_openapi_includes_control_plane_routes() -> None:
         assert "/readyz" in paths
         assert "/tasks" in paths
         assert "/tasks/{task_id}" in paths
+        assert "/tasks/{task_id}/input" in paths
         assert "/events" in paths

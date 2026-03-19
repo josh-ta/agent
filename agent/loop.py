@@ -14,7 +14,8 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 import structlog
 from pydantic_ai import Agent
@@ -25,16 +26,19 @@ from agent.events import (
     TaskDoneEvent,
     TaskErrorEvent,
     TaskStartEvent,
+    TaskWaitingEvent,
     bridge,
 )
 from agent.loop_services import (
     HeartbeatService,
     ReflectionService,
+    RunResult,
     RunExecutor,
     TaskContextBuilder,
     TaskJournal,
 )
 from agent.tools.discord_tools import DiscordAttachment
+from agent.task_waits import SuspendedTask, TaskWaitRegistry, task_wait_context
 
 log = structlog.get_logger()
 
@@ -89,6 +93,9 @@ def _classify_tier(content: str) -> str:
     return "fast"
 
 
+TaskStatus = Literal["queued", "running", "waiting_for_user", "succeeded", "failed"]
+
+
 @dataclass
 class Task:
     """A unit of work for the agent."""
@@ -110,10 +117,15 @@ class Task:
 class TaskResult:
     task: Task
     output: str
-    success: bool
+    success: bool | None
     elapsed_ms: float
+    status: TaskStatus = "succeeded"
     tool_calls: int = 0
-    discord_replied: bool = False  # True if agent called send_discord during this task
+    answered_user: bool = False
+    user_visible_reply_sent: bool = False
+    waiting_for_user: bool = False
+    question: str | None = None
+    timeout_s: int = 300
     attachments: list[DiscordAttachment] = field(default_factory=list)
 
 
@@ -158,6 +170,7 @@ class AgentLoop:
             postgres_store=self._postgres,
             enqueue=self.enqueue,
         )
+        self.wait_registry = TaskWaitRegistry()
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -174,9 +187,18 @@ class AgentLoop:
         return self.is_busy or not self.queue.empty()
 
     async def _execute_task(self, task: Task) -> TaskResult:
+        if task.metadata is None:
+            task.metadata = {}
         task_id = str(task.metadata.get("task_id", "")).strip() if task.metadata else ""
+        if not task_id and task.source == "api":
+            task_id = str(uuid4())
+            task.metadata["task_id"] = task_id
 
-        with bridge.task_context(task_id or None):
+        with bridge.task_context(task_id or None), task_wait_context(
+            task_id=task_id,
+            source=task.source,
+            channel_id=task.channel_id,
+        ):
             if self.memory and task_id and hasattr(self.memory, "mark_task_running"):
                 await self.memory.mark_task_running(task_id)
 
@@ -186,7 +208,8 @@ class AgentLoop:
                 await self.memory.record_task(task, result)
 
             # Post-task reflection (non-blocking, best-effort)
-            asyncio.create_task(self._reflect(task, result))
+            if result.status in {"succeeded", "failed"}:
+                asyncio.create_task(self._reflect(task, result))
 
             if task.response_future and not task.response_future.done():
                 task.response_future.set_result(result)
@@ -229,6 +252,60 @@ class AgentLoop:
         """Run a single task synchronously (useful for testing/CLI)."""
         task = Task(content=content, source=source)
         return await self._process(task)
+
+    def build_resumed_task(self, *, suspended: SuspendedTask, answer: str, author: str, source: str) -> Task:
+        metadata = self.wait_registry.build_resumed_metadata(
+            suspended,
+            answer=answer,
+            resumed_from=source,
+        )
+        return Task(
+            content=suspended.content,
+            source=suspended.source if suspended.source != "api" else source,
+            author=author,
+            channel_id=suspended.channel_id,
+            message_id=0,
+            metadata=metadata,
+        )
+
+    async def restore_waiting_tasks(self) -> int:
+        if self.memory is None or not hasattr(self.memory, "list_waiting_task_records"):
+            return 0
+
+        restored = 0
+        rows = await self.memory.list_waiting_task_records()
+        for row in rows:
+            metadata = dict(row.get("metadata") or {})
+            task_id = str(row.get("task_id", "")).strip()
+            wait_state = metadata.get("wait_state")
+            if not task_id or not isinstance(wait_state, dict):
+                continue
+            question = str(wait_state.get("question", "")).strip()
+            if not question:
+                continue
+            channel_id = self._coerce_int(wait_state.get("channel_id"))
+            message_id = self._coerce_int(wait_state.get("message_id"))
+            prompt_message_id = self._coerce_int_or_none(wait_state.get("prompt_message_id"))
+            timeout_s = max(1, self._coerce_int(wait_state.get("timeout_s"), default=300))
+            suspended = self.wait_registry.suspend(
+                task_id=task_id,
+                source=str(row.get("source", metadata.get("source", "api"))),
+                author=str(row.get("author", metadata.get("author", "system"))),
+                content=str(row.get("content", "")),
+                channel_id=channel_id,
+                message_id=message_id,
+                metadata=metadata,
+                question=question,
+                timeout_s=timeout_s,
+                base_prompt="",
+                tier=str(metadata.get("tier", "")),
+            )
+            if prompt_message_id is not None:
+                suspended.prompt_message_id = prompt_message_id
+            restored += 1
+        if restored:
+            log.info("waiting_tasks_restored", count=restored)
+        return restored
 
     async def _summarize_context(self, task: Task, accumulated_prompt: str) -> str:
         """
@@ -312,12 +389,98 @@ class AgentLoop:
                 pass
 
         try:
-            result_output, tool_calls, discord_replied, attachments = await self._run_executor.run(
+            run_result = await self._run_executor.run(
                 task=task,
                 agent=agent,
                 base_prompt=base_prompt,
                 tier=tier,
             )
+            result_output = run_result.output
+            tool_calls = run_result.tool_calls
+            attachments = run_result.attachments
+
+            if run_result.waiting_for_user:
+                if task.source == "a2a":
+                    blocker = (
+                        "I need clarification to continue, but this delegated task cannot pause for interactive input. "
+                        f"Question: {run_result.question or 'Additional context required.'}"
+                    )
+                    await bridge.emit(TaskErrorEvent(error=blocker[:400]))
+                    return TaskResult(
+                        task=task,
+                        output=blocker,
+                        success=False,
+                        status="failed",
+                        elapsed_ms=(asyncio.get_running_loop().time() - start) * 1000,
+                        tool_calls=tool_calls,
+                        question=run_result.question,
+                        timeout_s=run_result.timeout_s,
+                        attachments=attachments,
+                    )
+                task_id = self.wait_registry.ensure_task_id(task.metadata)
+                task.metadata["wait_state"] = {
+                    "question": run_result.question,
+                    "timeout_s": run_result.timeout_s,
+                    "channel_id": task.channel_id,
+                    "message_id": task.message_id,
+                    "prompt_message_id": None,
+                }
+                if self.memory and task_id and hasattr(self.memory, "get_task_record") and hasattr(self.memory, "create_task_record"):
+                    existing = await self.memory.get_task_record(task_id)
+                    if existing is None:
+                        await self.memory.create_task_record(
+                            task_id=task_id,
+                            source=task.source,
+                            author=task.author,
+                            content=task.content,
+                            metadata=task.metadata,
+                        )
+                if self.memory and task_id and hasattr(self.memory, "mark_task_waiting"):
+                    await self.memory.mark_task_waiting(
+                        task_id,
+                        metadata=task.metadata,
+                        question=run_result.question or "",
+                    )
+                self.wait_registry.suspend(
+                    task_id=task_id,
+                    source=task.source,
+                    author=task.author,
+                    content=task.content,
+                    channel_id=task.channel_id,
+                    message_id=task.message_id,
+                    metadata=task.metadata,
+                    question=run_result.question or "",
+                    timeout_s=run_result.timeout_s,
+                    base_prompt=base_prompt,
+                    tier=tier,
+                )
+                await bridge.emit(
+                    TaskWaitingEvent(
+                        question=run_result.question or "",
+                        timeout_s=run_result.timeout_s,
+                    )
+                )
+                return TaskResult(
+                    task=task,
+                    output="",
+                    success=None,
+                    status="waiting_for_user",
+                    elapsed_ms=(asyncio.get_running_loop().time() - start) * 1000,
+                    tool_calls=tool_calls,
+                    waiting_for_user=True,
+                    question=run_result.question,
+                    timeout_s=run_result.timeout_s,
+                    attachments=attachments,
+                )
+
+            answered_user = run_result.user_visible_reply_sent
+            final_output = result_output
+            if not answered_user:
+                final_output, answered_user = await self._ensure_answer_required(
+                    task=task,
+                    output=result_output,
+                    tool_calls=tool_calls,
+                )
 
             elapsed_ms = (asyncio.get_running_loop().time() - start) * 1000
             elapsed_s = elapsed_ms / 1000
@@ -327,31 +490,36 @@ class AgentLoop:
                 n=self._task_count,
                 tier=tier,
                 elapsed_ms=round(elapsed_ms),
-                output_len=len(result_output),
+                output_len=len(final_output),
                 tool_calls=tool_calls,
             )
 
-            await bridge.emit(TaskDoneEvent(
-                output=result_output,
-                elapsed_s=elapsed_s,
-                tool_calls=tool_calls,
-            ))
+            status_value: TaskStatus = "succeeded" if answered_user else "failed"
+            if answered_user:
+                await bridge.emit(TaskDoneEvent(
+                    output=final_output,
+                    elapsed_s=elapsed_s,
+                    tool_calls=tool_calls,
+                ))
+            else:
+                await bridge.emit(TaskErrorEvent(error=final_output[:400]))
 
             # Broadcast task done to Postgres audit log
             if self._postgres is not None:
                 try:
-                    await self._postgres.log_task_done(task.content, True, elapsed_ms, tool_calls)
+                    await self._postgres.log_task_done(task.content, answered_user, elapsed_ms, tool_calls)
                 except Exception:
                     pass
 
-            self._success_count += 1
+            if answered_user:
+                self._success_count += 1
 
             # Save the assistant's reply to conversation history
-            if self.memory and hasattr(self.memory, "save_message") and task.source == "discord":
+            if self.memory and hasattr(self.memory, "save_message") and task.source == "discord" and final_output:
                 try:
                     await self.memory.save_message(
                         role="assistant",
-                        content=result_output,
+                        content=final_output,
                         channel_id=task.channel_id,
                     )
                 except Exception:
@@ -359,10 +527,12 @@ class AgentLoop:
 
             return TaskResult(
                 task=task,
-                output=result_output,
-                discord_replied=discord_replied,
+                output=final_output,
+                status=status_value,
+                answered_user=answered_user,
+                user_visible_reply_sent=run_result.user_visible_reply_sent,
                 attachments=attachments,
-                success=True,
+                success=answered_user,
                 elapsed_ms=elapsed_ms,
                 tool_calls=tool_calls,
             )
@@ -390,6 +560,7 @@ class AgentLoop:
             return TaskResult(
                 task=task,
                 output=f"Error: {exc}",
+                status="failed",
                 success=False,
                 elapsed_ms=elapsed_ms,
             )
@@ -401,7 +572,7 @@ class AgentLoop:
         base_prompt: str,
         tier: str,
         message_history: list | None = None,
-    ) -> tuple[str, int, bool, list[DiscordAttachment]]:
+    ) -> RunResult:
         return await self._run_executor.run(
             task=task,
             agent=agent,
@@ -431,3 +602,74 @@ class AgentLoop:
         """Periodic background work: update presence, checkpoint SQLite, poll A2A tasks."""
         log.debug("heartbeat", agent=settings.agent_name, queue_size=self.queue.qsize())
         await self._heartbeat_service.heartbeat(is_busy=self.is_busy)
+
+    async def _ensure_answer_required(self, *, task: Task, output: str, tool_calls: int) -> tuple[str, bool]:
+        if await self._is_answer_acceptable(task=task, output=output, tool_calls=tool_calls):
+            return output, True
+
+        repaired = await self._repair_user_answer(task=task, output=output)
+        if await self._is_answer_acceptable(task=task, output=repaired, tool_calls=tool_calls):
+            return repaired, True
+
+        fallback = (
+            repaired.strip()
+            or output.strip()
+            or (
+                "I could not produce a reliable final answer from the work completed. "
+                "Please retry or ask me to continue from a narrower checkpoint."
+            )
+        )
+        return fallback, False
+
+    async def _is_answer_acceptable(self, *, task: Task, output: str, tool_calls: int) -> bool:
+        text = output.strip()
+        if not text:
+            return False
+        if text.startswith(("[ERROR", "Error: [No reply", "⏳ Still working", "🔧", "🟢", "💭")):
+            return False
+        if tool_calls == 0 and len(text.split()) >= 2:
+            return True
+        validator_prompt = (
+            "Decide whether the assistant's draft directly answers the user's request.\n"
+            "Reply with exactly one line: ANSWERED or NOT_ANSWERED.\n\n"
+            f"User request:\n{task.content[:2000]}\n\n"
+            f"Assistant draft:\n{text[:4000]}"
+        )
+        try:
+            validator = self.agents.get("fast", self.agent)
+            result = await validator.run(validator_prompt, usage_limits=UsageLimits(request_limit=None))
+            verdict = str(result.output).strip().splitlines()[0].strip().upper()
+            return verdict == "ANSWERED"
+        except Exception:
+            return len(text.split()) >= 6
+
+    async def _repair_user_answer(self, *, task: Task, output: str) -> str:
+        repair_prompt = (
+            "Write the final user-facing answer now.\n"
+            "Use only the evidence already gathered.\n"
+            "Answer the user's request directly in 3-8 sentences.\n"
+            "If information is missing, say exactly what is missing.\n"
+            "Do not call tools.\n\n"
+            f"User request:\n{task.content[:2000]}\n\n"
+            f"Existing draft or notes:\n{output[:4000]}"
+        )
+        try:
+            repair_agent = self.agents.get("fast", self.agent)
+            result = await repair_agent.run(repair_prompt, usage_limits=UsageLimits(request_limit=None))
+            return str(result.output).strip()
+        except Exception:
+            return output.strip()
+
+    @staticmethod
+    def _coerce_int(value: object, *, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_int_or_none(value: object) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None

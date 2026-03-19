@@ -21,7 +21,7 @@ from pydantic_ai.messages import (
 
 from agent.config import settings
 from agent.loop import Task, TaskResult
-from agent.loop_services import HeartbeatService, ReflectionService, RunExecutor, TaskContextBuilder, TaskJournal
+from agent.loop_services import HeartbeatService, ReflectionService, RunExecutor, RunResult, TaskContextBuilder, TaskJournal
 from agent.events import (
     ProgressEvent,
     TextDeltaEvent,
@@ -31,6 +31,7 @@ from agent.events import (
     ToolCallStartEvent,
     ToolResultEvent,
 )
+from agent.task_waits import UserInputRequired
 
 
 class _MemoryStore:
@@ -174,6 +175,17 @@ class _StreamingAgentWithBrowserScreenshot:
         yield final
 
 
+class _StreamingAgentWithUserQuestion:
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        del prompt, message_history, usage_limits
+        raise UserInputRequired("Which environment should I use?", timeout_s=120)
+        if False:
+            yield None
+
+
 class _SlowFinalAgent:
     def run_mcp_servers(self) -> _NullContext:
         return _NullContext()
@@ -310,7 +322,7 @@ async def test_run_executor_retries_rate_limit(monkeypatch: pytest.MonkeyPatch) 
 
     assert agent.calls == 2
     assert sleeps == [5.0]
-    assert result == ("", 0, False, [])
+    assert result == RunResult()
 
 
 @pytest.mark.asyncio
@@ -329,7 +341,10 @@ async def test_run_executor_emits_events_and_folds_injected_messages() -> None:
         tier="smart",
     )
 
-    assert result == ("revised", 1, False, [])
+    assert result.output == "revised"
+    assert result.tool_calls == 1
+    assert result.user_visible_reply_sent is False
+    assert result.attachments == []
     assert agent.calls == 2
     assert "New message received while you were working" in agent.prompts[1]
     assert [type(event) for event in bridge.events] == [
@@ -356,7 +371,10 @@ async def test_run_executor_ignores_empty_thinking_deltas() -> None:
         tier="smart",
     )
 
-    assert result == ("done", 0, False, [])
+    assert result.output == "done"
+    assert result.tool_calls == 0
+    assert result.user_visible_reply_sent is False
+    assert result.attachments == []
     assert [type(event) for event in bridge.events] == [
         ThinkingDeltaEvent,
         ThinkingEndEvent,
@@ -380,7 +398,10 @@ async def test_run_executor_does_not_treat_comms_send_as_user_reply(monkeypatch:
         tier="smart",
     )
 
-    assert result == ("done", 1, False, [])
+    assert result.output == "done"
+    assert result.tool_calls == 1
+    assert result.user_visible_reply_sent is False
+    assert result.attachments == []
 
 
 @pytest.mark.asyncio
@@ -398,7 +419,10 @@ async def test_run_executor_treats_private_send_as_user_reply(monkeypatch: pytes
         tier="smart",
     )
 
-    assert result == ("done", 1, True, [])
+    assert result.output == "done"
+    assert result.tool_calls == 1
+    assert result.user_visible_reply_sent is False
+    assert result.attachments == []
 
 
 @pytest.mark.asyncio
@@ -406,19 +430,19 @@ async def test_run_executor_collects_browser_screenshot_attachments() -> None:
     executor = RunExecutor(event_bridge=_Bridge())
     agent = _StreamingAgentWithBrowserScreenshot()
 
-    output, tool_calls, discord_replied, attachments = await executor.run(
+    result = await executor.run(
         task=Task(content="show screenshot", source="discord", channel_id=101),
         agent=agent,  # type: ignore[arg-type]
         base_prompt="show screenshot",
         tier="smart",
     )
 
-    assert output == "done"
-    assert tool_calls == 1
-    assert discord_replied is False
-    assert len(attachments) == 1
-    assert attachments[0].filename == "browser-screenshot-1.png"
-    assert attachments[0].data == b"png"
+    assert result.output == "done"
+    assert result.tool_calls == 1
+    assert result.user_visible_reply_sent is False
+    assert len(result.attachments) == 1
+    assert result.attachments[0].filename == "browser-screenshot-1.png"
+    assert result.attachments[0].data == b"png"
 
 
 @pytest.mark.asyncio
@@ -428,17 +452,17 @@ async def test_run_executor_emits_idle_progress_when_task_goes_quiet(monkeypatch
     executor = RunExecutor(event_bridge=bridge)
     agent = _SlowFinalAgent()
 
-    output, tool_calls, discord_replied, attachments = await executor.run(
+    result = await executor.run(
         task=Task(content="wait for it"),
         agent=agent,  # type: ignore[arg-type]
         base_prompt="wait for it",
         tier="smart",
     )
 
-    assert output == "done"
-    assert tool_calls == 0
-    assert discord_replied is False
-    assert attachments == []
+    assert result.output == "done"
+    assert result.tool_calls == 0
+    assert result.user_visible_reply_sent is False
+    assert result.attachments == []
     assert any(
         isinstance(event, ProgressEvent) and "Still working" in event.message
         for event in bridge.events
@@ -468,10 +492,30 @@ async def test_run_executor_compresses_context_and_retries(isolated_paths) -> No
         tier="smart",
     )
 
-    assert result == ("done", 0, False, [])
+    assert result.output == "done"
+    assert result.tool_calls == 0
+    assert result.user_visible_reply_sent is False
+    assert result.attachments == []
     assert "summary" in agent.prompts[1]
     assert "CONTEXT COMPRESSED" in journal.path.read_text(encoding="utf-8")
     assert isinstance(bridge.events[0], ProgressEvent)
+
+
+@pytest.mark.asyncio
+async def test_run_executor_returns_waiting_result_for_user_question() -> None:
+    executor = RunExecutor(event_bridge=_Bridge())
+    agent = _StreamingAgentWithUserQuestion()
+
+    result = await executor.run(
+        task=Task(content="deploy it", source="discord", channel_id=101),
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="deploy it",
+        tier="smart",
+    )
+
+    assert result.waiting_for_user is True
+    assert result.question == "Which environment should I use?"
+    assert result.timeout_s == 120
 
 
 @pytest.mark.asyncio

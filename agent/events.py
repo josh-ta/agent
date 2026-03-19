@@ -28,6 +28,7 @@ Shell lifecycle:
 Task lifecycle:
   TaskStartEvent      — new task begun (content, tier)
   TaskDoneEvent       — task completed successfully
+  TaskWaitingEvent    — task is suspended waiting for clarification
   TaskErrorEvent      — task failed with an error
 
 Housekeeping:
@@ -171,6 +172,15 @@ class TaskDoneEvent:
 
 
 @dataclass
+class TaskWaitingEvent:
+    """Task paused and is waiting for user input."""
+    question: str
+    timeout_s: int
+    task_id: str | None = None
+    kind: str = field(default="task_waiting", init=False)
+
+
+@dataclass
 class TaskErrorEvent:
     """Task failed with an error."""
     error: str
@@ -203,6 +213,7 @@ AgentEvent = Union[
     TaskQueuedEvent,
     TaskStartEvent,
     TaskDoneEvent,
+    TaskWaitingEvent,
     TaskErrorEvent,
     ProgressEvent,
 ]

@@ -12,7 +12,7 @@ import contextlib
 import json
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -33,9 +33,6 @@ from pydantic_ai.usage import UsageLimits
 from agent.config import settings
 from agent.events import (
     ProgressEvent,
-    TaskDoneEvent,
-    TaskErrorEvent,
-    TaskStartEvent,
     TextDeltaEvent,
     TextTurnEndEvent,
     ThinkingDeltaEvent,
@@ -45,11 +42,23 @@ from agent.events import (
     bridge,
 )
 from agent.tools.discord_tools import DiscordAttachment, decode_data_url_attachment
+from agent.task_waits import UserInputRequired
 
 if TYPE_CHECKING:
     from agent.loop import Task, TaskResult
 
 log = structlog.get_logger()
+
+
+@dataclass
+class RunResult:
+    output: str = ""
+    tool_calls: int = 0
+    user_visible_reply_sent: bool = False
+    waiting_for_user: bool = False
+    question: str | None = None
+    timeout_s: int = 300
+    attachments: list[DiscordAttachment] = field(default_factory=list)
 
 
 class TaskJournal:
@@ -109,16 +118,20 @@ class TaskContextBuilder:
             metadata=task.metadata,
             created_at=task.created_at,
             inject_queue=task.inject_queue,
+            response_future=task.response_future,
         )
 
         lessons_context = await self._load_lessons(task.content)
         channel_context = await self._load_channel_history(normalized_task)
+        resume_context = self._load_resume_context(normalized_task)
 
         parts: list[str] = []
         if channel_context:
             parts.append(channel_context)
         if lessons_context:
             parts.append(lessons_context)
+        if resume_context:
+            parts.append(resume_context)
         parts.append(normalized_task.content)
         return normalized_task, tier, "\n\n---\n\n".join(parts)
 
@@ -171,6 +184,23 @@ class TaskContextBuilder:
         except Exception:
             return ""
 
+    @staticmethod
+    def _load_resume_context(task: "Task") -> str:
+        metadata = task.metadata or {}
+        resume_context = metadata.get("resume_context")
+        if not isinstance(resume_context, dict):
+            return ""
+        question = str(resume_context.get("question", "")).strip()
+        answer = str(resume_context.get("answer", "")).strip()
+        if not question and not answer:
+            return ""
+        parts = ["## Resume context", "This task was paused for clarification and is now resuming."]
+        if question:
+            parts.append(f"Question asked: {question}")
+        if answer:
+            parts.append(f"User answer: {answer}")
+        return "\n".join(parts)
+
 
 class RunExecutor:
     def __init__(
@@ -194,7 +224,7 @@ class RunExecutor:
         base_prompt: str,
         tier: str,
         message_history: list | None = None,
-    ) -> tuple[str, int, bool, list[DiscordAttachment]]:
+    ) -> RunResult:
         prompt = base_prompt
         context_retries = 0
         max_context_retries = 2
@@ -205,10 +235,11 @@ class RunExecutor:
         max_bad_args_retries = 2
 
         while True:
-            discord_replied = False
+            user_visible_reply_sent = False
             tool_calls = 0
             result_output = ""
             attachments: list[DiscordAttachment] = []
+            pending_visible_discord_sends: set[str] = set()
             loop = asyncio.get_running_loop()
             progress_state = {
                 "last_activity_at": loop.time(),
@@ -258,7 +289,7 @@ class RunExecutor:
                             self._set_progress_activity(progress_state, f"running `{tool_name}`")
                             parsed_args = self._parse_tool_args(event.part.args)
                             if self._is_user_visible_discord_send(task, tool_name, parsed_args):
-                                discord_replied = True
+                                pending_visible_discord_sends.add(event.part.tool_call_id)
                             await self._bridge.emit(
                                 ToolCallStartEvent(
                                     tool_name=tool_name,
@@ -272,6 +303,12 @@ class RunExecutor:
                             if tool_name:
                                 self._set_progress_activity(progress_state, f"reviewing results from `{tool_name}`")
                             result_str = str(getattr(ret, "content", ret)) if ret is not None else ""
+                            if (
+                                tool_name == "send_discord"
+                                and getattr(ret, "tool_call_id", "") in pending_visible_discord_sends
+                                and self._is_successful_send_discord_result(result_str)
+                            ):
+                                user_visible_reply_sent = True
                             attachments.extend(self._extract_discord_attachments(tool_name, getattr(ret, "content", ret)))
                             await self._bridge.emit(
                                 ToolResultEvent(
@@ -294,7 +331,7 @@ class RunExecutor:
                                 )
                             )
                         )
-                        followup_output, followup_calls, followup_replied, followup_attachments = await self.run(
+                        followup_result = await self.run(
                             task=task,
                             agent=agent,
                             base_prompt=(
@@ -306,14 +343,38 @@ class RunExecutor:
                             tier=tier,
                             message_history=message_history,
                         )
-                        result_output = followup_output
-                        tool_calls += followup_calls
-                        discord_replied = discord_replied or followup_replied
-                        attachments.extend(followup_attachments)
+                        result_output = followup_result.output
+                        tool_calls += followup_result.tool_calls
+                        user_visible_reply_sent = user_visible_reply_sent or followup_result.user_visible_reply_sent
+                        attachments.extend(followup_result.attachments)
+                        if followup_result.waiting_for_user:
+                            return RunResult(
+                                output=result_output,
+                                tool_calls=tool_calls,
+                                user_visible_reply_sent=user_visible_reply_sent,
+                                waiting_for_user=True,
+                                question=followup_result.question,
+                                timeout_s=followup_result.timeout_s,
+                                attachments=attachments,
+                            )
 
-                return result_output, tool_calls, discord_replied, attachments
+                return RunResult(
+                    output=result_output,
+                    tool_calls=tool_calls,
+                    user_visible_reply_sent=user_visible_reply_sent,
+                    attachments=attachments,
+                )
 
             except Exception as exc:
+                if isinstance(exc, UserInputRequired):
+                    return RunResult(
+                        tool_calls=tool_calls,
+                        user_visible_reply_sent=user_visible_reply_sent,
+                        waiting_for_user=True,
+                        question=exc.question,
+                        timeout_s=exc.timeout_s,
+                        attachments=attachments,
+                    )
                 exc_str = str(exc)
                 is_context_overflow = "prompt is too long" in exc_str or ("400" in exc_str and "maximum" in exc_str)
                 is_rate_limit = "429" in exc_str
@@ -390,6 +451,11 @@ class RunExecutor:
             return False
         visible_channels = {cid for cid in (task.channel_id, settings.discord_agent_channel_id) if cid}
         return channel_id in visible_channels
+
+    @staticmethod
+    def _is_successful_send_discord_result(result: str) -> bool:
+        text = result.strip()
+        return bool(text) and not text.startswith("[ERROR") and text.startswith("Sent ")
 
     @staticmethod
     def _tool_name_from_result_event(event: FunctionToolResultEvent, result: object) -> str:

@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Sequence
 import discord
 import structlog
 
+from agent.task_waits import UserInputRequired, current_task_wait_context
+
 if TYPE_CHECKING:
     from discord.abc import Messageable
 
@@ -165,6 +167,9 @@ async def ask_user(question: str, timeout: int = 300) -> str:
     Returns:
         The user's reply text, or a timeout notice if no reply arrives.
     """
+    if current_task_wait_context() is not None:
+        raise UserInputRequired(question=question, timeout_s=timeout)
+
     from agent.config import settings
 
     if _discord_client is None:
