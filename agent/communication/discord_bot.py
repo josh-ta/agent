@@ -88,6 +88,20 @@ class DiscordBot:
         async def status(interaction: discord.Interaction) -> None:
             await self._handle_slash_command(interaction, "status")
 
+        @self._tree.command(name="memory", description="Show saved project memory for this repo")
+        async def memory(interaction: discord.Interaction) -> None:
+            await self._handle_slash_command(interaction, "memory")
+
+        @self._tree.command(name="remember", description="Save a repo-specific fact or preference")
+        @discord.app_commands.describe(fact="Fact or preference to keep in project memory")
+        async def remember(interaction: discord.Interaction, fact: str) -> None:
+            await self._handle_slash_command(interaction, "remember", fact)
+
+        @self._tree.command(name="unremember", description="Remove matching saved project-memory entries")
+        @discord.app_commands.describe(text="Text to match against saved project memory")
+        async def unremember(interaction: discord.Interaction, text: str) -> None:
+            await self._handle_slash_command(interaction, "unremember", text)
+
         @self._tree.command(name="cancel", description="Cancel the current task after the next safe step")
         async def cancel(interaction: discord.Interaction) -> None:
             await self._handle_slash_command(interaction, "cancel")

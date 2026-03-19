@@ -38,6 +38,7 @@ from agent.loop_services import (
     TaskJournal,
 )
 from agent.tools.discord_tools import DiscordAttachment
+from agent.project_memory import save_project_memory_facts
 from agent.task_waits import SuspendedTask, TaskWaitRegistry, task_wait_context
 
 log = structlog.get_logger()
@@ -62,6 +63,22 @@ _SMART_KEYWORDS = re.compile(
     r"\b(code|implement|write|create|fix|debug|test|pr|"
     r"pull\s+request|commit|clone|install|setup|configure|"
     r"research|summarize|search|find|build|run|script|sql)\b",
+    re.IGNORECASE,
+)
+_DEPLOY_KEYWORDS = re.compile(
+    r"\b(deploy|deployment|release|rollout|docker compose|docker-compose|ssh|prod|production|staging)\b",
+    re.IGNORECASE,
+)
+_HOST_FACT_RE = re.compile(
+    r"\b((?:app|data|deploy|db|database|redis|api|frontend)\s+host\s+(?:is|=)\s+([^\s,;]+))",
+    re.IGNORECASE,
+)
+_PATH_FACT_RE = re.compile(
+    r"\b((?:workspace|repo root|project root|deploy path)\s+(?:is|=)\s+([^\s,;]+))",
+    re.IGNORECASE,
+)
+_SCRIPT_FACT_RE = re.compile(
+    r"\b(use\s+(scripts/[^\s,;]+|[^\s,;]+\.sh)\b[^.]*)",
     re.IGNORECASE,
 )
 
@@ -694,6 +711,12 @@ class AgentLoop:
                     tool_calls=tool_calls,
                 )
 
+            task_succeeded = answered_user
+            deploy_blocker = self._build_deploy_blocker_message(task=task, run_result=run_result, output=final_output)
+            if deploy_blocker is not None:
+                final_output = deploy_blocker
+                task_succeeded = False
+
             elapsed_ms = (asyncio.get_running_loop().time() - start) * 1000
             elapsed_s = elapsed_ms / 1000
 
@@ -706,8 +729,8 @@ class AgentLoop:
                 tool_calls=tool_calls,
             )
 
-            status_value: TaskStatus = "succeeded" if answered_user else "failed"
-            if answered_user:
+            status_value: TaskStatus = "succeeded" if task_succeeded else "failed"
+            if task_succeeded:
                 await bridge.emit(TaskDoneEvent(
                     output=final_output,
                     elapsed_s=elapsed_s,
@@ -719,18 +742,18 @@ class AgentLoop:
             # Broadcast task done to Postgres audit log
             if self._postgres is not None:
                 try:
-                    await self._postgres.log_task_done(task.content, answered_user, elapsed_ms, tool_calls)
+                    await self._postgres.log_task_done(task.content, task_succeeded, elapsed_ms, tool_calls)
                 except Exception:
                     pass
 
-            if answered_user:
+            if task_succeeded:
                 self._success_count += 1
 
             if self.memory and hasattr(self.memory, "set_session_status"):
                 try:
                     await self.memory.set_session_status(
                         session_id,
-                        status="completed" if answered_user else "failed",
+                        status="completed" if task_succeeded else "failed",
                         pending_task_id="",
                     )
                 except Exception:
@@ -777,7 +800,7 @@ class AgentLoop:
                 answered_user=answered_user,
                 user_visible_reply_sent=run_result.user_visible_reply_sent,
                 attachments=attachments,
-                success=answered_user,
+                success=task_succeeded,
                 elapsed_ms=elapsed_ms,
                 tool_calls=tool_calls,
             )
@@ -936,6 +959,40 @@ class AgentLoop:
             return output.strip()
 
     @staticmethod
+    def _is_deploy_like_task(task: Task) -> bool:
+        return bool(_DEPLOY_KEYWORDS.search(task.content))
+
+    def _build_deploy_blocker_message(self, *, task: Task, run_result: RunResult, output: str) -> str | None:
+        if not self._is_deploy_like_task(task) or not run_result.shell_failures:
+            return None
+        if self._output_acknowledges_failure(output):
+            return output
+
+        blockers = "\n".join(f"- {item}" for item in run_result.shell_failures[:3])
+        return (
+            "The deployment is not verified as successful.\n\n"
+            "At least one critical shell step failed:\n"
+            f"{blockers}\n\n"
+            "I am treating this run as failed instead of summarizing it as a success. "
+            "Fix the blocker and rerun, or ask me to continue from this point."
+        )
+
+    @staticmethod
+    def _output_acknowledges_failure(output: str) -> bool:
+        lowered = output.strip().lower()
+        return any(
+            phrase in lowered
+            for phrase in (
+                "failed",
+                "not verified",
+                "blocked",
+                "error",
+                "did not complete",
+                "could not",
+            )
+        )
+
+    @staticmethod
     def _coerce_int(value: object, *, default: int = 0) -> int:
         try:
             return int(value)
@@ -950,25 +1007,61 @@ class AgentLoop:
             return None
 
     async def _maybe_promote_memory_fact(self, *, task: Task) -> None:
-        if self.memory is None or not hasattr(self.memory, "save_memory_fact"):
-            return
         text = task.content.strip()
         lowered = text.lower()
         if not text or len(text) > 1200:
             return
+        facts = self._extract_memory_facts(text)
+        if not facts:
+            return
+        metadata = {
+            "source": task.source,
+            "author": task.author,
+            "session_id": str((task.metadata or {}).get("session_id", "")),
+        }
+        if self.memory is not None and hasattr(self.memory, "save_memory_fact"):
+            for fact in facts:
+                await self.memory.save_memory_fact(fact, metadata=metadata)
+        save_project_memory_facts(facts)
+
+    @staticmethod
+    def _extract_memory_facts(text: str) -> set[str]:
+        lowered = text.lower()
         facts: set[str] = set()
         fact_prefixes = (
             "remember ",
+            "remember permanently ",
             "use ",
             "always ",
             "never ",
             "my ",
             "for this repo",
             "for this project",
+            "in this repo",
+            "in this project",
             "prefer ",
         )
         if any(lowered.startswith(prefix) for prefix in fact_prefixes):
             facts.add(text[:500])
+        if any(
+            phrase in lowered
+            for phrase in (
+                "app host",
+                "data host",
+                "deploy host",
+                "workspace is",
+                "repo root",
+                "project root",
+                "use scripts/",
+                "deploy script",
+                "do not claim deploy success",
+                "never claim deploy success",
+            )
+        ):
+            facts.add(text[:500])
+        for pattern in (_HOST_FACT_RE, _PATH_FACT_RE, _SCRIPT_FACT_RE):
+            for match in pattern.finditer(text):
+                facts.add(match.group(1)[:500])
         if "/workspace" in text:
             facts.add("Use the existing checkout in /workspace before guessing repo names, paths, or hosts.")
         if any(phrase in lowered for phrase in ("hallucinating a repo", "guess the repo", "guess a repo", "guess the host", "guess the hostname")):
@@ -981,12 +1074,4 @@ class AgentLoop:
             phrase in lowered for phrase in ("do not guess", "don't guess", "stop guessing")
         ):
             facts.add(text[:500])
-        if not facts:
-            return
-        metadata = {
-            "source": task.source,
-            "author": task.author,
-            "session_id": str((task.metadata or {}).get("session_id", "")),
-        }
-        for fact in facts:
-            await self.memory.save_memory_fact(fact, metadata=metadata)
+        return facts

@@ -38,6 +38,11 @@ from agent.events import (
     bridge,
 )
 from agent.loop import Task
+from agent.project_memory import (
+    remove_project_memory_facts,
+    render_project_memory,
+    save_project_memory_facts,
+)
 from agent.session_router import SessionRouter, TurnIntent
 from agent.tools import discord_tools as discord_tools_module
 
@@ -102,7 +107,7 @@ class NativeCommand:
 
     @property
     def expects_task_text(self) -> bool:
-        return self.name in {"replace", "queue"}
+        return self.name in {"replace", "queue", "remember", "unremember"}
 
 
 def parse_native_command(content: str) -> NativeCommand | None:
@@ -114,7 +119,19 @@ def parse_native_command(content: str) -> NativeCommand | None:
         return None
     name = parts[0].strip().lower()
     argument = parts[1].strip() if len(parts) > 1 else ""
-    if name not in {"status", "cancel", "replace", "queue", "clear", "resume", "forget", "help"}:
+    if name not in {
+        "status",
+        "cancel",
+        "replace",
+        "queue",
+        "clear",
+        "resume",
+        "forget",
+        "help",
+        "memory",
+        "remember",
+        "unremember",
+    }:
         return None
     return NativeCommand(name=name, argument=argument)
 
@@ -238,6 +255,7 @@ class MessageHandlingService:
         self._waiting_sink_tag = f"discord_waiting_prompt_{id(self)}"
         self._inject_queues: dict[int, asyncio.Queue[str]] = {}
         self._active_sessions: dict[int, str] = {}
+        self._sticky_sessions: dict[int, str] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._session_router = SessionRouter()
         self._bridge.register(self._waiting_sink_tag, self._make_waiting_prompt_sink())
@@ -247,6 +265,9 @@ class MessageHandlingService:
         return (
             "## Commands\n"
             "- `/status` — show active, queued, and waiting work\n"
+            "- `/memory` — show saved project memory for this repo\n"
+            "- `/remember <fact>` — save a repo-specific fact or preference\n"
+            "- `/unremember <text>` — remove saved project-memory entries matching text\n"
             "- `/cancel` — stop the current task after the next safe step\n"
             "- `/replace <task>` — cancel current work and run a new task next\n"
             "- `/queue <task>` — add a task to the back of the queue\n"
@@ -270,13 +291,17 @@ class MessageHandlingService:
         parsed: ParsedMessage,
         message: discord.Message,
         attachment_metadata: dict[str, Any],
+        session_id_seed: str = "",
     ) -> dict[str, Any]:
+        metadata_seed = dict(attachment_metadata)
+        if session_id_seed:
+            metadata_seed["session_id"] = session_id_seed
         metadata = self._session_router.build_metadata(
             source="discord",
             channel_id=parsed.channel_id,
             message_id=parsed.message_id,
             reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
-            metadata=attachment_metadata,
+            metadata=metadata_seed,
         )
         metadata["task_id"] = metadata.get("task_id") or f"discord-{parsed.channel_id}-{parsed.message_id}"
         return metadata
@@ -305,12 +330,15 @@ class MessageHandlingService:
         task_content: str,
         attachment_metadata: dict[str, Any],
         front: bool = False,
+        session_id_seed: str = "",
     ) -> Task:
         metadata = self._build_task_metadata(
             parsed=parsed,
             message=message,
             attachment_metadata=attachment_metadata,
+            session_id_seed=session_id_seed,
         )
+        self._sticky_sessions[parsed.channel_id] = metadata["session_id"]
         await self._persist_task_record(
             metadata=metadata,
             parsed=parsed,
@@ -456,6 +484,37 @@ class MessageHandlingService:
             await self._reply_safe(message, status)
             return True
 
+        if command.name == "memory":
+            await self._reply_safe(message, render_project_memory())
+            return True
+
+        if command.name in {"remember", "unremember"} and not task_content.strip():
+            await self._reply_safe(
+                message,
+                f"Usage: `/{command.name} <text>`",
+            )
+            return True
+
+        if command.name == "remember":
+            added = save_project_memory_facts([task_content])
+            await self._reply_safe(
+                message,
+                "🧠 Saved that to project memory."
+                if added
+                else "💬 That project-memory fact was already saved.",
+            )
+            return True
+
+        if command.name == "unremember":
+            removed = remove_project_memory_facts(task_content)
+            await self._reply_safe(
+                message,
+                f"🧹 Removed {removed} matching project-memory entr{'y' if removed == 1 else 'ies'}."
+                if removed
+                else "💬 I couldn't find a matching project-memory entry to remove.",
+            )
+            return True
+
         if command.name == "resume":
             waiting = self._agent_loop.wait_registry.pending_for_channel(parsed.channel_id)
             if len(waiting) == 1:
@@ -480,6 +539,8 @@ class MessageHandlingService:
             return True
 
         if command.name in {"cancel", "forget"}:
+            if command.name == "forget":
+                self._sticky_sessions.pop(parsed.channel_id, None)
             removed = await self._clear_queued_channel_tasks(
                 channel_id=parsed.channel_id,
                 reason="Cancelled by operator command.",
@@ -519,6 +580,7 @@ class MessageHandlingService:
                 task_content=task_content,
                 attachment_metadata=attachment_metadata,
                 front=False,
+                session_id_seed="",
             )
             await self._reply_safe(message, "📝 Queued that task.")
             return True
@@ -538,6 +600,7 @@ class MessageHandlingService:
                 task_content=task_content,
                 attachment_metadata=attachment_metadata,
                 front=True,
+                session_id_seed="",
             )
             await self._reply_safe(message, "⏭️ Replacing the current task. Your new task is next.")
             return True
@@ -715,6 +778,11 @@ class MessageHandlingService:
             if parsed.kind == MessageKind.TASK and self._is_private_channel(parsed.channel_id)
             else None
         )
+        sticky_session_id = (
+            self._sticky_sessions.get(parsed.channel_id, "")
+            if self._is_private_channel(parsed.channel_id) and native_command is None
+            else ""
+        )
         base_content = native_command.argument if native_command and native_command.expects_task_text else raw_task_content
         task_content, attachment_metadata, combined_content = await self._build_task_input(
             message,
@@ -742,7 +810,7 @@ class MessageHandlingService:
             reference_message_id=getattr(getattr(message, "reference", None), "message_id", None),
             content=combined_content,
             metadata={
-                "session_id": self._active_sessions.get(parsed.channel_id, ""),
+                "session_id": self._active_sessions.get(parsed.channel_id, "") or sticky_session_id,
                 **attachment_metadata,
             },
             has_active_task=parsed.channel_id in self._inject_queues,
@@ -771,6 +839,7 @@ class MessageHandlingService:
                     )
                 except discord.HTTPException:
                     pass
+            self._sticky_sessions[parsed.channel_id] = str((resumed_task.metadata or {}).get("session_id", "")).strip()
             await self._agent_loop.enqueue(resumed_task)
             return
 
@@ -795,6 +864,7 @@ class MessageHandlingService:
                 await self._acknowledge_message(message)
                 forget_request = self._is_forget_request(combined_content)
                 if forget_request:
+                    self._sticky_sessions.pop(parsed.channel_id, None)
                     await self._clear_queued_channel_tasks(
                         channel_id=parsed.channel_id,
                         reason="Discarded after operator said to forget the task.",
@@ -831,6 +901,7 @@ class MessageHandlingService:
                     task_content=task_content,
                     attachment_metadata=attachment_metadata,
                     front=True,
+                    session_id_seed="",
                 )
                 await self._acknowledge_message(message)
                 await self._reply_safe(message, "⏭️ Replacing the current task. Your new task is next.")
@@ -859,6 +930,7 @@ class MessageHandlingService:
                     task_content=task_content,
                     attachment_metadata=attachment_metadata,
                     front=True,
+                    session_id_seed="",
                 )
                 await self._acknowledge_message(message)
                 await self._reply_safe(message, "⏭️ Your new task is queued next.")
@@ -869,6 +941,7 @@ class MessageHandlingService:
                 task_content=task_content,
                 attachment_metadata=attachment_metadata,
                 front=False,
+                session_id_seed=sticky_session_id,
             )
             await self._acknowledge_message(message)
             position = f"#{self._agent_loop.queue.qsize()}" if self._agent_loop.queue.qsize() > 1 else "next"
@@ -885,8 +958,10 @@ class MessageHandlingService:
             parsed=parsed,
             message=message,
             attachment_metadata=attachment_metadata,
+            session_id_seed=sticky_session_id,
         )
         self._active_sessions[parsed.channel_id] = metadata["session_id"]
+        self._sticky_sessions[parsed.channel_id] = metadata["session_id"]
         await self._persist_task_record(
             metadata=metadata,
             parsed=parsed,

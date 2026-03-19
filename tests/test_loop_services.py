@@ -323,6 +323,20 @@ async def test_task_context_builder_prefers_session_context_and_adds_resume_chec
 
 
 @pytest.mark.asyncio
+async def test_task_context_builder_includes_project_memory(isolated_paths) -> None:
+    (isolated_paths["workspace"] / ".agent-project-memory.md").write_text(
+        "# Project Memory\n\n- App host is root@example\n",
+        encoding="utf-8",
+    )
+    builder = TaskContextBuilder(None)
+
+    _, _, prompt = await builder.build(Task(content="deploy", source="discord", channel_id=101))
+
+    assert "## Project memory" in prompt
+    assert "App host is root@example" in prompt
+
+
+@pytest.mark.asyncio
 async def test_task_journal_expires_appends_and_clears(tmp_path: Path) -> None:
     now = 4_000.0
     journal = TaskJournal(tmp_path, now_fn=lambda: now)
@@ -1013,6 +1027,10 @@ def test_run_executor_helper_methods_cover_parsing_visibility_and_attachment_ext
         "value": "[REDACTED]",
     }
     assert RunExecutor._sanitize_tool_result("secret_get", "hunter2") == "[REDACTED secret value]"
+    assert RunExecutor._detect_shell_failure("ok\n[exit code: 0]") is None
+    assert "Host key verification failed" in RunExecutor._detect_shell_failure(
+        "Host key verification failed.\n[exit code: 255]"
+    )
     assert RunExecutor._iter_text_values(
         {
             "a": "plain",

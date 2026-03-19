@@ -205,13 +205,16 @@ async def test_registered_slash_commands_route_expected_names(monkeypatch: pytes
     monkeypatch.setattr(bot, "_handle_slash_command", fake_handle_slash_command)
 
     for command in bot._tree.get_commands():
-        if command.name in {"queue", "replace"}:
+        if command.name in {"queue", "replace", "remember", "unremember"}:
             await command.callback(interaction, "do work")
         else:
             await command.callback(interaction)
 
     assert seen == [
         ("status", ""),
+        ("memory", ""),
+        ("remember", "do work"),
+        ("unremember", "do work"),
         ("cancel", ""),
         ("forget", ""),
         ("clear", ""),

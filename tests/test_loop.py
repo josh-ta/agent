@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -139,3 +140,56 @@ async def test_process_success_skips_answer_gate_when_reply_already_sent(event_c
 
     assert result.success is True
     assert isinstance(event_collector[1], TaskDoneEvent)
+
+
+@pytest.mark.asyncio
+async def test_process_deploy_task_fails_when_shell_step_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop = AgentLoop({"smart": _RecordingAgent(), "fast": _RecordingAgent(), "best": _RecordingAgent()})
+
+    async def fake_build(task: Task):
+        return task, "smart", "prompt"
+
+    async def fake_run(**kwargs):
+        return RunResult(
+            output="Deployment verification summary: everything looks good.",
+            tool_calls=2,
+            shell_failures=["Host key verification failed. | [exit code: 255]"],
+        )
+
+    async def fake_answer_gate(**kwargs):
+        return "Deployment verification summary: everything looks good.", True
+
+    monkeypatch.setattr(loop._context_builder, "build", fake_build)
+    monkeypatch.setattr(loop._run_executor, "run", fake_run)
+    monkeypatch.setattr(loop, "_ensure_answer_required", fake_answer_gate)
+
+    result = await loop._process(Task(content="deploy the app server"))
+
+    assert result.success is False
+    assert result.status == "failed"
+    assert "not verified as successful" in result.output
+    assert "Host key verification failed" in result.output
+
+
+def test_extract_memory_facts_handles_natural_repo_instructions() -> None:
+    facts = AgentLoop._extract_memory_facts(
+        "The app host is root@89.167.14.150, data host is root@89.167.1.147, "
+        "workspace is /workspace/TicketActionApp, and use scripts/deploy-app.sh first."
+    )
+
+    assert any("app host is root@89.167.14.150" in fact.lower() for fact in facts)
+    assert any("data host is root@89.167.1.147" in fact.lower() for fact in facts)
+    assert any("workspace is /workspace/TicketActionApp".lower() in fact.lower() for fact in facts)
+    assert any("use scripts/deploy-app.sh" in fact.lower() for fact in facts)
+
+
+@pytest.mark.asyncio
+async def test_memory_promotion_writes_project_memory_without_sqlite(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    loop = AgentLoop({"smart": _RecordingAgent(), "fast": _RecordingAgent(), "best": _RecordingAgent()}, memory_store=None)
+    task = Task(content="App host is root@89.167.14.150 and use scripts/deploy-app.sh for this project.")
+
+    await loop._maybe_promote_memory_fact(task=task)
+
+    project_memory = (isolated_paths["workspace"] / ".agent-project-memory.md").read_text(encoding="utf-8")
+    assert "root@89.167.14.150" in project_memory
+    assert "scripts/deploy-app.sh" in project_memory

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ from agent.events import (
     ToolResultEvent,
     bridge,
 )
+from agent.project_memory import load_project_memory
 from agent.tools.discord_tools import DiscordAttachment, decode_data_url_attachment, discord_send
 from agent.task_waits import UserInputRequired
 
@@ -52,6 +54,11 @@ if TYPE_CHECKING:
     from agent.loop import Task, TaskResult
 
 log = structlog.get_logger()
+_SHELL_EXIT_CODE_RE = re.compile(r"\[exit code:\s*(-?\d+)\]", re.IGNORECASE)
+_SHELL_CRITICAL_FAILURE_RE = re.compile(
+    r"(?i)(\[timeout|\[error:|host key verification failed|permission denied|command not found|"
+    r"module(?:not)?founderror|pull access denied|no module named|traceback )"
+)
 
 
 @dataclass
@@ -63,6 +70,7 @@ class RunResult:
     question: str | None = None
     timeout_s: int = 300
     attachments: list[DiscordAttachment] = field(default_factory=list)
+    shell_failures: list[str] = field(default_factory=list)
 
 
 class TaskJournal:
@@ -128,6 +136,7 @@ class TaskContextBuilder:
         lessons_context = await self._load_lessons(task.content)
         facts_context = await self._load_memory_facts(task.content)
         session_context = await self._load_session_context(normalized_task)
+        project_context = self._load_project_context()
         channel_context = await self._load_channel_history(normalized_task) if not session_context else ""
         resume_context = self._load_resume_context(normalized_task)
         checkpoint_context = await self._load_checkpoint_context(normalized_task)
@@ -138,6 +147,8 @@ class TaskContextBuilder:
             parts.append(session_context)
         elif channel_context:
             parts.append(channel_context)
+        if project_context:
+            parts.append(project_context)
         if facts_context:
             parts.append(facts_context)
         if lessons_context:
@@ -150,6 +161,10 @@ class TaskContextBuilder:
             parts.append(attachment_context)
         parts.append(normalized_task.content)
         return normalized_task, tier, "\n\n---\n\n".join(parts)
+
+    @staticmethod
+    def _load_project_context() -> str:
+        return load_project_memory()
 
     async def _load_lessons(self, content: str) -> str:
         if self._memory and hasattr(self._memory, "search_lessons"):
@@ -312,6 +327,7 @@ class RunExecutor:
             tool_calls = 0
             result_output = ""
             attachments: list[DiscordAttachment] = []
+            shell_failures: list[str] = []
             pending_visible_discord_sends: set[str] = set()
             loop = asyncio.get_running_loop()
             progress_state = {
@@ -407,6 +423,10 @@ class RunExecutor:
                                 and self._is_successful_send_discord_result(result_str)
                             ):
                                 user_visible_reply_sent = True
+                            if tool_name == "run_shell":
+                                failure = self._detect_shell_failure(result_str)
+                                if failure:
+                                    shell_failures.append(failure)
                             attachments.extend(self._extract_discord_attachments(tool_name, getattr(ret, "content", ret)))
                             await self._bridge.emit(
                                 ToolResultEvent(
@@ -454,13 +474,16 @@ class RunExecutor:
                                 question=followup_result.question,
                                 timeout_s=followup_result.timeout_s,
                                 attachments=attachments,
+                                shell_failures=shell_failures + followup_result.shell_failures,
                             )
+                        shell_failures.extend(followup_result.shell_failures)
 
                 return RunResult(
                     output=result_output,
                     tool_calls=tool_calls,
                     user_visible_reply_sent=user_visible_reply_sent,
                     attachments=attachments,
+                    shell_failures=shell_failures,
                 )
 
             except Exception as exc:
@@ -472,6 +495,7 @@ class RunExecutor:
                         question=exc.question,
                         timeout_s=exc.timeout_s,
                         attachments=attachments,
+                        shell_failures=shell_failures,
                     )
                 exc_str = str(exc)
                 is_context_overflow = "prompt is too long" in exc_str or ("400" in exc_str and "maximum" in exc_str)
@@ -667,6 +691,32 @@ class RunExecutor:
             except asyncio.QueueEmpty:
                 break
         return items
+
+    @staticmethod
+    def _detect_shell_failure(result: str) -> str | None:
+        text = result.strip()
+        if not text:
+            return None
+
+        match = _SHELL_EXIT_CODE_RE.search(text)
+        if match is not None:
+            try:
+                if int(match.group(1)) == 0:
+                    return None
+            except ValueError:
+                pass
+            return RunExecutor._summarize_shell_failure(text)
+
+        if _SHELL_CRITICAL_FAILURE_RE.search(text):
+            return RunExecutor._summarize_shell_failure(text)
+        return None
+
+    @staticmethod
+    def _summarize_shell_failure(text: str) -> str:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return "Shell command failed."
+        return " | ".join(lines[-3:])[:400]
 
     async def _progress_watchdog(self, progress_state: dict[str, object]) -> None:
         interval_s = max(1, int(settings.progress_heartbeat_seconds))

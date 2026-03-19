@@ -631,6 +631,7 @@ async def test_message_service_native_command_helper_paths(
     fake_client,
     discord_channels,
     fake_message_factory,
+    isolated_paths,
 ) -> None:
     loop = _ReadyLoop()
     service = MessageHandlingService(
@@ -650,6 +651,49 @@ async def test_message_service_native_command_helper_paths(
     )
     assert handled is True
     assert "/replace <task>" in help_message.replies[0]
+
+    memory_message = fake_message_factory(channel=discord_channels["private"], content="/memory")
+    handled = await service._handle_native_command(
+        message=memory_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="memory"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert handled is True
+    assert "(no project memory recorded yet)" in memory_message.replies[0]
+
+    remember_message = fake_message_factory(channel=discord_channels["private"], content="/remember app host is root@example")
+    handled = await service._handle_native_command(
+        message=remember_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="remember", argument="app host is root@example"),
+        task_content="app host is root@example",
+        attachment_metadata={},
+    )
+    assert handled is True
+    assert "Saved that to project memory" in remember_message.replies[0]
+
+    memory_message = fake_message_factory(channel=discord_channels["private"], content="/memory")
+    handled = await service._handle_native_command(
+        message=memory_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="memory"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert "root@example" in memory_message.replies[0]
+
+    unremember_message = fake_message_factory(channel=discord_channels["private"], content="/unremember root@example")
+    handled = await service._handle_native_command(
+        message=unremember_message,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="unremember", argument="root@example"),
+        task_content="root@example",
+        attachment_metadata={},
+    )
+    assert handled is True
+    assert "Removed 1 matching project-memory entry" in unremember_message.replies[0]
 
     queue_message = fake_message_factory(channel=discord_channels["private"], content="/queue run tests")
     handled = await service._handle_native_command(
@@ -675,6 +719,17 @@ async def test_message_service_native_command_helper_paths(
     )
     assert handled is True
     assert usage_message.replies == ["Usage: `/queue <task>`"]
+
+    remember_usage = fake_message_factory(channel=discord_channels["private"], content="/remember")
+    handled = await service._handle_native_command(
+        message=remember_usage,  # type: ignore[arg-type]
+        parsed=parsed,
+        command=NativeCommand(name="remember"),
+        task_content="",
+        attachment_metadata={},
+    )
+    assert handled is True
+    assert remember_usage.replies == ["Usage: `/remember <text>`"]
 
     public_message = fake_message_factory(channel=discord_channels["bus"], content="/help")
     public_parsed = _parsed(MessageKind.TASK, channel_id=discord_channels["bus"].id)
@@ -1113,6 +1168,36 @@ async def test_message_service_reacts_when_accepting_new_task(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert message.reactions == ["👀", "🏁"]
+
+
+@pytest.mark.asyncio
+async def test_message_service_reuses_sticky_private_session_between_turns(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _ReadyLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, channel_id=discord_channels["private"].id),
+    )
+
+    first = fake_message_factory(channel=discord_channels["private"], content="check the deploy logs", message_id=1)
+    await service.handle_message(first)  # type: ignore[arg-type]
+    first_session = loop.enqueued.metadata["session_id"]
+
+    second = fake_message_factory(channel=discord_channels["private"], content="also verify the nginx config", message_id=2)
+    await service.handle_message(second)  # type: ignore[arg-type]
+    second_session = loop.enqueued.metadata["session_id"]
+
+    assert first_session == second_session
 
 
 @pytest.mark.asyncio
