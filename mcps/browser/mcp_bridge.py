@@ -10,87 +10,158 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import os as _os
 import re
 import sys
 import traceback
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
-
-# ── Attempt to import optional deps ───────────────────────────────────────────
-try:
-    import uvicorn
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-    from starlette.routing import Mount, Route
-    HAS_STARLETTE = True
-except ImportError:
-    HAS_STARLETTE = False
-
-try:
-    from markdownify import markdownify as _md
-    HAS_MARKDOWNIFY = True
-except ImportError:
-    HAS_MARKDOWNIFY = False
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
 from playwright.async_api import async_playwright
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3080
 
-# ── Proxy + browser identity config ───────────────────────────────────────────
-_PROXY_URL     = _os.environ.get("PROXY_URL", "").strip()
-_PROXY_SERVER  = _os.environ.get("PROXY_SERVER", "").strip()   # host:port (alt form)
-_PROXY_USER    = _os.environ.get("PROXY_USERNAME", "").strip()
-_PROXY_PASS    = _os.environ.get("PROXY_PASSWORD", "").strip()
+@dataclass(frozen=True)
+class RuntimeDeps:
+    uvicorn: Any | None = None
+    Starlette: Any | None = None
+    Request: Any | None = None
+    JSONResponse: Any | None = None
+    Mount: Any | None = None
+    Route: Any | None = None
+    markdownify: Callable[..., str] | None = None
 
-# Build Playwright proxy dict.  Supports two forms:
-#   PROXY_URL=http://user:pass@host:port   (single env var — credentials parsed out explicitly)
-#   PROXY_SERVER=host:port + PROXY_USERNAME + PROXY_PASSWORD  (split form)
-#
-# Playwright does NOT parse credentials from the server URL string — they must
-# be supplied as separate username/password keys in the proxy dict.
-_PROXY_SETTINGS: dict | None = None
-if _PROXY_URL:
-    _parsed = urlparse(_PROXY_URL)
-    # Rebuild server URL without embedded credentials
-    _server_url = _PROXY_URL
-    if _parsed.username or _parsed.password:
-        if _parsed.hostname is None:
-            raise ValueError(f"Invalid PROXY_URL: missing hostname in {_PROXY_URL!r}")
-        _netloc_no_auth = _parsed.hostname
-        if _parsed.port:
-            _netloc_no_auth += f":{_parsed.port}"
-        _server_url = _parsed._replace(netloc=_netloc_no_auth).geturl()
-    _PROXY_SETTINGS = {"server": _server_url}
-    if _parsed.username:
-        _PROXY_SETTINGS["username"] = _parsed.username
-    if _parsed.password:
-        _PROXY_SETTINGS["password"] = _parsed.password
-elif _PROXY_SERVER:
-    _PROXY_SETTINGS = {"server": _PROXY_SERVER}
-    if _PROXY_USER:
-        _PROXY_SETTINGS["username"] = _PROXY_USER
-    if _PROXY_PASS:
-        _PROXY_SETTINGS["password"] = _PROXY_PASS
+    @property
+    def has_starlette(self) -> bool:
+        return all(
+            item is not None
+            for item in (self.uvicorn, self.Starlette, self.Request, self.JSONResponse, self.Mount, self.Route)
+        )
 
-# Browser identity — override locale, timezone, geolocation to match proxy country.
-# Defaults match a common US residential browser profile.
-_LOCALE    = _os.environ.get("BROWSER_LOCALE",   "en-US")
-_TIMEZONE  = _os.environ.get("BROWSER_TIMEZONE", "America/New_York")
-_LAT       = float(_os.environ.get("BROWSER_GEO_LAT",  "40.7128"))   # New York
-_LON       = float(_os.environ.get("BROWSER_GEO_LON",  "-74.0060"))
+    @property
+    def has_markdownify(self) -> bool:
+        return self.markdownify is not None
 
-# Realistic desktop viewport + UA (reduces bot fingerprint)
-_VIEWPORT  = {"width": 1920, "height": 1080}
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+
+@dataclass(frozen=True)
+class BridgeConfig:
+    port: int
+    proxy_settings: dict[str, str] | None
+    locale: str
+    timezone: str
+    latitude: float
+    longitude: float
+    viewport: dict[str, int]
+    user_agent: str
+
+
+def parse_proxy_settings(
+    *,
+    proxy_url: str = "",
+    proxy_server: str = "",
+    proxy_user: str = "",
+    proxy_pass: str = "",
+) -> dict[str, str] | None:
+    proxy_url = proxy_url.strip()
+    proxy_server = proxy_server.strip()
+    proxy_user = proxy_user.strip()
+    proxy_pass = proxy_pass.strip()
+    if proxy_url:
+        parsed = urlparse(proxy_url)
+        server_url = proxy_url
+        if parsed.username or parsed.password:
+            if parsed.hostname is None:
+                raise ValueError(f"Invalid PROXY_URL: missing hostname in {proxy_url!r}")
+            netloc = parsed.hostname
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            server_url = parsed._replace(netloc=netloc).geturl()
+        settings = {"server": server_url}
+        if parsed.username:
+            settings["username"] = parsed.username
+        if parsed.password:
+            settings["password"] = parsed.password
+        return settings
+    if proxy_server:
+        settings = {"server": proxy_server}
+        if proxy_user:
+            settings["username"] = proxy_user
+        if proxy_pass:
+            settings["password"] = proxy_pass
+        return settings
+    return None
+
+
+def build_config(env: Mapping[str, str], argv: Sequence[str]) -> BridgeConfig:
+    port = int(argv[1]) if len(argv) > 1 else 3080
+    return BridgeConfig(
+        port=port,
+        proxy_settings=parse_proxy_settings(
+            proxy_url=env.get("PROXY_URL", ""),
+            proxy_server=env.get("PROXY_SERVER", ""),
+            proxy_user=env.get("PROXY_USERNAME", ""),
+            proxy_pass=env.get("PROXY_PASSWORD", ""),
+        ),
+        locale=env.get("BROWSER_LOCALE", "en-US"),
+        timezone=env.get("BROWSER_TIMEZONE", "America/New_York"),
+        latitude=float(env.get("BROWSER_GEO_LAT", "40.7128")),
+        longitude=float(env.get("BROWSER_GEO_LON", "-74.0060")),
+        viewport={"width": 1920, "height": 1080},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+
+
+def load_optional_deps(
+    import_module: Callable[[str], Any] = importlib.import_module,
+) -> RuntimeDeps:
+    uvicorn = Starlette = Request = JSONResponse = Mount = Route = markdownify = None
+    try:
+        uvicorn = import_module("uvicorn")
+        Starlette = import_module("starlette.applications").Starlette
+        Request = import_module("starlette.requests").Request
+        JSONResponse = import_module("starlette.responses").JSONResponse
+        routes = import_module("starlette.routing")
+        Mount = routes.Mount
+        Route = routes.Route
+    except ImportError:
+        pass
+    try:
+        markdownify = import_module("markdownify").markdownify
+    except ImportError:
+        pass
+    return RuntimeDeps(
+        uvicorn=uvicorn,
+        Starlette=Starlette,
+        Request=Request,
+        JSONResponse=JSONResponse,
+        Mount=Mount,
+        Route=Route,
+        markdownify=markdownify,
+    )
+
+
+CONFIG = build_config(_os.environ, sys.argv)
+DEPS = load_optional_deps()
+
+PORT = CONFIG.port
+_PROXY_SETTINGS = CONFIG.proxy_settings
+_LOCALE = CONFIG.locale
+_TIMEZONE = CONFIG.timezone
+_LAT = CONFIG.latitude
+_LON = CONFIG.longitude
+_VIEWPORT = CONFIG.viewport
+_USER_AGENT = CONFIG.user_agent
+HAS_STARLETTE = DEPS.has_starlette
+HAS_MARKDOWNIFY = DEPS.has_markdownify
 
 print(
     f"[mcp_bridge] Starting on port {PORT} "
@@ -101,68 +172,88 @@ print(
     flush=True,
 )
 
-# ── HTML → Markdown conversion ─────────────────────────────────────────────────
-# Tags that add zero information when converted — strip them entirely before md
 _STRIP_TAGS = ["script", "style", "noscript", "iframe", "svg", "head"]
 _STRIP_RE = re.compile(
     r"<(" + "|".join(_STRIP_TAGS) + r")[\s>].*?</\1>",
     re.IGNORECASE | re.DOTALL,
 )
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
-
-# Caps — tuned to stay well under 8k tokens even for dense pages
-_MD_CHAR_CAP = 12_000   # ~3k tokens after conversion
-_HTML_CHAR_CAP = 80_000  # pre-strip cap to avoid huge regex on multi-MB pages
+_MD_CHAR_CAP = 12_000
+_HTML_CHAR_CAP = 80_000
 
 
-def _html_to_markdown(html: str) -> str:
-    """Strip boilerplate and convert HTML to compact Markdown."""
-    if len(html) > _HTML_CHAR_CAP:
-        html = html[:_HTML_CHAR_CAP]
-
-    # Remove script/style/svg noise before any conversion
+def _html_to_markdown(
+    html: str,
+    *,
+    markdownify_fn: Callable[..., str] | None = None,
+    md_char_cap: int = _MD_CHAR_CAP,
+    html_char_cap: int = _HTML_CHAR_CAP,
+) -> str:
+    if len(html) > html_char_cap:
+        html = html[:html_char_cap]
     html = _STRIP_RE.sub("", html)
-
-    if HAS_MARKDOWNIFY:
-        md = _md(
+    renderer = DEPS.markdownify if markdownify_fn is None else markdownify_fn
+    if renderer is not None:
+        md = renderer(
             html,
             heading_style="ATX",
             bullets="-",
-            strip=["a"],        # drop hyperlinks — keep link text, lose URLs
-            convert=["p", "h1", "h2", "h3", "h4", "h5", "h6",
-                     "li", "ul", "ol", "table", "tr", "td", "th",
-                     "strong", "em", "br", "hr"],
+            strip=["a"],
         )
     else:
-        # Minimal fallback: strip all remaining tags
         md = re.sub(r"<[^>]+>", " ", html)
-
-    # Collapse runs of whitespace / blank lines
     md = _BLANK_LINES_RE.sub("\n\n", md).strip()
-
-    if len(md) > _MD_CHAR_CAP:
-        md = md[:_MD_CHAR_CAP] + "\n\n... [page truncated]"
-
+    if len(md) > md_char_cap:
+        md = md[:md_char_cap] + "\n\n... [page truncated]"
     return md
 
-# ── Playwright singleton ───────────────────────────────────────────────────────
+
+def _context_kwargs(config: BridgeConfig) -> dict[str, Any]:
+    return {
+        "proxy": config.proxy_settings,
+        "locale": config.locale,
+        "timezone_id": config.timezone,
+        "geolocation": {"latitude": config.latitude, "longitude": config.longitude},
+        "permissions": ["geolocation"],
+        "viewport": config.viewport,
+        "user_agent": config.user_agent,
+        "color_scheme": "light",
+        "extra_http_headers": {
+            "Accept-Language": f"{config.locale},{config.locale.split('-')[0]};q=0.9,en;q=0.8",
+        },
+    }
+
+
+def _init_script(config: BridgeConfig) -> str:
+    return f"""
+                Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+                Object.defineProperty(navigator, 'plugins', {{ get: () => [1,2,3,4,5] }});
+                Object.defineProperty(navigator, 'languages', {{
+                    get: () => ['{config.locale}', '{config.locale.split("-")[0]}']
+                }});
+            """
+
 
 _browser = None
 _context = None
-_page    = None
-_pw      = None
+_page = None
+_pw = None
 
 
-async def get_page():
+async def get_page(
+    *,
+    config: BridgeConfig | None = None,
+    playwright_factory: Callable[[], Any] = async_playwright,
+):
     global _browser, _context, _page, _pw
+    config = config or CONFIG
     try:
         if _pw is None:
-            _pw = await async_playwright().start()
-
+            _pw = await playwright_factory().start()
         if _browser is None or not _browser.is_connected():
             _browser = await _pw.chromium.launch(
                 headless=False,
-                proxy=_PROXY_SETTINGS,
+                proxy=config.proxy_settings,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-first-run",
@@ -171,128 +262,88 @@ async def get_page():
             )
             _context = None
             _page = None
-
         if _context is None:
-            _context = await _browser.new_context(
-                # Proxy auth at context level (handles authenticated proxies)
-                proxy=_PROXY_SETTINGS,
-                # Locale / language headers
-                locale=_LOCALE,
-                timezone_id=_TIMEZONE,
-                # Geolocation spoofing
-                geolocation={"latitude": _LAT, "longitude": _LON},
-                permissions=["geolocation"],
-                # Viewport + UA that look like a real desktop Chrome
-                viewport=_VIEWPORT,
-                user_agent=_USER_AGENT,
-                # Colour scheme / platform hints
-                color_scheme="light",
-                extra_http_headers={
-                    "Accept-Language": f"{_LOCALE},{_LOCALE.split('-')[0]};q=0.9,en;q=0.8",
-                },
-            )
+            _context = await _browser.new_context(**_context_kwargs(config))
             _page = None
-
         if _page is None:
             _page = await _context.new_page()
-            # Mask navigator.webdriver so automation is not detectable
-            await _page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['""" + _LOCALE + """', '""" + _LOCALE.split("-")[0] + """']
-                });
-            """)
-
+            await _page.add_init_script(_init_script(config))
         return _page
-    except Exception as e:
-        print(f"[mcp_bridge] get_page error: {e}", flush=True)
+    except Exception as exc:
+        print(f"[mcp_bridge] get_page error: {exc}", flush=True)
         raise
 
-
-# ── MCP Server ─────────────────────────────────────────────────────────────────
 
 mcp = Server("playwright-bridge")
 
 
-@mcp.list_tools()
-async def list_tools() -> list[Tool]:
+def _tool_specs() -> list[dict[str, Any]]:
     return [
-        Tool(
-            name="browser_navigate",
-            description="Navigate the browser to a URL",
-            inputSchema={
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-        ),
-        Tool(
-            name="browser_screenshot",
-            description="Take a screenshot of the current page, returns base64 PNG",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="browser_content",
-            description="Get the page content as clean Markdown (scripts/styles stripped). Much more token-efficient than raw HTML. Use this to read page text, listings, tables, etc.",
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="browser_click",
-            description="Click an element by CSS selector",
-            inputSchema={
+        {
+            "name": "browser_navigate",
+            "description": "Navigate the browser to a URL",
+            "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+        },
+        {
+            "name": "browser_screenshot",
+            "description": "Take a screenshot of the current page, returns base64 PNG",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "browser_content",
+            "description": "Get the page content as clean Markdown (scripts/styles stripped). Much more token-efficient than raw HTML. Use this to read page text, listings, tables, etc.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "browser_click",
+            "description": "Click an element by CSS selector",
+            "inputSchema": {
                 "type": "object",
                 "properties": {"selector": {"type": "string"}},
                 "required": ["selector"],
             },
-        ),
-        Tool(
-            name="browser_type",
-            description="Type text into an element by CSS selector",
-            inputSchema={
+        },
+        {
+            "name": "browser_type",
+            "description": "Type text into an element by CSS selector",
+            "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "selector": {"type": "string"},
-                    "text": {"type": "string"},
-                },
+                "properties": {"selector": {"type": "string"}, "text": {"type": "string"}},
                 "required": ["selector", "text"],
             },
-        ),
-        Tool(
-            name="browser_evaluate",
-            description="Execute JavaScript in the browser and return the result",
-            inputSchema={
+        },
+        {
+            "name": "browser_evaluate",
+            "description": "Execute JavaScript in the browser and return the result",
+            "inputSchema": {
                 "type": "object",
                 "properties": {"script": {"type": "string"}},
                 "required": ["script"],
             },
-        ),
-        Tool(
-            name="browser_snapshot",
-            description=(
+        },
+        {
+            "name": "browser_snapshot",
+            "description": (
                 "Return a compact accessibility tree of the current page — element roles, "
                 "names, and ref IDs. Much cheaper than screenshots for understanding page "
                 "structure before interacting with it. Use this instead of browser_screenshot "
                 "when you need to find selectors or understand layout."
             ),
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="browser_fill",
-            description="Clear a form field and type new text into it (by CSS selector). Equivalent to clearing then typing.",
-            inputSchema={
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "browser_fill",
+            "description": "Clear a form field and type new text into it (by CSS selector). Equivalent to clearing then typing.",
+            "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "selector": {"type": "string"},
-                    "value": {"type": "string"},
-                },
+                "properties": {"selector": {"type": "string"}, "value": {"type": "string"}},
                 "required": ["selector", "value"],
             },
-        ),
-        Tool(
-            name="browser_scroll",
-            description="Scroll the page or a specific element. Use direction='down'/'up'/'left'/'right' and amount in pixels, or supply a selector to scroll an element into view.",
-            inputSchema={
+        },
+        {
+            "name": "browser_scroll",
+            "description": "Scroll the page or a specific element. Use direction='down'/'up'/'left'/'right' and amount in pixels, or supply a selector to scroll an element into view.",
+            "inputSchema": {
                 "type": "object",
                 "properties": {
                     "direction": {
@@ -300,105 +351,133 @@ async def list_tools() -> list[Tool]:
                         "enum": ["down", "up", "left", "right"],
                         "default": "down",
                     },
-                    "amount": {
-                        "type": "integer",
-                        "description": "Pixels to scroll",
-                        "default": 500,
-                    },
+                    "amount": {"type": "integer", "description": "Pixels to scroll", "default": 500},
                     "selector": {
                         "type": "string",
                         "description": "Optional CSS selector — scroll this element into view instead",
                     },
                 },
             },
-        ),
+        },
     ]
+
+
+def _text_result(text: str) -> list[TextContent]:
+    return [TextContent(type="text", text=text)]
+
+
+def format_accessibility_tree(snapshot: dict[str, Any], limit: int = 8000) -> str:
+    def _compact(node: dict[str, Any], depth: int = 0) -> str:
+        indent = "  " * depth
+        role = node.get("role", "")
+        name = node.get("name", "")
+        label = f"{role}: {name}" if name else role
+        lines = [f"{indent}{label}"]
+        for child in node.get("children", []):
+            lines.append(_compact(child, depth + 1))
+        return "\n".join(lines)
+
+    tree = _compact(snapshot)
+    if len(tree) > limit:
+        tree = tree[:limit] + "\n... [truncated]"
+    return tree
+
+
+def scroll_args_to_delta(direction: str, amount: int) -> tuple[int, int]:
+    axis_map = {"down": (0, amount), "up": (0, -amount), "right": (amount, 0), "left": (-amount, 0)}
+    return axis_map.get(direction, (0, amount))
+
+
+async def _tool_navigate(page: Any, arguments: dict[str, Any]) -> str:
+    url = arguments["url"]
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    return f"Navigated to {url}"
+
+
+async def _tool_screenshot(page: Any, arguments: dict[str, Any]) -> str:
+    png = await page.screenshot(full_page=False)
+    return f"data:image/png;base64,{base64.b64encode(png).decode()}"
+
+
+async def _tool_content(page: Any, arguments: dict[str, Any]) -> str:
+    return _html_to_markdown(await page.content())
+
+
+async def _tool_click(page: Any, arguments: dict[str, Any]) -> str:
+    await page.click(arguments["selector"], timeout=10000)
+    return f"Clicked {arguments['selector']}"
+
+
+async def _tool_type(page: Any, arguments: dict[str, Any]) -> str:
+    await page.fill(arguments["selector"], arguments["text"], timeout=10000)
+    return f"Typed into {arguments['selector']}"
+
+
+async def _tool_evaluate(page: Any, arguments: dict[str, Any]) -> str:
+    return str(await page.evaluate(arguments["script"]))
+
+
+async def _tool_snapshot(page: Any, arguments: dict[str, Any]) -> str:
+    snapshot = await page.accessibility.snapshot()
+    if snapshot is None:
+        return "(accessibility tree is empty)"
+    return format_accessibility_tree(snapshot)
+
+
+async def _tool_fill(page: Any, arguments: dict[str, Any]) -> str:
+    selector = arguments["selector"]
+    value = arguments.get("value", "")
+    await page.fill(selector, value, timeout=10000)
+    return f"Filled '{selector}' with provided value"
+
+
+async def _tool_scroll(page: Any, arguments: dict[str, Any]) -> str:
+    selector = arguments.get("selector", "")
+    if selector:
+        await page.eval_on_selector(
+            selector,
+            "el => el.scrollIntoView({behavior: 'smooth', block: 'center'})",
+        )
+        return f"Scrolled '{selector}' into view"
+    direction = arguments.get("direction", "down")
+    amount = int(arguments.get("amount", 500))
+    dx, dy = scroll_args_to_delta(direction, amount)
+    await page.evaluate(f"window.scrollBy({dx}, {dy})")
+    return f"Scrolled {direction} by {amount}px"
+
+
+TOOL_HANDLERS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
+    "browser_navigate": _tool_navigate,
+    "browser_screenshot": _tool_screenshot,
+    "browser_content": _tool_content,
+    "browser_click": _tool_click,
+    "browser_type": _tool_type,
+    "browser_evaluate": _tool_evaluate,
+    "browser_snapshot": _tool_snapshot,
+    "browser_fill": _tool_fill,
+    "browser_scroll": _tool_scroll,
+}
+
+
+@mcp.list_tools()
+async def list_tools() -> list[Tool]:
+    return [Tool(**spec) for spec in _tool_specs()]
 
 
 @mcp.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         page = await get_page()
-    except Exception as e:
-        return [TextContent(type="text", text=f"Browser error: {e}")]
-
+    except Exception as exc:
+        return _text_result(f"Browser error: {exc}")
+    handler = TOOL_HANDLERS.get(name)
+    if handler is None:
+        return _text_result(f"Unknown tool: {name}")
     try:
-        if name == "browser_navigate":
-            url = arguments["url"]
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            return [TextContent(type="text", text=f"Navigated to {url}")]
+        return _text_result(await handler(page, arguments))
+    except Exception as exc:
+        return _text_result(f"Tool error ({name}): {exc}\n{traceback.format_exc()}")
 
-        elif name == "browser_screenshot":
-            png = await page.screenshot(full_page=False)
-            b64 = base64.b64encode(png).decode()
-            return [TextContent(type="text", text=f"data:image/png;base64,{b64}")]
-
-        elif name == "browser_content":
-            html = await page.content()
-            md = _html_to_markdown(html)
-            return [TextContent(type="text", text=md)]
-
-        elif name == "browser_click":
-            await page.click(arguments["selector"], timeout=10000)
-            return [TextContent(type="text", text=f"Clicked {arguments['selector']}")]
-
-        elif name == "browser_type":
-            await page.fill(arguments["selector"], arguments["text"], timeout=10000)
-            return [TextContent(type="text", text=f"Typed into {arguments['selector']}")]
-
-        elif name == "browser_evaluate":
-            result = await page.evaluate(arguments["script"])
-            return [TextContent(type="text", text=str(result))]
-
-        elif name == "browser_snapshot":
-            snapshot = await page.accessibility.snapshot()
-            if snapshot is None:
-                return [TextContent(type="text", text="(accessibility tree is empty)")]
-
-            def _compact(node: dict, depth: int = 0) -> str:
-                indent = "  " * depth
-                role = node.get("role", "")
-                name = node.get("name", "")
-                label = f"{role}: {name}" if name else role
-                lines = [f"{indent}{label}"]
-                for child in node.get("children", []):
-                    lines.append(_compact(child, depth + 1))
-                return "\n".join(lines)
-
-            tree = _compact(snapshot)
-            if len(tree) > 8000:
-                tree = tree[:8000] + "\n... [truncated]"
-            return [TextContent(type="text", text=tree)]
-
-        elif name == "browser_fill":
-            selector = arguments["selector"]
-            value = arguments.get("value", "")
-            await page.fill(selector, value, timeout=10000)
-            return [TextContent(type="text", text=f"Filled '{selector}' with provided value")]
-
-        elif name == "browser_scroll":
-            selector = arguments.get("selector", "")
-            if selector:
-                await page.eval_on_selector(
-                    selector,
-                    "el => el.scrollIntoView({behavior: 'smooth', block: 'center'})",
-                )
-                return [TextContent(type="text", text=f"Scrolled '{selector}' into view")]
-            direction = arguments.get("direction", "down")
-            amount = int(arguments.get("amount", 500))
-            axis_map = {"down": (0, amount), "up": (0, -amount), "right": (amount, 0), "left": (-amount, 0)}
-            dx, dy = axis_map.get(direction, (0, amount))
-            await page.evaluate(f"window.scrollBy({dx}, {dy})")
-            return [TextContent(type="text", text=f"Scrolled {direction} by {amount}px")]
-
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    except Exception as e:
-        return [TextContent(type="text", text=f"Tool error ({name}): {e}\n{traceback.format_exc()}")]
-
-
-# ── Health endpoint (always available via stdlib, no extra deps) ───────────────
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -416,74 +495,105 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
 
-# ── Server startup ─────────────────────────────────────────────────────────────
+def build_starlette_app(mcp_server: Server, transport: Any, deps: RuntimeDeps) -> Any:
+    async def _handle_sse(request: Any):
+        async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
+            await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
 
-if HAS_STARLETTE:
-    # Full Starlette app: /health + /sse + /messages on one port
-    sse_transport = SseServerTransport("/messages")
+    async def _handle_health(request: Any):
+        return deps.JSONResponse({"status": "ok"})
 
-    async def _handle_sse(request: Request):
-        async with sse_transport.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
-
-    async def _handle_health(request: Request):
-        return JSONResponse({"status": "ok"})
-
-    app = Starlette(
+    return deps.Starlette(
         routes=[
-            Route("/health", _handle_health),
-            Route("/sse", _handle_sse),
-            Mount("/messages", app=sse_transport.handle_post_message),
+            deps.Route("/health", _handle_health),
+            deps.Route("/sse", _handle_sse),
+            deps.Mount("/messages", app=transport.handle_post_message),
         ]
     )
 
-    if __name__ == "__main__":
+
+def build_fallback_asgi_app(mcp_server: Server, transport: Any):
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        path = scope.get("path", "")
+        if path == "/health":
+            body = b'{"status":"ok"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"content-length", str(len(body)).encode()],
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+        elif path == "/sse":
+            async with transport.connect_sse(scope, receive, send) as streams:
+                await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+        elif path.startswith("/messages"):
+            await transport.handle_post_message(scope, receive, send)
+        else:
+            await send({"type": "http.response.start", "status": 404, "headers": []})
+            await send({"type": "http.response.body", "body": b"not found"})
+
+    return app
+
+
+def resolve_hypercorn(import_module: Callable[[str], Any] = importlib.import_module) -> tuple[Any | None, Any | None]:
+    try:
+        serve = import_module("hypercorn.asyncio").serve
+        config_cls = import_module("hypercorn.config").Config
+        return serve, config_cls
+    except ImportError:
+        return None, None
+
+
+async def run_fallback_server(
+    *,
+    port: int = PORT,
+    mcp_server: Server = mcp,
+    transport_factory: Callable[[str], Any] = SseServerTransport,
+    hypercorn_resolver: Callable[[], tuple[Any | None, Any | None]] = resolve_hypercorn,
+    http_server_cls: type[HTTPServer] = HTTPServer,
+) -> str:
+    transport = transport_factory("/messages")
+    app = build_fallback_asgi_app(mcp_server, transport)
+    serve, config_cls = hypercorn_resolver()
+    if serve is not None and config_cls is not None:
+        config = config_cls()
+        config.bind = [f"0.0.0.0:{port}"]
+        config.loglevel = "WARNING"
+        print(f"[mcp_bridge] Running hypercorn MCP server on :{port}", flush=True)
+        await serve(app, config)
+        return "hypercorn"
+    print("[mcp_bridge] WARNING: neither uvicorn nor hypercorn available; /sse will not work", flush=True)
+    print("[mcp_bridge] Only /health will be served (healthcheck will pass but browser tools unavailable)", flush=True)
+    server = http_server_cls(("0.0.0.0", port), _HealthHandler)
+    await asyncio.get_running_loop().run_in_executor(None, server.serve_forever)
+    return "health_only"
+
+
+def build_default_app() -> Any | None:
+    if not DEPS.has_starlette:
+        return None
+    return build_starlette_app(mcp, SseServerTransport("/messages"), DEPS)
+
+
+app = build_default_app()
+
+
+def main() -> str:
+    if app is not None:
         print(f"[mcp_bridge] Running full Starlette+uvicorn MCP server on :{PORT}", flush=True)
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+        DEPS.uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+        return "starlette"
+    print(f"[mcp_bridge] Running fallback MCP server on :{PORT}", flush=True)
+    asyncio.run(run_fallback_server())
+    return "fallback"
 
-else:
-    # Fallback: serve /health, /sse, and /messages from a minimal async HTTP server.
-    async def _run_mcp_sse():
-        """Run MCP over SSE using mcp's built-in asyncio HTTP handler."""
 
-        transport = SseServerTransport("/messages")
-
-        async def app(scope, receive, send):
-            if scope["type"] == "http":
-                path = scope.get("path", "")
-                if path == "/health":
-                    body = b'{"status":"ok"}'
-                    await send({"type": "http.response.start", "status": 200,
-                                "headers": [[b"content-type", b"application/json"],
-                                            [b"content-length", str(len(body)).encode()]]})
-                    await send({"type": "http.response.body", "body": body})
-                elif path == "/sse":
-                    async with transport.connect_sse(scope, receive, send) as streams:
-                        await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
-                elif path.startswith("/messages"):
-                    await transport.handle_post_message(scope, receive, send)
-                else:
-                    await send({"type": "http.response.start", "status": 404, "headers": []})
-                    await send({"type": "http.response.body", "body": b"not found"})
-
-        # Try to use hypercorn or fall back to a basic asyncio server
-        try:
-            import hypercorn.asyncio
-            import hypercorn.config
-            config = hypercorn.config.Config()
-            config.bind = [f"0.0.0.0:{PORT}"]
-            config.loglevel = "WARNING"
-            print(f"[mcp_bridge] Running hypercorn MCP server on :{PORT}", flush=True)
-            await hypercorn.asyncio.serve(app, config)
-        except ImportError:
-            # Last resort: just run the health server on PORT and log a warning
-            print("[mcp_bridge] WARNING: neither uvicorn nor hypercorn available; /sse will not work", flush=True)
-            print("[mcp_bridge] Only /health will be served (healthcheck will pass but browser tools unavailable)", flush=True)
-            server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
-            await asyncio.get_running_loop().run_in_executor(None, server.serve_forever)
-
-    if __name__ == "__main__":
-        print(f"[mcp_bridge] Running fallback MCP server on :{PORT}", flush=True)
-        asyncio.run(_run_mcp_sse())
+if __name__ == "__main__":
+    main()

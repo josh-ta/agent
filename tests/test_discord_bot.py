@@ -78,6 +78,17 @@ class _FakeLoop:
         return SimpleNamespace(content=suspended.content, source=source, author=author, metadata=metadata)
 
 
+class _EventClient:
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+        self.user = SimpleNamespace(id=1, display_name="agent-1", bot=True)
+        self.guilds = [SimpleNamespace(name="Guild One")]
+
+    def event(self, fn):
+        self.handlers[fn.__name__] = fn
+        return fn
+
+
 @pytest.mark.asyncio
 async def test_free_discord_message_uses_queue_path(monkeypatch: pytest.MonkeyPatch) -> None:
     channel_id = 123
@@ -131,12 +142,48 @@ async def test_start_bot_handles_login_failure(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_start_bot_returns_early_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    started: list[str] = []
+
+    async def _start(_token: str) -> None:
+        started.append("started")
+
+    monkeypatch.setattr(discord_bot_module.settings, "discord_bot_token", "")
+    monkeypatch.setattr(bot._client, "start", _start)
+
+    await bot.start_bot()
+
+    assert started == []
+
+
+@pytest.mark.asyncio
 async def test_start_bot_handles_cancelled_error_and_closes(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
     closed: list[str] = []
 
     async def _start(_token: str) -> None:
         raise asyncio.CancelledError
+
+    async def _close() -> None:
+        closed.append("closed")
+
+    monkeypatch.setattr(discord_bot_module.settings, "discord_bot_token", "token")
+    monkeypatch.setattr(bot._client, "start", _start)
+    monkeypatch.setattr(bot._client, "close", _close)
+
+    await bot.start_bot()
+
+    assert closed == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_start_bot_handles_unexpected_error_and_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    closed: list[str] = []
+
+    async def _start(_token: str) -> None:
+        raise RuntimeError("boom")
 
     async def _close() -> None:
         closed.append("closed")
@@ -185,3 +232,108 @@ async def test_announce_online_uses_unknown_version_on_error(monkeypatch: pytest
     await bot._announce_online()
 
     assert "unknown" in channel.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_announce_online_swallows_http_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _BrokenChannel(_FakeChannel):
+        async def send(self, content: str = "", *, file=None) -> None:
+            raise RuntimeError("send failed")
+
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    bot._client = SimpleNamespace(get_channel=lambda channel_id: _BrokenChannel(55))  # type: ignore[assignment]
+
+    monkeypatch.setattr(discord_bot_module.settings, "discord_bus_channel_id", 55)
+    monkeypatch.setattr(discord_bot_module.settings, "agent_name", "agent-1")
+    monkeypatch.setattr(discord_bot_module.settings, "agent_model", "gpt-4o")
+    monkeypatch.setattr(discord_bot_module.discord, "HTTPException", RuntimeError)
+
+    await bot._announce_online()
+
+
+@pytest.mark.asyncio
+async def test_announce_online_returns_when_bus_channel_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    channel = _FakeChannel(55)
+    bot._client = SimpleNamespace(get_channel=lambda channel_id: channel)  # type: ignore[assignment]
+
+    monkeypatch.setattr(discord_bot_module.settings, "discord_bus_channel_id", 0)
+
+    await bot._announce_online()
+
+    assert channel.sent == []
+
+
+@pytest.mark.asyncio
+async def test_announce_online_returns_when_channel_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    bot._client = SimpleNamespace(get_channel=lambda channel_id: None)  # type: ignore[assignment]
+
+    monkeypatch.setattr(discord_bot_module.settings, "discord_bus_channel_id", 55)
+
+    await bot._announce_online()
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_wrapper_methods_delegate_to_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    calls: list[tuple[str, object]] = []
+
+    async def fake_send_reply(parsed, output, original_message) -> None:
+        calls.append(("reply", output))
+
+    async def fake_send_chunked(channel, text) -> None:
+        calls.append(("chunked", text))
+
+    async def fake_post_bus_status(message: str) -> None:
+        calls.append(("bus", message))
+
+    monkeypatch.setattr(bot._messages, "send_reply", fake_send_reply)
+    monkeypatch.setattr(bot._presenter, "send_chunked", fake_send_chunked)
+    monkeypatch.setattr(bot._messages, "post_bus_status", fake_post_bus_status)
+    monkeypatch.setattr(bot._presenter, "make_sink", lambda channel: ("sink", channel.id))
+
+    channel = _FakeChannel(55)
+    message = _FakeMessage(channel)
+
+    await bot._send_reply(None, "done", message)  # type: ignore[arg-type]
+    await bot._send_chunked(channel, "long text")
+    await bot._post_bus_status("ready")
+    sink = bot._make_discord_sink(channel)
+
+    assert calls == [("reply", "done"), ("chunked", "long text"), ("bus", "ready")]
+    assert sink == ("sink", 55)
+
+
+@pytest.mark.asyncio
+async def test_setup_events_registers_handlers_and_routes_callbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = object.__new__(DiscordBot)
+    bot._client = _EventClient()
+    seen: list[tuple[str, object]] = []
+
+    async def _announce_online() -> None:
+        seen.append(("ready", None))
+
+    async def _handle_message(message) -> None:
+        seen.append(("message", message.id))
+
+    bot._announce_online = _announce_online  # type: ignore[assignment]
+    bot._handle_message = _handle_message  # type: ignore[assignment]
+
+    warnings: list[str] = []
+    infos: list[str] = []
+    monkeypatch.setattr(discord_bot_module.log, "warning", lambda event, **kwargs: warnings.append(event))
+    monkeypatch.setattr(discord_bot_module.log, "info", lambda event, **kwargs: infos.append(event))
+
+    bot._setup_events()
+
+    await bot._client.handlers["on_ready"]()
+    await bot._client.handlers["on_message"](SimpleNamespace(id=7))
+    bot._client.user = None
+    await bot._client.handlers["on_message"](SimpleNamespace(id=8))
+    await bot._client.handlers["on_disconnect"]()
+    await bot._client.handlers["on_resumed"]()
+
+    assert seen == [("ready", None), ("message", 7)]
+    assert infos == ["discord_ready", "discord_resumed"]
+    assert warnings == ["discord_disconnected"]

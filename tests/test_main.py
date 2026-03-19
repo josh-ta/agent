@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 
 from agent.config import settings
 from agent.loop import Task, TaskResult
-from agent.main import RuntimeServices, _build_runtime, _install_signal_handlers, _run_once, _shutdown_runtime, _start, serve_api
+from agent.main import RuntimeServices, _build_runtime, _install_signal_handlers, _run_once, _shutdown_runtime, _start, run, serve_api, start
+
+
+def test_start_and_run_commands_delegate_to_asyncio(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+
+    monkeypatch.setattr("agent.main.asyncio.run", lambda coro: seen.append(coro))
+
+    start()
+    run("ship it")
+
+    assert len(seen) == 2
+    for coro in seen:
+        coro.close()
 
 
 @pytest.mark.asyncio
@@ -46,6 +62,39 @@ async def test_run_once_exits_nonzero_on_failure(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
+async def test_run_once_prints_success_and_shuts_down(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    calls: list[str] = []
+
+    class _Loop:
+        async def run_once(self, task: str):
+            return TaskResult(task=Task(content=task), output="done", success=True, elapsed_ms=1.0)
+
+        def stop(self) -> None:
+            return None
+
+    runtime = RuntimeServices(
+        sqlite=SimpleNamespace(close=lambda: None),
+        postgres=None,
+        loop=_Loop(),
+        bot=None,
+    )
+
+    async def _build_runtime(*, start_discord: bool):
+        return runtime
+
+    async def _shutdown_runtime_stub(runtime: RuntimeServices) -> None:
+        calls.append("shutdown")
+
+    monkeypatch.setattr("agent.main._build_runtime", _build_runtime)
+    monkeypatch.setattr("agent.main._shutdown_runtime", _shutdown_runtime_stub)
+
+    await _run_once("do the thing")
+
+    assert capsys.readouterr().out.strip() == "done"
+    assert calls == ["shutdown"]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_runtime_marks_offline_closes_sqlite_and_stops_loop() -> None:
     calls: list[str] = []
 
@@ -69,6 +118,57 @@ async def test_shutdown_runtime_marks_offline_closes_sqlite_and_stops_loop() -> 
     await _shutdown_runtime(runtime)
 
     assert calls == ["offline", "close", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_runtime_tolerates_offline_and_close_failures() -> None:
+    calls: list[str] = []
+
+    async def _set_offline() -> None:
+        calls.append("offline")
+        raise RuntimeError("boom")
+
+    async def _close() -> None:
+        calls.append("close")
+        raise RuntimeError("boom")
+
+    class _Loop:
+        def stop(self) -> None:
+            calls.append("stop")
+
+    runtime = RuntimeServices(
+        sqlite=SimpleNamespace(close=_close),
+        postgres=SimpleNamespace(set_offline=_set_offline),
+        loop=_Loop(),
+        bot=None,
+    )
+
+    await _shutdown_runtime(runtime)
+
+    assert calls == ["offline", "close", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_runtime_handles_missing_postgres() -> None:
+    calls: list[str] = []
+
+    async def _close() -> None:
+        calls.append("close")
+
+    class _Loop:
+        def stop(self) -> None:
+            calls.append("stop")
+
+    runtime = RuntimeServices(
+        sqlite=SimpleNamespace(close=_close),
+        postgres=None,
+        loop=_Loop(),
+        bot=None,
+    )
+
+    await _shutdown_runtime(runtime)
+
+    assert calls == ["close", "stop"]
 
 
 @pytest.mark.asyncio
@@ -192,6 +292,49 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
     assert ("register_agent", "postgresql://example") in calls
     assert ("register_all", ("_SQLiteStore", "_PostgresStore")) in calls
     assert ("set_postgres", "postgresql://example") in calls
+
+
+@pytest.mark.asyncio
+async def test_build_runtime_restores_pending_tasks_when_supported(monkeypatch: pytest.MonkeyPatch) -> None:
+    import agent.core as core_module
+    import agent.loop as loop_module
+    import agent.memory.sqlite_store as sqlite_store_module
+    import agent.tools.registry as registry_module
+
+    class _SQLiteStore:
+        def __init__(self, path) -> None:
+            self.path = path
+
+        async def init(self) -> None:
+            return None
+
+    class _Registry:
+        def register_all(self, sqlite, postgres) -> None:
+            return None
+
+    class _Loop:
+        def __init__(self, agents, *, memory_store, postgres_store) -> None:
+            self.waiting = 0
+            self.pending = 0
+
+        async def restore_waiting_tasks(self) -> int:
+            self.waiting += 1
+            return 0
+
+        async def restore_pending_tasks(self) -> int:
+            self.pending += 1
+            return 0
+
+    monkeypatch.setattr(settings, "postgres_url", "")
+    monkeypatch.setattr(sqlite_store_module, "SQLiteStore", _SQLiteStore)
+    monkeypatch.setattr(registry_module, "ToolRegistry", _Registry)
+    monkeypatch.setattr(core_module, "create_agents", lambda registry: {"fast": "agent"})
+    monkeypatch.setattr(loop_module, "AgentLoop", _Loop)
+
+    runtime = await _build_runtime(start_discord=False)
+
+    assert runtime.loop.waiting == 1
+    assert runtime.loop.pending == 1
 
 
 def test_install_signal_handlers_ignores_unsupported_platforms() -> None:
@@ -332,6 +475,49 @@ async def test_start_handles_signal_shutdown_and_cancellation(monkeypatch: pytes
     assert calls[:3] == ["loop", "bot", "shutdown"]
 
 
+@pytest.mark.asyncio
+async def test_start_handles_signal_shutdown_without_main_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    captured_handler = {}
+    shutdown_complete = asyncio.Event()
+
+    class _Loop:
+        async def run_forever(self) -> None:
+            calls.append("loop")
+            captured_handler["handler"]("SIGTERM")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+    runtime = RuntimeServices(
+        sqlite=SimpleNamespace(close=lambda: None),
+        postgres=None,
+        loop=_Loop(),
+        bot=None,
+    )
+
+    async def fake_build_runtime(*, start_discord: bool):
+        return runtime
+
+    async def fake_shutdown_runtime(_runtime: RuntimeServices) -> None:
+        calls.append("shutdown")
+        shutdown_complete.set()
+
+    def fake_install_signal_handlers(_loop, handler) -> None:
+        captured_handler["handler"] = handler
+
+    monkeypatch.setattr("agent.main._build_runtime", fake_build_runtime)
+    monkeypatch.setattr("agent.main._shutdown_runtime", fake_shutdown_runtime)
+    monkeypatch.setattr("agent.main._install_signal_handlers", fake_install_signal_handlers)
+    monkeypatch.setattr("agent.main.settings.discord_bot_token", "")
+    monkeypatch.setattr("importlib.metadata.version", lambda name: "1.0.0")
+
+    await _start()
+    await asyncio.wait_for(shutdown_complete.wait(), timeout=1)
+
+    assert calls == ["loop", "shutdown"]
+
+
 def test_serve_api_runs_uvicorn_with_factory(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, object] = {}
 
@@ -353,3 +539,26 @@ def test_serve_api_runs_uvicorn_with_factory(monkeypatch: pytest.MonkeyPatch) ->
         "port": 9000,
         "log_level": "warning",
     }
+
+
+def test_main_module_cli_guard_invokes_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class _FakeTyper:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def command(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+        def __call__(self) -> None:
+            calls.append("cli")
+
+    monkeypatch.setattr(typer, "Typer", _FakeTyper)
+
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "agent" / "main.py"), run_name="__main__")
+
+    assert calls == ["cli"]

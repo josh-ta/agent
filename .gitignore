@@ -13,5 +13,7 @@ venv/
 .DS_Store
 *.log
 .coverage
+coverage.xml
+htmlcov/
 # SSH keys — never commit these
 .ssh/

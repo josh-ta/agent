@@ -18,6 +18,7 @@ class _FakeConn:
         self.execute_results: list[str] = []
         self.fetch_results: list[list] = []
         self.fetchrow_results: list[dict | None] = []
+        self.fetchval_result = 1
 
     async def execute(self, query: str, *args):
         self.execute_calls.append((query, args))
@@ -28,6 +29,9 @@ class _FakeConn:
 
     async def fetchrow(self, query: str, *args):
         return self.fetchrow_results.pop(0) if self.fetchrow_results else {"n": 1}
+
+    async def fetchval(self, query: str, *args):
+        return self.fetchval_result
 
 
 class _FakePool:
@@ -171,6 +175,26 @@ async def test_postgres_store_close_closes_pool() -> None:
     await store.close()
 
     assert pool.closed is True
+
+
+@pytest.mark.asyncio
+async def test_postgres_store_close_is_noop_without_pool_and_healthcheck_paths() -> None:
+    store = PostgresStore("postgresql://example")
+    await store.close()
+    assert await store.healthcheck() is False
+
+    conn = _FakeConn()
+    pool = _FakePool(conn)
+    store._pool = pool  # type: ignore[assignment]
+    assert await store.healthcheck() is True
+
+    class _BrokenConn(_FakeConn):
+        async def fetchval(self, query: str):
+            raise RuntimeError("boom")
+
+    broken = PostgresStore("postgresql://example")
+    broken._pool = _FakePool(_BrokenConn())  # type: ignore[assignment]
+    assert await broken.healthcheck() is False
 
 
 @pytest.mark.asyncio

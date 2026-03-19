@@ -77,10 +77,8 @@ class SQLiteTaskRepository:
             migrations.append(("ALTER TABLE tasks ADD COLUMN updated_ts REAL", None))
 
         for sql, params in migrations:
-            if params is None:
-                await self._store._db.execute(sql)
-            else:
-                await self._store._db.execute(sql, params)
+            assert params is None
+            await self._store._db.execute(sql)
 
         await self._store._db.execute(
             """

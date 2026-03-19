@@ -57,7 +57,7 @@ strict = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "--cov=agent --cov-branch --cov-report=term-missing"
+addopts = "--cov=agent --cov=mcps --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-fail-under=99.9"
 markers = [
     "unit: fast isolated tests",
     "integration: tests that use real local resources like temporary SQLite databases",
@@ -65,7 +65,7 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["agent"]
+source = ["agent", "mcps"]
 
 [tool.coverage.report]
 skip_empty = true

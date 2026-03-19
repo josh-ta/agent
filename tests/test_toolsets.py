@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -177,3 +179,162 @@ async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.Monk
 
 async def _async_result(value):
     return value
+
+
+def test_task_resume_handles_missing_empty_truncated_and_read_error(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_paths,
+) -> None:
+    agent = _Agent()
+    monkeypatch.setattr(toolsets.settings, "workspace_path", isolated_paths["workspace"])
+    toolsets.attach_journal_tools(agent, sqlite=None)  # type: ignore[arg-type]
+    journal_path = isolated_paths["workspace"] / ".task_journal.md"
+
+    assert agent.funcs["task_resume"]() == "(no task journal found — this is a fresh start)"
+
+    journal_path.write_text("", encoding="utf-8")
+    assert agent.funcs["task_resume"]() == "(task journal is empty)"
+
+    journal_path.write_text("x" * 9000, encoding="utf-8")
+    truncated = agent.funcs["task_resume"]()
+    assert "[...older entries truncated...]" in truncated
+
+    original_read_text = Path.read_text
+
+    def _broken_read_text(self: Path, *args, **kwargs):
+        if self == journal_path:
+            raise OSError("boom")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _broken_read_text)
+    assert agent.funcs["task_resume"]() == "[journal read error: boom]"
+
+
+@pytest.mark.asyncio
+async def test_task_note_and_clear_schedule_sqlite_work(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    class _SQLiteSpy:
+        def __init__(self) -> None:
+            self.notes: list[tuple[str, str]] = []
+            self.cleared: list[str] = []
+
+        async def append_task_note(self, task_id: str, note: str) -> None:
+            self.notes.append((task_id, note))
+
+        async def clear_task_checkpoint(self, task_id: str) -> None:
+            self.cleared.append(task_id)
+
+    sqlite = _SQLiteSpy()
+    agent = _Agent()
+    monkeypatch.setattr(toolsets.settings, "workspace_path", isolated_paths["workspace"])
+    monkeypatch.setattr(toolsets, "current_task_id", lambda: "task-1")
+    toolsets.attach_journal_tools(agent, sqlite=sqlite)  # type: ignore[arg-type]
+
+    result = agent.funcs["task_note"]("hello")
+    await asyncio.sleep(0)
+    assert "Journal updated" in result
+    assert sqlite.notes and sqlite.notes[0][0] == "task-1"
+
+    clear_result = agent.funcs["task_journal_clear"]()
+    await asyncio.sleep(0)
+    assert clear_result == "Task journal cleared."
+    assert sqlite.cleared == ["task-1"]
+
+
+def test_task_note_and_clear_handle_missing_task_context(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    agent = _Agent()
+    monkeypatch.setattr(toolsets.settings, "workspace_path", isolated_paths["workspace"])
+    monkeypatch.setattr(toolsets, "current_task_id", lambda: "")
+    toolsets.attach_journal_tools(agent, sqlite=_SQLite())  # type: ignore[arg-type]
+
+    result = agent.funcs["task_note"]("hello")
+    clear_result = agent.funcs["task_journal_clear"]()
+
+    assert "Journal updated" in result
+    assert clear_result == "Task journal cleared."
+
+
+def test_task_note_and_clear_report_write_errors(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    agent = _Agent()
+    monkeypatch.setattr(toolsets.settings, "workspace_path", isolated_paths["workspace"])
+    toolsets.attach_journal_tools(agent, sqlite=None)  # type: ignore[arg-type]
+
+    original_open = Path.open
+
+    def _broken_open(self: Path, *args, **kwargs):
+        raise OSError("open failed")
+
+    def _broken_unlink(self: Path, *args, **kwargs):
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr(Path, "open", _broken_open)
+    assert agent.funcs["task_note"]("hello") == "[journal write error: open failed]"
+
+    journal_path = isolated_paths["workspace"] / ".task_journal.md"
+    monkeypatch.setattr(Path, "open", original_open)
+    journal_path.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(Path, "unlink", _broken_unlink)
+    assert agent.funcs["task_journal_clear"]() == "[journal clear error: unlink failed]"
+
+
+def test_task_note_and_clear_skip_async_scheduling_when_loop_not_running(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    class _Loop:
+        def is_running(self) -> bool:
+            return False
+
+        def create_task(self, coro) -> None:
+            raise AssertionError("create_task should not be called")
+
+    agent = _Agent()
+    monkeypatch.setattr(toolsets.settings, "workspace_path", isolated_paths["workspace"])
+    monkeypatch.setattr(toolsets, "current_task_id", lambda: "task-1")
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: _Loop())
+    toolsets.attach_journal_tools(agent, sqlite=_SQLite())  # type: ignore[arg-type]
+
+    assert "Journal updated" in agent.funcs["task_note"]("hello")
+    assert agent.funcs["task_journal_clear"]() == "Task journal cleared."
+
+
+def test_task_journal_clear_ignores_running_loop_lookup_errors(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    agent = _Agent()
+    monkeypatch.setattr(toolsets.settings, "workspace_path", isolated_paths["workspace"])
+    monkeypatch.setattr(toolsets, "current_task_id", lambda: "task-1")
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: (_ for _ in ()).throw(RuntimeError("no loop")))
+    toolsets.attach_journal_tools(agent, sqlite=_SQLite())  # type: ignore[arg-type]
+
+    assert agent.funcs["task_journal_clear"]() == "Task journal cleared."
+
+
+@pytest.mark.asyncio
+async def test_db_stats_reports_sqlite_and_postgres_errors() -> None:
+    class _BrokenSQLite:
+        async def get_stats(self):
+            raise RuntimeError("sqlite down")
+
+    class _BrokenPostgres:
+        async def get_stats(self):
+            raise RuntimeError("postgres down")
+
+    agent = _Agent()
+    toolsets.attach_database_tools(agent, sqlite=_BrokenSQLite(), postgres=_BrokenPostgres())  # type: ignore[arg-type]
+
+    result = await agent.funcs["db_stats"]()
+
+    assert "SQLite error: sqlite down" in result
+    assert "Postgres error: postgres down" in result
+
+
+@pytest.mark.asyncio
+async def test_attach_database_tools_with_single_backend() -> None:
+    sqlite_agent = _Agent()
+    toolsets.attach_database_tools(sqlite_agent, sqlite=_SQLite(), postgres=None)  # type: ignore[arg-type]
+    assert "memory_search" in sqlite_agent.funcs
+    assert "list_agents" not in sqlite_agent.funcs
+    assert "SQLite (local)" in await sqlite_agent.funcs["db_stats"]()
+    assert "Postgres (shared)" not in await sqlite_agent.funcs["db_stats"]()
+
+    postgres_agent = _Agent()
+    toolsets.attach_database_tools(postgres_agent, sqlite=None, postgres=_Postgres())  # type: ignore[arg-type]
+    assert "list_agents" in postgres_agent.funcs
+    assert "memory_search" not in postgres_agent.funcs
+    assert "Postgres (shared)" in await postgres_agent.funcs["db_stats"]()
+    assert "SQLite (local)" not in await postgres_agent.funcs["db_stats"]()

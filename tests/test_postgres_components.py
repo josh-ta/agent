@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ class _Conn:
         self.execute_calls: list[tuple[str, tuple]] = []
         self.fetch_results: list[list] = []
         self.fetchrow_results: list[dict | None] = []
+        self.fetchval_result = 1
 
     async def execute(self, query: str, *args):
         self.execute_calls.append((query, args))
@@ -32,6 +34,10 @@ class _Conn:
     async def fetchrow(self, query: str, *args):
         self.execute_calls.append((query, args))
         return self.fetchrow_results.pop(0) if self.fetchrow_results else {"n": 1}
+
+    async def fetchval(self, query: str, *args):
+        self.execute_calls.append((query, args))
+        return self.fetchval_result
 
 
 class _Pool:
@@ -97,6 +103,24 @@ async def test_shared_task_repository_handles_empty_and_no_pool_paths() -> None:
 
 
 @pytest.mark.asyncio
+async def test_shared_task_repository_returns_pending_rows_and_running_status() -> None:
+    conn = _Conn()
+    conn.fetch_results.append([{"id": "task-1", "from_agent": "peer", "description": "check build"}])
+    conn.fetchrow_results.extend([{"id": "task-1"}, None])
+    store = PostgresStore("postgresql://example")
+    store._pool = _Pool(conn)  # type: ignore[assignment]
+    repo = SharedTaskRepository(store)
+
+    rows = await repo.get_pending_task_rows()
+    first = await repo.mark_task_running("task-1")
+    second = await repo.mark_task_running("task-1")
+
+    assert rows == [{"id": "task-1", "from_agent": "peer", "description": "check build"}]
+    assert first is True
+    assert second is False
+
+
+@pytest.mark.asyncio
 async def test_shared_task_repository_completes_task_when_updated() -> None:
     conn = _Conn()
     store = PostgresStore("postgresql://example")
@@ -150,6 +174,25 @@ async def test_audit_log_repository_handles_empty_and_error_tolerant_paths(monke
 
     await repo.log_task_start("task", "discord", "smart")
     await repo.log_task_done("task", True, 1.2, 3)
+
+
+@pytest.mark.asyncio
+async def test_audit_log_repository_no_pool_short_circuits() -> None:
+    repo = AuditLogRepository(PostgresStore("postgresql://example"))
+
+    await repo.log_task_start("task", "discord", "smart")
+    await repo.log_task_done("task", True, 1.2, 3)
+
+
+@pytest.mark.asyncio
+async def test_agent_registry_list_agents_empty_and_broadcast_message() -> None:
+    conn = _Conn()
+    store = PostgresStore("postgresql://example")
+    store._pool = _Pool(conn)  # type: ignore[assignment]
+
+    assert await AgentRegistryRepository(store).list_agents() == "(no agents registered)"
+    result = await AuditLogRepository(store).broadcast_message("hello", event_type="status")
+    assert result == "Broadcast sent [status]: hello"
 
 
 @pytest.mark.asyncio
@@ -209,6 +252,27 @@ async def test_shared_memory_repository_keyword_and_no_match_paths(monkeypatch: 
 
 
 @pytest.mark.asyncio
+async def test_shared_memory_repository_semantic_miss_falls_back_to_keyword(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _Conn()
+    conn.fetchrow_results.append({"id": "abcdef1234"})
+    conn.fetch_results.extend([
+        [],
+        [{"agent_id": "peer", "content": "important fact", "created_at": SimpleNamespace(strftime=lambda fmt: "2026-03-16 10:00")}],
+    ])
+    store = PostgresStore("postgresql://example")
+    store._pool = _Pool(conn)  # type: ignore[assignment]
+    store._has_embeddings = True
+
+    async def fake_embed(text: str):
+        return [0.1, 0.2]
+
+    monkeypatch.setattr(store, "_embed", fake_embed)
+    rendered = await SharedMemoryRepository(store).search_shared_memory("important")
+
+    assert "important fact" in rendered
+
+
+@pytest.mark.asyncio
 async def test_postgres_maintenance_heartbeat_and_stats(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _Conn()
     conn.fetchrow_results.extend([{"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}])
@@ -241,5 +305,22 @@ async def test_postgres_maintenance_handles_no_pool_and_cleanup_errors(monkeypat
         raise RuntimeError("cleanup failed")
 
     monkeypatch.setattr(maintenance, "cleanup", _explode)
+
+    await maintenance.heartbeat()
+
+
+@pytest.mark.asyncio
+async def test_postgres_maintenance_heartbeat_logs_when_agent_update_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _BrokenConn(_Conn):
+        async def execute(self, query: str, *args):
+            if "UPDATE agents SET last_seen=NOW()" in query:
+                raise RuntimeError("boom")
+            return await super().execute(query, *args)
+
+    conn = _BrokenConn()
+    store = PostgresStore("postgresql://example")
+    store._pool = _Pool(conn)  # type: ignore[assignment]
+    maintenance = PostgresMaintenance(store)
+    store._last_cleanup_ts = time.time()
 
     await maintenance.heartbeat()

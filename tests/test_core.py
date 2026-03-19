@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import agent.core as core_module
 from agent.config import settings
 from agent.core import build_system_prompt, create_agents
 from agent.core_services import ModelFactory, PeerAgentProvider
@@ -87,3 +88,77 @@ def test_create_agents_deduplicates_identical_models(monkeypatch: pytest.MonkeyP
     assert set(agents.keys()) == {"fast", "smart", "best"}
     assert created.count("same-model") == 1
     assert created.count("other-model") == 1
+
+
+def test_set_postgres_updates_module_global() -> None:
+    sentinel = object()
+
+    core_module.set_postgres(sentinel)
+
+    assert core_module._postgres is sentinel
+
+
+@pytest.mark.asyncio
+async def test_create_agent_wires_model_factory_registry_and_dynamic_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeAgent:
+        def __init__(self, **kwargs) -> None:
+            captured["init"] = kwargs
+            self.prompt_fn = None
+
+        def system_prompt(self, *, dynamic: bool):
+            captured["dynamic"] = dynamic
+
+            def decorator(fn):
+                self.prompt_fn = fn
+                return fn
+
+            return decorator
+
+    class _Factory:
+        def mcp_servers(self):
+            return ["mcp-server"]
+
+        def build_model(self, model_string: str):
+            captured["model_string"] = model_string
+            return "model"
+
+        def model_settings(self, model_string: str):
+            return {"temperature": 0}
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.attached = None
+
+        def attach_to_agent(self, agent) -> None:
+            self.attached = agent
+
+    class _Peers:
+        def __init__(self, store) -> None:
+            captured["postgres"] = store
+
+        async def list_other_agents(self):
+            return ["peer-1"]
+
+    registry = _Registry()
+    monkeypatch.setattr(core_module, "Agent", _FakeAgent)
+    monkeypatch.setattr(core_module, "_model_factory", _Factory())
+    monkeypatch.setattr(core_module, "PeerAgentProvider", _Peers)
+    monkeypatch.setattr(core_module, "build_system_prompt", lambda other_agents=None: f"prompt:{other_agents}")
+    core_module.set_postgres("postgres-store")
+
+    agent = core_module.create_agent(registry, "openai:gpt-4o")
+    prompt = await agent.prompt_fn()
+
+    assert captured["model_string"] == "openai:gpt-4o"
+    assert captured["init"] == {
+        "model": "model",
+        "mcp_servers": ["mcp-server"],
+        "model_settings": {"temperature": 0},
+        "retries": 2,
+    }
+    assert captured["dynamic"] is True
+    assert captured["postgres"] == "postgres-store"
+    assert prompt == "prompt:['peer-1']"
+    assert registry.attached is agent
