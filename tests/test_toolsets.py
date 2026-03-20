@@ -36,6 +36,13 @@ class _SQLite:
     async def save_memory_fact(self, content: str) -> None:
         self.saved_memory = content
 
+    async def save_procedure(self, trigger_text: str, checklist: str, kind: str = "procedure") -> int:
+        self.saved_procedure = (trigger_text, checklist, kind)
+        return 9
+
+    async def search_procedures(self, query: str, limit: int = 5) -> list[dict]:
+        return [{"id": 9, "trigger_text": f"trigger:{query}", "checklist": "step one"}]
+
     async def save_lesson(self, summary: str, kind: str = "lesson") -> None:
         self.saved_lesson = (summary, kind)
 
@@ -44,6 +51,16 @@ class _SQLite:
 
     async def get_recent_lessons(self, limit: int = 10) -> str:
         return f"recent:{limit}"
+
+    async def record_feedback(self, **kwargs) -> int:
+        self.feedback = kwargs
+        return 11
+
+    async def pin_memory_item(self, memory_item_id: int, *, pinned: bool = True) -> None:
+        self.pinned_memory = (memory_item_id, pinned)
+
+    async def pin_procedure(self, procedure_id: int, *, pinned: bool = True) -> None:
+        self.pinned_procedure = (procedure_id, pinned)
 
 
 class _Postgres:
@@ -164,9 +181,14 @@ async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.Monk
     assert "SQLite (local)" in await agent.funcs["db_stats"]()
     assert await agent.funcs["memory_search"]("parser") == "memory:parser:5"
     assert await agent.funcs["memory_save"]("fact") == "Saved to memory: fact"
+    assert await agent.funcs["procedure_save"]("deploy", "check health") == "Saved procedure #9: deploy"
+    assert "## Procedures" in await agent.funcs["procedure_search"]("deploy")
     assert await agent.funcs["lesson_save"]("lesson") == "Lesson recorded [lesson]: lesson"
     assert await agent.funcs["lesson_search"]("nothing") == "(no lessons found for: nothing)"
     assert await agent.funcs["lessons_recent"]() == "recent:10"
+    assert await agent.funcs["memory_feedback"]("approved", 1.5, "task-1", 7, None, "good") == "Recorded feedback #11 [approved] score=1.5"
+    assert await agent.funcs["memory_pin"](7) == "Pinned memory item #7"
+    assert await agent.funcs["procedure_pin"](9, False) == "Unpinned procedure #9"
     assert await agent.funcs["list_agents"]() == "agents"
     assert await agent.funcs["create_shared_task"]("peer", "work") == "peer:work"
     assert await agent.funcs["my_tasks"]() == "tasks"
@@ -348,10 +370,24 @@ def test_attach_secret_tools_covers_success_empty_and_error_paths(monkeypatch: p
         def __init__(self, path) -> None:
             self.path = path
 
+        def list_entries(self):
+            return [
+                {
+                    "name": name,
+                    "purpose": "dashboard login",
+                    "scope": "staging",
+                    "allowed_tools": ["browser_fill_secret"],
+                }
+                for name in state["names"]
+            ]
+
         def list_names(self):
             if state["mode"] == "list_error":
                 raise toolsets.SecretStoreError("list failed")
             return list(state["names"])
+
+        def search(self, query: str, limit: int = 5):
+            return [entry for entry in self.list_entries() if query.lower() in entry["name"].lower()][:limit]
 
         def set(self, name: str, value: str) -> None:
             if state["mode"] == "set_error":
@@ -380,6 +416,8 @@ def test_attach_secret_tools_covers_success_empty_and_error_paths(monkeypatch: p
     assert agent.funcs["secret_list"]() == "(no secrets stored)"
     assert "Stored secret `TOKEN`" in agent.funcs["secret_set"]("TOKEN", "hunter2")
     assert "## Stored secrets" in agent.funcs["secret_list"]()
+    assert "dashboard login" in agent.funcs["secret_list"]()
+    assert "## Matching secrets" in agent.funcs["secret_search"]("TOK")
     assert agent.funcs["secret_get"]("TOKEN") == "hunter2"
     assert agent.funcs["secret_delete"]("TOKEN") == "Deleted secret `TOKEN`."
     assert agent.funcs["secret_delete"]("TOKEN") == "[ERROR: secret not found: TOKEN]"
@@ -393,3 +431,46 @@ def test_attach_secret_tools_covers_success_empty_and_error_paths(monkeypatch: p
     assert "get failed" in agent.funcs["secret_get"]("TOKEN")
     state["mode"] = "delete_error"
     assert "delete failed" in agent.funcs["secret_delete"]("TOKEN")
+
+
+@pytest.mark.asyncio
+async def test_attach_secret_tools_and_procedure_search_cover_empty_fallback_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = _Agent()
+
+    class _SecretStoreNoSearch:
+        def __init__(self, path) -> None:
+            self.path = path
+
+        def list_names(self):
+            return ["TOKEN"]
+
+        def set(self, name: str, value: str) -> None:
+            return None
+
+        def get(self, name: str) -> str:
+            return "value"
+
+        def delete(self, name: str) -> bool:
+            return True
+
+    class _SQLiteNoProcedures(_SQLite):
+        async def search_procedures(self, query: str, limit: int = 5) -> list[dict]:
+            return []
+
+    monkeypatch.setattr(toolsets, "SecretStore", _SecretStoreNoSearch)
+    toolsets.attach_secret_tools(agent)  # type: ignore[arg-type]
+    toolsets.attach_database_tools(agent, sqlite=_SQLiteNoProcedures(), postgres=None)  # type: ignore[arg-type]
+
+    assert "## Stored secrets" in agent.funcs["secret_list"]()
+    assert "## Matching secrets" in agent.funcs["secret_search"]("tok")
+    assert agent.funcs["secret_search"]("missing") == "(no stored secrets match: missing)"
+    assert await agent.funcs["procedure_search"]("deploy") == "(no procedures found for: deploy)"
+
+    class _SecretStoreSearchError(_SecretStoreNoSearch):
+        def search(self, query: str, limit: int = 5):
+            raise toolsets.SecretStoreError("search failed")
+
+    error_agent = _Agent()
+    monkeypatch.setattr(toolsets, "SecretStore", _SecretStoreSearchError)
+    toolsets.attach_secret_tools(error_agent)  # type: ignore[arg-type]
+    assert "search failed" in error_agent.funcs["secret_search"]("tok")

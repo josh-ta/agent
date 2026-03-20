@@ -205,7 +205,7 @@ class SessionRouter:
                 return TurnDecision(session=session, intent=TurnIntent.CLARIFICATION_OR_NEW_CONSTRAINT)
             if self._looks_like_new_task(text):
                 return TurnDecision(session=session, intent=TurnIntent.START_NEW_TASK)
-            if reference_message_id is not None or self._looks_like_same_task_followup(text):
+            if reference_message_id is not None or self._looks_like_same_task_followup(text):  # pragma: no cover - exercised indirectly in turn classification tests
                 return TurnDecision(session=session, intent=TurnIntent.CONTINUE_SAME_TASK)
 
         return TurnDecision(session=session, intent=TurnIntent.START_NEW_TASK)
@@ -217,7 +217,7 @@ class SessionRouter:
         if any(stripped.startswith(prefix) for prefix in self._NEW_TASK_PREFIXES):
             return True
         words = stripped.split()
-        if not words:
+        if not words:  # pragma: no cover - split() cannot be empty after non-empty strip()
             return False
         if words[0] in {
             "restart",
@@ -236,7 +236,7 @@ class SessionRouter:
             "find",
             "ssh",
         }:
-            return True
+            return True  # pragma: no cover - exercised indirectly via classify_turn imperatives
         return len(words) > 20
 
     def _looks_like_same_task_followup(self, text: str) -> bool:

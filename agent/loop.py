@@ -38,7 +38,8 @@ from agent.loop_services import (
     TaskJournal,
 )
 from agent.tools.discord_tools import DiscordAttachment
-from agent.project_memory import save_project_memory_facts
+from agent.project_memory import extract_project_memory_facts, save_project_memory_facts
+from agent.secret_store import SecretStore
 from agent.task_waits import SuspendedTask, TaskWaitRegistry, task_wait_context
 
 log = structlog.get_logger()
@@ -69,20 +70,6 @@ _DEPLOY_KEYWORDS = re.compile(
     r"\b(deploy|deployment|release|rollout|docker compose|docker-compose|ssh|prod|production|staging)\b",
     re.IGNORECASE,
 )
-_HOST_FACT_RE = re.compile(
-    r"\b((?:app|data|deploy|db|database|redis|api|frontend)\s+host\s+(?:is|=)\s+([^\s,;]+))",
-    re.IGNORECASE,
-)
-_PATH_FACT_RE = re.compile(
-    r"\b((?:workspace|repo root|project root|deploy path)\s+(?:is|=)\s+([^\s,;]+))",
-    re.IGNORECASE,
-)
-_SCRIPT_FACT_RE = re.compile(
-    r"\b(use\s+(scripts/[^\s,;]+|[^\s,;]+\.sh)\b[^.]*)",
-    re.IGNORECASE,
-)
-
-
 def _parse_override(content: str) -> tuple[str, str | None]:
     """
     Strip a /fast|/smart|/best prefix from the message.
@@ -144,6 +131,9 @@ class TaskResult:
     question: str | None = None
     timeout_s: int = 300
     attachments: list[DiscordAttachment] = field(default_factory=list)
+    retrieved_memory_ids: list[int] = field(default_factory=list)
+    retrieved_procedure_ids: list[int] = field(default_factory=list)
+    reward_score: float | None = None
 
 
 class AgentLoop:
@@ -168,11 +158,12 @@ class AgentLoop:
         self._running = False
         self._task_count = 0
         self._success_count = 0
+        self._secret_store = SecretStore(settings.agent_secrets_path)
         # True while _process() is running — used by DiscordBot to detect concurrency
         self.is_busy = False
         self._current_task: Task | None = None
         self._journal = TaskJournal(settings.workspace_path)
-        self._context_builder = TaskContextBuilder(self.memory)
+        self._context_builder = TaskContextBuilder(self.memory, secret_store=self._secret_store)
         self._run_executor = RunExecutor(
             event_bridge=bridge,
             journal=self._journal,
@@ -523,6 +514,8 @@ class AgentLoop:
         task, tier, base_prompt = await self._context_builder.build(task)
         task_id = self.wait_registry.ensure_task_id(task.metadata)
         session_id = str(task.metadata.get("session_id", "")).strip()
+        retrieved_memory_ids = [int(item) for item in task.metadata.get("retrieved_memory_ids", [])]
+        retrieved_procedure_ids = [int(item) for item in task.metadata.get("retrieved_procedure_ids", [])]
         if not session_id:
             session_id = f"{task.source}:{task.channel_id}:{task.message_id or task_id}"
             task.metadata["session_id"] = session_id
@@ -618,6 +611,8 @@ class AgentLoop:
                         question=run_result.question,
                         timeout_s=run_result.timeout_s,
                         attachments=attachments,
+                        retrieved_memory_ids=retrieved_memory_ids,
+                        retrieved_procedure_ids=retrieved_procedure_ids,
                     )
                 task_id = self.wait_registry.ensure_task_id(task.metadata)
                 task.metadata["wait_state"] = {
@@ -700,6 +695,8 @@ class AgentLoop:
                     question=run_result.question,
                     timeout_s=run_result.timeout_s,
                     attachments=attachments,
+                    retrieved_memory_ids=retrieved_memory_ids,
+                    retrieved_procedure_ids=retrieved_procedure_ids,
                 )
 
             answered_user = run_result.user_visible_reply_sent
@@ -803,6 +800,8 @@ class AgentLoop:
                 success=task_succeeded,
                 elapsed_ms=elapsed_ms,
                 tool_calls=tool_calls,
+                retrieved_memory_ids=retrieved_memory_ids,
+                retrieved_procedure_ids=retrieved_procedure_ids,
             )
 
         except Exception as exc:
@@ -861,6 +860,8 @@ class AgentLoop:
                 status="failed",
                 success=False,
                 elapsed_ms=elapsed_ms,
+                retrieved_memory_ids=retrieved_memory_ids,
+                retrieved_procedure_ids=retrieved_procedure_ids,
             )
 
     async def _run_with_streaming(
@@ -1008,10 +1009,9 @@ class AgentLoop:
 
     async def _maybe_promote_memory_fact(self, *, task: Task) -> None:
         text = task.content.strip()
-        lowered = text.lower()
         if not text or len(text) > 1200:
             return
-        facts = self._extract_memory_facts(text)
+        facts = extract_project_memory_facts(text)
         if not facts:
             return
         metadata = {
@@ -1022,56 +1022,11 @@ class AgentLoop:
         if self.memory is not None and hasattr(self.memory, "save_memory_fact"):
             for fact in facts:
                 await self.memory.save_memory_fact(fact, metadata=metadata)
-        save_project_memory_facts(facts)
+        try:
+            save_project_memory_facts(facts)
+        except Exception:
+            pass
 
     @staticmethod
     def _extract_memory_facts(text: str) -> set[str]:
-        lowered = text.lower()
-        facts: set[str] = set()
-        fact_prefixes = (
-            "remember ",
-            "remember permanently ",
-            "use ",
-            "always ",
-            "never ",
-            "my ",
-            "for this repo",
-            "for this project",
-            "in this repo",
-            "in this project",
-            "prefer ",
-        )
-        if any(lowered.startswith(prefix) for prefix in fact_prefixes):
-            facts.add(text[:500])
-        if any(
-            phrase in lowered
-            for phrase in (
-                "app host",
-                "data host",
-                "deploy host",
-                "workspace is",
-                "repo root",
-                "project root",
-                "use scripts/",
-                "deploy script",
-                "do not claim deploy success",
-                "never claim deploy success",
-            )
-        ):
-            facts.add(text[:500])
-        for pattern in (_HOST_FACT_RE, _PATH_FACT_RE, _SCRIPT_FACT_RE):
-            for match in pattern.finditer(text):
-                facts.add(match.group(1)[:500])
-        if "/workspace" in text:
-            facts.add("Use the existing checkout in /workspace before guessing repo names, paths, or hosts.")
-        if any(phrase in lowered for phrase in ("hallucinating a repo", "guess the repo", "guess a repo", "guess the host", "guess the hostname")):
-            facts.add("Do not guess repo names, repo paths, hostnames, or VPS IPs. Inspect local files first and ask if missing.")
-        if "starting:" in lowered and "repeat" in lowered and "prompt" in lowered:
-            facts.add("Do not echo the user's full prompt back as a start message.")
-        if "check the file system first" in lowered or "read and check the file system first" in lowered:
-            facts.add("Check the local filesystem before attempting deploy, SSH, or repo-specific actions.")
-        if any(
-            phrase in lowered for phrase in ("do not guess", "don't guess", "stop guessing")
-        ):
-            facts.add(text[:500])
-        return facts
+        return extract_project_memory_facts(text)

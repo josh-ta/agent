@@ -46,7 +46,9 @@ from agent.events import (
     ToolResultEvent,
     bridge,
 )
+from agent.memory.learning_service import LearningService
 from agent.project_memory import load_project_memory
+from agent.secret_store import SecretStore
 from agent.tools.discord_tools import DiscordAttachment, decode_data_url_attachment, discord_send
 from agent.task_waits import UserInputRequired
 
@@ -77,6 +79,7 @@ class TaskJournal:
     def __init__(self, root: Path, *, now_fn: Callable[[], float] = time.time) -> None:
         self._path = root / ".task_journal.md"
         self._now = now_fn
+        self._secret_store = SecretStore(settings.agent_secrets_path)
 
     @property
     def path(self) -> Path:
@@ -96,8 +99,9 @@ class TaskJournal:
         try:
             ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            safe_body = self._secret_store.redact_text(body)
             with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(f"\n### [{ts}] — {title}\n{body}\n")
+                handle.write(f"\n### [{ts}] — {title}\n{safe_body}\n")
         except Exception:
             pass
 
@@ -110,9 +114,15 @@ class TaskJournal:
 
 
 class TaskContextBuilder:
-    def __init__(self, memory_store: Any, history_reader: Callable[[int, int], Awaitable[str]] | None = None) -> None:
+    def __init__(
+        self,
+        memory_store: Any,
+        history_reader: Callable[[int, int], Awaitable[str]] | None = None,
+        secret_store: SecretStore | None = None,
+    ) -> None:
         self._memory = memory_store
         self._history_reader = history_reader
+        self._secret_store = secret_store
 
     async def build(self, task: "Task") -> tuple["Task", str, str]:
         from agent.loop import Task as LoopTask
@@ -133,14 +143,18 @@ class TaskContextBuilder:
             response_future=task.response_future,
         )
 
-        lessons_context = await self._load_lessons(task.content)
-        facts_context = await self._load_memory_facts(task.content)
+        learning_context, retrieved_memory_ids, retrieved_procedure_ids = await self._load_learning_context(
+            task.content
+        )
+        lessons_context = "" if learning_context else await self._load_lessons(task.content)
+        facts_context = "" if learning_context else await self._load_memory_facts(task.content)
         session_context = await self._load_session_context(normalized_task)
         project_context = self._load_project_context()
         channel_context = await self._load_channel_history(normalized_task) if not session_context else ""
         resume_context = self._load_resume_context(normalized_task)
         checkpoint_context = await self._load_checkpoint_context(normalized_task)
         attachment_context = self._load_attachment_context(normalized_task)
+        secret_context = self._load_secret_context(normalized_task.content)
 
         parts: list[str] = []
         if session_context:
@@ -149,6 +163,8 @@ class TaskContextBuilder:
             parts.append(channel_context)
         if project_context:
             parts.append(project_context)
+        if learning_context:
+            parts.append(learning_context)
         if facts_context:
             parts.append(facts_context)
         if lessons_context:
@@ -159,6 +175,12 @@ class TaskContextBuilder:
             parts.append(resume_context)
         if attachment_context:
             parts.append(attachment_context)
+        if secret_context:
+            parts.append(secret_context)
+        if retrieved_memory_ids:
+            normalized_task.metadata["retrieved_memory_ids"] = retrieved_memory_ids
+        if retrieved_procedure_ids:
+            normalized_task.metadata["retrieved_procedure_ids"] = retrieved_procedure_ids
         parts.append(normalized_task.content)
         return normalized_task, tier, "\n\n---\n\n".join(parts)
 
@@ -174,6 +196,19 @@ class TaskContextBuilder:
                 return ""
         return ""
 
+    async def _load_learning_context(self, content: str) -> tuple[str, list[int], list[int]]:
+        if self._memory and hasattr(self._memory, "search_learning_context"):
+            try:
+                payload = await self._memory.search_learning_context(content[:200], limit=3)
+                return (
+                    str(payload.get("text", "")).strip(),
+                    [int(item) for item in payload.get("memory_ids", [])],
+                    [int(item) for item in payload.get("procedure_ids", [])],
+                )
+            except Exception:
+                return "", [], []
+        return "", [], []
+
     async def _load_memory_facts(self, content: str) -> str:
         if self._memory and hasattr(self._memory, "search_memory"):
             try:
@@ -183,6 +218,20 @@ class TaskContextBuilder:
             except Exception:
                 return ""
         return ""
+
+    def _load_secret_context(self, content: str) -> str:
+        if self._secret_store is None:
+            return ""
+        try:
+            matches = self._secret_store.search(content[:200], limit=3)
+        except Exception:
+            return ""
+        if not matches:
+            return ""
+        return "## Sensitive resources available by explicit request\n" + "\n".join(
+            f"- {entry['name']}" + (f" ({entry['purpose']})" if entry["purpose"] else "")
+            for entry in matches
+        )
 
     async def _load_session_context(self, task: "Task") -> str:
         session_id = str((task.metadata or {}).get("session_id", "")).strip()
@@ -329,6 +378,8 @@ class RunExecutor:
             attachments: list[DiscordAttachment] = []
             shell_failures: list[str] = []
             pending_visible_discord_sends: set[str] = set()
+            injection_restart_requested = False
+            injected_messages: list[str] = []
             loop = asyncio.get_running_loop()
             progress_state = {
                 "last_activity_at": loop.time(),
@@ -436,8 +487,15 @@ class RunExecutor:
                                 )
                             )
 
-                if task.inject_queue and not task.inject_queue.empty():
-                    injected = self._drain_queue(task.inject_queue)
+                        if task.inject_queue and isinstance(event, (FunctionToolResultEvent, FinalResultEvent)):
+                            injected_messages = self._drain_queue(task.inject_queue)
+                            if injected_messages:
+                                injection_restart_requested = True
+                                await self._close_event_stream(event_iter)
+                                break
+
+                if injection_restart_requested or (task.inject_queue and not task.inject_queue.empty()):
+                    injected = injected_messages or self._drain_queue(task.inject_queue)
                     if injected:
                         count = len(injected)
                         combined = "\n".join(f"[{i + 1}] {msg}" for i, msg in enumerate(injected))
@@ -745,6 +803,8 @@ class ReflectionService:
         self._agents = agents
         self._memory = memory_store
         self._journal = journal or TaskJournal(settings.workspace_path)
+        self._learning = LearningService()
+        self._secret_store = SecretStore(settings.agent_secrets_path)
 
     @property
     def _fast_agent(self) -> Agent:  # type: ignore[type-arg]
@@ -755,25 +815,71 @@ class ReflectionService:
             return
 
         try:
+            episode = self._learning.summarize_episode(task, result)
+            task_id = str((task.metadata or {}).get("task_id", "")).strip()
+            session_id = str((task.metadata or {}).get("session_id", "")).strip()
+            if hasattr(self._memory, "record_episodic_event"):
+                await self._memory.record_episodic_event(
+                    task_id=task_id,
+                    session_id=session_id,
+                    event_kind=episode.event_kind,
+                    summary=self._secret_store.redact_text(episode.summary),
+                    reward=episode.reward.score,
+                    details={
+                        **{
+                            key: self._secret_store.redact_text(value)
+                            if isinstance(value, str)
+                            else value
+                            for key, value in episode.details.items()
+                        },
+                        "reward_reasons": episode.reward.reasons,
+                    },
+                )
+            if hasattr(self._memory, "learning") and hasattr(self._memory.learning, "apply_outcome_to_memory"):
+                await self._memory.learning.apply_outcome_to_memory(
+                    [int(item) for item in result.retrieved_memory_ids],
+                    success_delta=max(episode.reward.score, 0.0),
+                    failure_delta=abs(min(episode.reward.score, 0.0)),
+                )
+            if hasattr(self._memory, "procedures") and hasattr(self._memory.procedures, "apply_outcome_to_procedures"):
+                await self._memory.procedures.apply_outcome_to_procedures(
+                    [int(item) for item in result.retrieved_procedure_ids],
+                    success_delta=max(episode.reward.score, 0.0),
+                    failure_delta=abs(min(episode.reward.score, 0.0)),
+                )
             if not result.success:
-                await self._reflect_on_failure(task, result)
+                if not self._learning.should_promote_failure(result, episode):
+                    return
+                await self._reflect_on_failure(task, result, episode.reward.score, episode.reward.reasons)
             else:
-                if result.tool_calls > 7:
-                    await self._reflect_on_success(task, result)
+                if not self._learning.should_promote_success(result, episode):
+                    if success_count % memory_update_interval == 0:
+                        await self.update_memory_md()
+                    return
+                await self._reflect_on_success(task, result, episode.reward.score, episode.reward.reasons)
                 if success_count % memory_update_interval == 0:
                     await self.update_memory_md()
         except Exception:
             log.warning("reflect_error", exc=traceback.format_exc())
 
-    async def _reflect_on_success(self, task: "Task", result: "TaskResult") -> None:
+    async def _reflect_on_success(
+        self,
+        task: "Task",
+        result: "TaskResult",
+        reward_score: float = 0.0,
+        reward_reasons: list[str] | None = None,
+    ) -> None:
+        reward_reasons = reward_reasons or []
         reflection_prompt = (
-            f"You just successfully completed the following task using {result.tool_calls} tool calls.\n\n"
+            f"You just completed the following task successfully using {result.tool_calls} tool calls.\n\n"
             f"Task: {task.content}\n\n"
             f"Result summary: {result.output[:500]}\n\n"
-            "In one concise sentence (max 200 chars), extract ONE reusable pattern, shortcut, or insight "
-            "from this task that would help you do similar tasks better or faster in the future. "
-            "Focus on what was surprising, efficient, or non-obvious. "
-            "If there is nothing genuinely useful to record, reply with exactly: NOTHING_TO_RECORD"
+            f"Reward score: {reward_score:.2f}\n"
+            f"Reward reasons: {', '.join(reward_reasons) or 'none'}\n\n"
+            "Return 1 or 2 lines only. Each line must start with one of:\n"
+            "PATTERN: <reusable success pattern>\n"
+            "PROCEDURE: <trigger> => <checklist>\n"
+            "If there is nothing genuinely reusable to record, reply with exactly: NOTHING_TO_RECORD"
         )
         try:
             insight_result = await self._fast_agent.run(
@@ -781,21 +887,51 @@ class ReflectionService:
                 usage_limits=UsageLimits(request_limit=None),
             )
             insight = str(insight_result.output).strip()
-            if insight and "NOTHING_TO_RECORD" not in insight:
+            if not insight or "NOTHING_TO_RECORD" in insight:
+                return
+            for raw_line in insight.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("PROCEDURE:"):
+                    payload = line.removeprefix("PROCEDURE:").strip()
+                    trigger, _, checklist = payload.partition("=>")
+                    if hasattr(self._memory, "save_procedure"):
+                        await self._memory.save_procedure(
+                            trigger_text=self._secret_store.redact_text((trigger or task.content[:240]).strip()),
+                            checklist=self._secret_store.redact_text((checklist or payload).strip())[:400],
+                            kind="pattern",
+                            confidence=0.72,
+                            salience=0.7,
+                            metadata={"context": self._secret_store.redact_text(task.content[:300]), "reward_score": reward_score},
+                        )
+                    continue
+                summary = line.removeprefix("PATTERN:").strip() if line.startswith("PATTERN:") else line
                 await self._memory.save_lesson(
-                    summary=insight[:300],
+                    summary=self._secret_store.redact_text(summary)[:300],
                     kind="pattern",
-                    context=task.content[:300],
+                    context=self._secret_store.redact_text(task.content[:300]),
                 )
         except Exception:
             log.warning("reflect_on_success_error", exc=traceback.format_exc())
 
-    async def _reflect_on_failure(self, task: "Task", result: "TaskResult") -> None:
+    async def _reflect_on_failure(
+        self,
+        task: "Task",
+        result: "TaskResult",
+        reward_score: float = 0.0,
+        reward_reasons: list[str] | None = None,
+    ) -> None:
+        reward_reasons = reward_reasons or []
         reflection_prompt = (
             "You just attempted the following task and it FAILED.\n\n"
             f"Task: {task.content}\n\n"
             f"Error/output: {result.output}\n\n"
-            "In 1-2 sentences, diagnose what went wrong and state what you should do differently next time. "
+            f"Reward score: {reward_score:.2f}\n"
+            f"Reward reasons: {', '.join(reward_reasons) or 'none'}\n\n"
+            "Return 1 or 2 lines only. Each line must start with one of:\n"
+            "MISTAKE: <what failed and what to do differently>\n"
+            "PROCEDURE: <trigger> => <corrective checklist>\n"
             "Be concise and specific."
         )
         try:
@@ -804,11 +940,29 @@ class ReflectionService:
                 usage_limits=UsageLimits(request_limit=None),
             )
             lesson = str(reflection.output).strip()
-            await self._memory.save_lesson(
-                summary=lesson,
-                kind="mistake",
-                context=task.content[:300],
-            )
+            for raw_line in lesson.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("PROCEDURE:"):
+                    payload = line.removeprefix("PROCEDURE:").strip()
+                    trigger, _, checklist = payload.partition("=>")
+                    if hasattr(self._memory, "save_procedure"):
+                        await self._memory.save_procedure(
+                            trigger_text=self._secret_store.redact_text((trigger or task.content[:240]).strip()),
+                            checklist=self._secret_store.redact_text((checklist or payload).strip())[:400],
+                            kind="recovery",
+                            confidence=0.8,
+                            salience=0.8,
+                            metadata={"context": self._secret_store.redact_text(task.content[:300]), "reward_score": reward_score},
+                        )
+                    continue
+                summary = line.removeprefix("MISTAKE:").strip() if line.startswith("MISTAKE:") else line
+                await self._memory.save_lesson(
+                    summary=self._secret_store.redact_text(summary),
+                    kind="mistake",
+                    context=self._secret_store.redact_text(task.content[:300]),
+                )
             await self.update_memory_md()
         except Exception:
             log.warning("reflect_on_failure_error", exc=traceback.format_exc())

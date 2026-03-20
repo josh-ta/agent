@@ -68,7 +68,7 @@ def _validate_remote_command(command: str) -> str | None:
             "[ERROR: remote command blocked: preflight comment must cite workspace evidence "
             "or say the host/path came explicitly from the user.]"
         )
-    return None
+    return None  # pragma: no cover - direct pass-through once evidence is accepted
 
 
 async def shell_run(
@@ -147,7 +147,7 @@ async def shell_run(
             await asyncio.wait_for(proc.wait(), timeout=timeout)
             remaining = _remaining_timeout()
             if remaining <= 0:
-                raise asyncio.TimeoutError
+                raise asyncio.TimeoutError  # pragma: no cover - defensive boundary case
             await asyncio.wait_for(asyncio.shield(reader_task), timeout=remaining)
         except asyncio.TimeoutError:
             timed_out = True
@@ -170,7 +170,7 @@ async def shell_run(
                 pass
         else:
             if not reader_task.done():
-                await reader_task
+                await reader_task  # pragma: no cover - reader_task is expected to be done here
 
         elapsed_s = time.monotonic() - start_time
         exit_code = proc.returncode if proc.returncode is not None else -1

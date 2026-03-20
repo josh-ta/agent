@@ -255,16 +255,72 @@ def attach_secret_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     def secret_list() -> str:
-        names = _store().list_names()
-        if not names:
+        store = _store()
+        if hasattr(store, "list_entries"):
+            entries = store.list_entries()
+        else:
+            entries = [{"name": name, "purpose": "", "scope": "", "allowed_tools": []} for name in store.list_names()]
+        if not entries:
             return "(no secrets stored)"
-        return "## Stored secrets\n" + "\n".join(f"- {name}" for name in names)
+        lines = ["## Stored secrets"]
+        for entry in entries:
+            meta = []
+            if entry["purpose"]:
+                meta.append(f"purpose={entry['purpose']}")
+            if entry["scope"]:
+                meta.append(f"scope={entry['scope']}")
+            if entry["allowed_tools"]:
+                meta.append(f"tools={','.join(entry['allowed_tools'])}")
+            suffix = f" ({'; '.join(meta)})" if meta else ""
+            lines.append(f"- {entry['name']}{suffix}")
+        return "\n".join(lines)
 
     @agent.tool_plain
-    def secret_set(name: str, value: str) -> str:
+    def secret_set(
+        name: str,
+        value: str,
+        purpose: str = "",
+        scope: str = "",
+        allowed_tools: list[str] | None = None,
+        rotation_hint: str = "",
+    ) -> str:
         try:
-            _store().set(name, value)
+            store = _store()
+            try:
+                store.set(
+                    name,
+                    value,
+                    purpose=purpose,
+                    scope=scope,
+                    allowed_tools=allowed_tools,
+                    rotation_hint=rotation_hint,
+                )
+            except TypeError:
+                store.set(name, value)
             return f"Stored secret `{name}` = {mask_secret(value)}"
+        except (SecretStoreError, ValueError) as exc:
+            return f"[ERROR: {exc}]"
+
+    @agent.tool_plain
+    def secret_search(query: str, limit: int = 5) -> str:
+        try:
+            store = _store()
+            if hasattr(store, "search"):
+                matches = store.search(query, limit=limit)
+            else:
+                names = [name for name in store.list_names() if query.lower() in name.lower()]
+                matches = [{"name": name, "purpose": "", "scope": "", "allowed_tools": []} for name in names[:limit]]
+            if not matches:
+                return f"(no stored secrets match: {query})"
+            lines = ["## Matching secrets"]
+            for entry in matches:
+                meta = []
+                if entry["purpose"]:
+                    meta.append(entry["purpose"])
+                if entry["scope"]:
+                    meta.append(f"scope={entry['scope']}")
+                lines.append(f"- {entry['name']}" + (f" ({'; '.join(meta)})" if meta else ""))
+            return "\n".join(lines)
         except (SecretStoreError, ValueError) as exc:
             return f"[ERROR: {exc}]"
 
@@ -304,6 +360,10 @@ def attach_database_tools(
                     lines.append(f"  tasks: {stats.get('tasks', '?')} rows")
                     lines.append(f"  memory_facts: {stats.get('memory_facts', '?')} rows")
                     lines.append(f"  lessons: {stats.get('lessons', '?')} rows")
+                    lines.append(f"  episodic_events: {stats.get('episodic_events', '?')} rows")
+                    lines.append(f"  memory_items: {stats.get('memory_items', '?')} rows")
+                    lines.append(f"  procedures: {stats.get('procedures', '?')} rows")
+                    lines.append(f"  feedback_events: {stats.get('feedback_events', '?')} rows")
                     lines.append(f"  db size: {stats.get('db_size_mb', '?')} MB")
                     lines.append(f"  vec search: {stats.get('vec_enabled', False)}")
                     lines.append(f"  last cleanup: {stats.get('last_cleanup', 'never')}")
@@ -333,6 +393,24 @@ def attach_database_tools(
             return f"Saved to memory: {content[:80]}"
 
         @agent.tool_plain
+        async def procedure_save(trigger_text: str, checklist: str, kind: str = "procedure") -> str:
+            procedure_id = await sqlite.save_procedure(
+                trigger_text=trigger_text,
+                checklist=checklist,
+                kind=kind,
+            )
+            return f"Saved procedure #{procedure_id}: {trigger_text[:60]}"
+
+        @agent.tool_plain
+        async def procedure_search(query: str, limit: int = 5) -> str:
+            procedures = await sqlite.search_procedures(query, limit=limit)
+            if not procedures:
+                return f"(no procedures found for: {query})"
+            return "## Procedures\n" + "\n".join(
+                f"- #{row['id']} {row['trigger_text']} => {row['checklist']}" for row in procedures
+            )
+
+        @agent.tool_plain
         async def lesson_save(summary: str, kind: str = "lesson") -> str:
             await sqlite.save_lesson(summary, kind=kind)
             return f"Lesson recorded [{kind}]: {summary[:80]}"
@@ -345,6 +423,35 @@ def attach_database_tools(
         @agent.tool_plain
         async def lessons_recent(limit: int = 10) -> str:
             return await sqlite.get_recent_lessons(limit)
+
+        @agent.tool_plain
+        async def memory_feedback(
+            feedback_kind: str,
+            score: float = 1.0,
+            task_id: str = "",
+            memory_item_id: int | None = None,
+            procedure_id: int | None = None,
+            details: str = "",
+        ) -> str:
+            feedback_id = await sqlite.record_feedback(
+                task_id=task_id,
+                feedback_kind=feedback_kind,
+                score=score,
+                memory_item_id=memory_item_id,
+                procedure_id=procedure_id,
+                details={"note": details} if details else None,
+            )
+            return f"Recorded feedback #{feedback_id} [{feedback_kind}] score={score}"
+
+        @agent.tool_plain
+        async def memory_pin(memory_item_id: int, pinned: bool = True) -> str:
+            await sqlite.pin_memory_item(memory_item_id, pinned=pinned)
+            return f"{'Pinned' if pinned else 'Unpinned'} memory item #{memory_item_id}"
+
+        @agent.tool_plain
+        async def procedure_pin(procedure_id: int, pinned: bool = True) -> str:
+            await sqlite.pin_procedure(procedure_id, pinned=pinned)
+            return f"{'Pinned' if pinned else 'Unpinned'} procedure #{procedure_id}"
 
     if postgres:
         @agent.tool_plain

@@ -421,6 +421,148 @@ async def test_cleanup_swallows_fts_rebuild_and_rollback_failures(sqlite_store) 
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_learning_repositories_update_existing_memory_and_procedures(sqlite_store) -> None:
+    memory_id = await sqlite_store.learning.save_memory_item(
+        kind="fact",
+        content="Use the blue deployment workflow.",
+        confidence=0.4,
+    )
+    same_memory_id = await sqlite_store.learning.save_memory_item(
+        kind="fact",
+        content="Use the blue deployment workflow.",
+        confidence=0.9,
+        pinned=True,
+        sensitive=True,
+    )
+    procedure_id = await sqlite_store.procedures.save_procedure(
+        trigger_text="blue deploy",
+        checklist="Run blue deploy and verify health.",
+        confidence=0.4,
+    )
+    same_procedure_id = await sqlite_store.procedures.save_procedure(
+        trigger_text="blue deploy",
+        checklist="Run blue deploy and verify health.",
+        confidence=0.9,
+        pinned=True,
+    )
+
+    assert memory_id == same_memory_id
+    assert procedure_id == same_procedure_id
+
+    assert sqlite_store._db is not None
+    async with sqlite_store._db.execute(
+        "SELECT confidence, pinned, sensitive FROM memory_items WHERE id=?",
+        (memory_id,),
+    ) as cur:
+        memory_row = await cur.fetchone()
+    async with sqlite_store._db.execute(
+        "SELECT confidence, pinned FROM procedures WHERE id=?",
+        (procedure_id,),
+    ) as cur:
+        procedure_row = await cur.fetchone()
+
+    assert memory_row["confidence"] == pytest.approx(0.9)
+    assert memory_row["pinned"] == 1
+    assert memory_row["sensitive"] == 1
+    assert procedure_row["confidence"] == pytest.approx(0.9)
+    assert procedure_row["pinned"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_search_learning_context_and_feedback_update_scores(sqlite_store) -> None:
+    memory_id = await sqlite_store.learning.save_memory_item(
+        kind="warning",
+        content="Do not skip the deployment approval check.",
+    )
+    procedure_id = await sqlite_store.procedures.save_procedure(
+        trigger_text="deploy task",
+        checklist="Check approval first.",
+    )
+
+    payload = await sqlite_store.learning.search_learning_context("deploy task", limit=3)
+    await sqlite_store.feedback.record_feedback(
+        task_id="task-1",
+        feedback_kind="approved",
+        score=1.5,
+        memory_item_id=memory_id,
+        procedure_id=procedure_id,
+    )
+
+    assert "Known pitfalls" in payload["text"]
+    assert "Preferred procedures" in payload["text"]
+    async with sqlite_store._db.execute(
+        "SELECT success_credit FROM memory_items WHERE id=?",
+        (memory_id,),
+    ) as cur:
+        memory_row = await cur.fetchone()
+    async with sqlite_store._db.execute(
+        "SELECT success_credit FROM procedures WHERE id=?",
+        (procedure_id,),
+    ) as cur:
+        procedure_row = await cur.fetchone()
+    assert memory_row["success_credit"] > 0
+    assert procedure_row["success_credit"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_search_memory_items_and_procedures_fall_back_and_track_usage(sqlite_store) -> None:
+    memory_id = await sqlite_store.learning.save_memory_item(
+        kind="fact",
+        content="Use the green deploy lane.",
+        metadata={"legacy_lesson_id": 1},
+    )
+    await sqlite_store.procedures.save_procedure(
+        trigger_text="green deploy",
+        checklist="Use the green deploy lane.",
+    )
+    original_db = sqlite_store._db
+    assert original_db is not None
+    sqlite_store._db = _ExecuteFailProxy(original_db, needle="FROM memory_items_fts")
+    try:
+        memory_items = await sqlite_store.learning.search_memory_items("green deploy")
+    finally:
+        sqlite_store._db = original_db
+
+    sqlite_store._db = _ExecuteFailProxy(original_db, needle="FROM procedures_fts")
+    try:
+        procedures = await sqlite_store.procedures.search_procedures("green deploy")
+    finally:
+        sqlite_store._db = original_db
+
+    assert memory_items[0]["id"] == memory_id
+    assert procedures[0]["trigger_text"] == "green deploy"
+    async with sqlite_store._db.execute("SELECT use_count FROM memory_items WHERE id=?", (memory_id,)) as cur:
+        row = await cur.fetchone()
+    assert row["use_count"] >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_record_episodic_event_persists_details(sqlite_store) -> None:
+    event_id = await sqlite_store.learning.record_episodic_event(
+        task_id="task-1",
+        session_id="session-1",
+        event_kind="success",
+        summary="Task succeeded cleanly.",
+        reward=1.2,
+        details={"reason": "tests_passed"},
+    )
+
+    assert sqlite_store._db is not None
+    async with sqlite_store._db.execute(
+        "SELECT event_kind, reward, details FROM episodic_events WHERE id=?",
+        (event_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["event_kind"] == "success"
+    assert row["reward"] == pytest.approx(1.2)
+    assert json.loads(row["details"])["reason"] == "tests_passed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_heartbeat_swallows_cleanup_errors(monkeypatch: pytest.MonkeyPatch, sqlite_store) -> None:
     async def boom() -> None:
         raise RuntimeError("cleanup failed")

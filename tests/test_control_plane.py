@@ -19,6 +19,7 @@ class _FakeSQLite:
         self.rows: dict[str, dict[str, object]] = {}
         self.sessions: dict[str, dict[str, object]] = {}
         self.turns: dict[str, list[dict[str, object]]] = {}
+        self.feedback: list[dict[str, object]] = []
 
     async def create_task_record(
         self,
@@ -120,6 +121,28 @@ class _FakeSQLite:
 
     async def list_session_turns(self, session_id: str, limit: int = 20) -> list[dict[str, object]]:
         return self.turns.get(session_id, [])[-limit:]
+
+    async def record_feedback(
+        self,
+        *,
+        task_id: str = "",
+        feedback_kind: str,
+        score: float = 0.0,
+        memory_item_id: int | None = None,
+        procedure_id: int | None = None,
+        details=None,
+    ) -> int:
+        self.feedback.append(
+            {
+                "task_id": task_id,
+                "feedback_kind": feedback_kind,
+                "score": score,
+                "memory_item_id": memory_item_id,
+                "procedure_id": procedure_id,
+                "details": details or {},
+            }
+        )
+        return len(self.feedback)
 
 
 class _FakeLoop:
@@ -450,6 +473,85 @@ def test_resume_waiting_task_rejects_blank_trimmed_content() -> None:
         assert response.json()["error_code"] == "invalid_request"
 
 
+def test_task_feedback_records_operator_signal() -> None:
+    client, sqlite, _ = _build_app()
+    sqlite.rows["task-1"] = {
+        "task_id": "task-1",
+        "source": "api",
+        "author": "tester",
+        "content": "do thing",
+        "status": "succeeded",
+        "result": "done",
+        "error": None,
+        "success": 1,
+        "elapsed_ms": 12.5,
+        "tool_calls": 2,
+        "created_ts": 1.0,
+        "started_ts": 2.0,
+        "finished_ts": 3.0,
+        "updated_ts": 3.0,
+        "metadata": {},
+    }
+
+    with client:
+        response = client.post(
+            "/tasks/task-1/feedback",
+            json={
+                "feedback_kind": "approved",
+                "score": 1.5,
+                "memory_item_id": 7,
+                "details": {"note": "worked well"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"] == "task-1"
+    assert sqlite.feedback[0]["feedback_kind"] == "approved"
+    assert sqlite.feedback[0]["memory_item_id"] == 7
+
+
+def test_task_feedback_rejects_missing_task() -> None:
+    client, _, _ = _build_app()
+    with client:
+        response = client.post(
+            "/tasks/missing/feedback",
+            json={"feedback_kind": "approved", "score": 1.0},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "task_not_found"
+
+
+def test_task_feedback_returns_service_unavailable_without_feedback_storage() -> None:
+    class _SQLite:
+        async def get_task_record(self, task_id: str) -> dict[str, object] | None:
+            return {
+                "task_id": task_id,
+                "source": "api",
+                "author": "tester",
+                "content": "do thing",
+                "status": "succeeded",
+                "result": "done",
+                "error": None,
+                "success": 1,
+                "elapsed_ms": 1.0,
+                "tool_calls": 1,
+                "created_ts": 1.0,
+                "started_ts": 1.0,
+                "finished_ts": 1.0,
+                "updated_ts": 1.0,
+                "metadata": {},
+            }
+
+    runtime = SimpleNamespace(sqlite=_SQLite(), loop=_FakeLoop(), bot=None)
+    client = TestClient(create_app(runtime, start_background_runtime=False, shutdown_runtime=False))
+    with client:
+        response = client.post("/tasks/task-1/feedback", json={"feedback_kind": "approved"})
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "service_unavailable"
+
+
 def test_conversation_endpoints_return_session_and_turns() -> None:
     client, sqlite, _ = _build_app()
     sqlite.sessions["api:task-1"] = {
@@ -670,6 +772,7 @@ def test_openapi_includes_control_plane_routes() -> None:
         assert "/tasks" in paths
         assert "/tasks/{task_id}" in paths
         assert "/tasks/{task_id}/input" in paths
+        assert "/tasks/{task_id}/feedback" in paths
         assert "/conversations/{session_id}" in paths
         assert "/conversations/{session_id}/turns" in paths
         assert "/events" in paths

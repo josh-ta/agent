@@ -267,3 +267,18 @@ def test_classify_turn_starts_new_task_when_pending_waits_are_ambiguous() -> Non
     )
 
     assert decision.intent is TurnIntent.START_NEW_TASK
+
+
+def test_session_router_task_shape_helpers_cover_edge_cases() -> None:
+    router = SessionRouter()
+
+    assert router._looks_like_new_task("") is False
+    assert router._looks_like_new_task("deploy now") is True
+    assert (
+        router._looks_like_new_task(
+            "this is a much longer note that should probably count as a new task request overall because it contains many extra words and keeps going"
+        )
+        is True
+    )
+    assert router._looks_like_same_task_followup("") is False
+    assert router._looks_like_same_task_followup("continue") is True

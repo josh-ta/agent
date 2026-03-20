@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 import agent.tools.shell as shell_module
-from agent.tools.shell import shell_run
+from agent.tools.shell import _validate_remote_command, shell_run
 
 
 @pytest.mark.asyncio
@@ -330,3 +330,23 @@ async def test_shell_run_times_out_when_process_exits_but_stream_never_closes(
 
     assert result.startswith("[TIMEOUT after 1s]")
     assert proc.kill_called is True
+
+
+def test_validate_remote_command_allows_github_and_checks_relative_workspace(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    monkeypatch.setattr(shell_module.settings, "workspace_path", isolated_paths["workspace"])
+    repo = isolated_paths["workspace"] / "repo"
+    repo.mkdir()
+
+    assert _validate_remote_command("ssh -T git@github.com") is None
+    assert _validate_remote_command(
+        "# remote-preflight: workspace=repo; basis=explicit user host\nssh root@example 'hostname'"
+    ) is None
+
+
+def test_validate_remote_command_requires_workspace_or_explicit_user_evidence(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
+    monkeypatch.setattr(shell_module.settings, "workspace_path", isolated_paths["workspace"])
+
+    result = _validate_remote_command("# remote-preflight: basis=checked logs\nssh root@example 'hostname'")
+
+    assert result is not None
+    assert "preflight comment must cite workspace evidence" in result

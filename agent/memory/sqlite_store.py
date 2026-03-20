@@ -21,9 +21,12 @@ import structlog
 
 from agent.memory.sqlite_components import (
     SQLiteConversationRepository,
+    SQLiteFeedbackRepository,
     SQLiteLessonRepository,
+    SQLiteLearningRepository,
     SQLiteMaintenance,
     SQLiteMemoryRepository,
+    SQLiteProcedureRepository,
     SQLiteTaskRepository,
 )
 
@@ -171,6 +174,126 @@ CREATE TRIGGER IF NOT EXISTS lessons_au AFTER UPDATE ON lessons BEGIN
     INSERT INTO lessons_fts(rowid, summary, context) VALUES (new.id, new.summary, new.context);
 END;
 
+-- Episodic learning events used for reliability scoring and replay
+CREATE TABLE IF NOT EXISTS episodic_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT DEFAULT '',
+    session_id   TEXT DEFAULT '',
+    event_kind   TEXT NOT NULL DEFAULT 'observation',
+    summary      TEXT NOT NULL,
+    reward       REAL NOT NULL DEFAULT 0,
+    details      TEXT DEFAULT '{}',
+    ts           REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS episodic_events_task_ts_idx
+    ON episodic_events (task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS episodic_events_kind_ts_idx
+    ON episodic_events (event_kind, ts DESC);
+
+-- Normalized long-term memory with usefulness metadata
+CREATE TABLE IF NOT EXISTS memory_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL DEFAULT 'fact',
+    scope           TEXT NOT NULL DEFAULT 'task',
+    content         TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'agent',
+    confidence      REAL NOT NULL DEFAULT 0.5,
+    salience        REAL NOT NULL DEFAULT 0.5,
+    success_credit  REAL NOT NULL DEFAULT 0,
+    failure_credit  REAL NOT NULL DEFAULT 0,
+    use_count       INTEGER NOT NULL DEFAULT 0,
+    pinned          INTEGER NOT NULL DEFAULT 0,
+    sensitive       INTEGER NOT NULL DEFAULT 0,
+    last_used_ts    REAL,
+    metadata        TEXT DEFAULT '{}',
+    ts              REAL NOT NULL,
+    updated_ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_items_kind_updated_idx
+    ON memory_items (kind, updated_ts DESC);
+CREATE INDEX IF NOT EXISTS memory_items_salience_idx
+    ON memory_items (pinned DESC, salience DESC, updated_ts DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts USING fts5(
+    content,
+    source,
+    content='memory_items',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
+    INSERT INTO memory_items_fts(rowid, content, source) VALUES (new.id, new.content, new.source);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
+    INSERT INTO memory_items_fts(memory_items_fts, rowid, content, source)
+    VALUES ('delete', old.id, old.content, old.source);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items BEGIN
+    INSERT INTO memory_items_fts(memory_items_fts, rowid, content, source)
+    VALUES ('delete', old.id, old.content, old.source);
+    INSERT INTO memory_items_fts(rowid, content, source) VALUES (new.id, new.content, new.source);
+END;
+
+-- Reusable procedures and checklists
+CREATE TABLE IF NOT EXISTS procedures (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL DEFAULT 'procedure',
+    trigger_text    TEXT NOT NULL,
+    checklist       TEXT NOT NULL,
+    confidence      REAL NOT NULL DEFAULT 0.5,
+    salience        REAL NOT NULL DEFAULT 0.5,
+    success_credit  REAL NOT NULL DEFAULT 0,
+    failure_credit  REAL NOT NULL DEFAULT 0,
+    use_count       INTEGER NOT NULL DEFAULT 0,
+    pinned          INTEGER NOT NULL DEFAULT 0,
+    last_used_ts    REAL,
+    metadata        TEXT DEFAULT '{}',
+    ts              REAL NOT NULL,
+    updated_ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS procedures_salience_idx
+    ON procedures (pinned DESC, salience DESC, updated_ts DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS procedures_fts USING fts5(
+    trigger_text,
+    checklist,
+    content='procedures',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS procedures_ai AFTER INSERT ON procedures BEGIN
+    INSERT INTO procedures_fts(rowid, trigger_text, checklist)
+    VALUES (new.id, new.trigger_text, new.checklist);
+END;
+CREATE TRIGGER IF NOT EXISTS procedures_ad AFTER DELETE ON procedures BEGIN
+    INSERT INTO procedures_fts(procedures_fts, rowid, trigger_text, checklist)
+    VALUES ('delete', old.id, old.trigger_text, old.checklist);
+END;
+CREATE TRIGGER IF NOT EXISTS procedures_au AFTER UPDATE ON procedures BEGIN
+    INSERT INTO procedures_fts(procedures_fts, rowid, trigger_text, checklist)
+    VALUES ('delete', old.id, old.trigger_text, old.checklist);
+    INSERT INTO procedures_fts(rowid, trigger_text, checklist)
+    VALUES (new.id, new.trigger_text, new.checklist);
+END;
+
+-- Explicit human/operator feedback on tasks and memories
+CREATE TABLE IF NOT EXISTS feedback_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT DEFAULT '',
+    memory_item_id  INTEGER,
+    procedure_id    INTEGER,
+    feedback_kind   TEXT NOT NULL,
+    score           REAL NOT NULL DEFAULT 0,
+    details         TEXT DEFAULT '{}',
+    ts              REAL NOT NULL,
+    FOREIGN KEY(memory_item_id) REFERENCES memory_items(id) ON DELETE SET NULL,
+    FOREIGN KEY(procedure_id) REFERENCES procedures(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS feedback_events_task_ts_idx
+    ON feedback_events (task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS feedback_events_kind_ts_idx
+    ON feedback_events (feedback_kind, ts DESC);
+
 -- Internal metadata (cleanup timestamps, etc.)
 CREATE TABLE IF NOT EXISTS _meta (
     key   TEXT PRIMARY KEY,
@@ -203,6 +326,9 @@ class SQLiteStore:
         self.tasks = SQLiteTaskRepository(self)
         self.memory_facts = SQLiteMemoryRepository(self)
         self.lessons = SQLiteLessonRepository(self)
+        self.learning = SQLiteLearningRepository(self)
+        self.procedures = SQLiteProcedureRepository(self)
+        self.feedback = SQLiteFeedbackRepository(self)
         self.maintenance = SQLiteMaintenance(self)
 
     def _check(self) -> None:
@@ -632,6 +758,64 @@ class SQLiteStore:
         """Search memory facts — tries vector similarity first, falls back to FTS5."""
         return await self.memory_facts.search_memory(query, limit)
 
+    async def search_learning_context(self, query: str, limit: int = 3) -> dict[str, Any]:
+        return await self.learning.search_learning_context(query, limit=limit)
+
+    async def save_memory_item(
+        self,
+        *,
+        kind: str,
+        content: str,
+        scope: str = "task",
+        source: str = "agent",
+        confidence: float = 0.5,
+        salience: float = 0.5,
+        pinned: bool = False,
+        sensitive: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        return await self.learning.save_memory_item(
+            kind=kind,
+            content=content,
+            scope=scope,
+            source=source,
+            confidence=confidence,
+            salience=salience,
+            pinned=pinned,
+            sensitive=sensitive,
+            metadata=metadata,
+        )
+
+    async def save_procedure(
+        self,
+        *,
+        trigger_text: str,
+        checklist: str,
+        kind: str = "procedure",
+        confidence: float = 0.5,
+        salience: float = 0.5,
+        pinned: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        return await self.procedures.save_procedure(
+            trigger_text=trigger_text,
+            checklist=checklist,
+            kind=kind,
+            confidence=confidence,
+            salience=salience,
+            pinned=pinned,
+            metadata=metadata,
+        )
+
+    async def search_procedures(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        return await self.procedures.search_procedures(query, limit=limit)
+
+    async def pin_memory_item(self, memory_item_id: int, *, pinned: bool = True) -> None:
+        await self.learning.pin_memory_item(memory_item_id, pinned=pinned)
+
+    async def pin_procedure(self, procedure_id: int, *, pinned: bool = True) -> None:
+        await self.procedures.pin_procedure(procedure_id, pinned=pinned)
+
     # ── Lessons ───────────────────────────────────────────────────────────────
 
     async def save_lesson(
@@ -650,6 +834,44 @@ class SQLiteStore:
     async def get_recent_lessons(self, limit: int = 20) -> str:
         """Return the most recent lessons for MEMORY.md updates."""
         return await self.lessons.get_recent_lessons(limit)
+
+    async def record_episodic_event(
+        self,
+        *,
+        task_id: str = "",
+        session_id: str = "",
+        event_kind: str,
+        summary: str,
+        reward: float = 0.0,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        return await self.learning.record_episodic_event(
+            task_id=task_id,
+            session_id=session_id,
+            event_kind=event_kind,
+            summary=summary,
+            reward=reward,
+            details=details,
+        )
+
+    async def record_feedback(
+        self,
+        *,
+        task_id: str = "",
+        feedback_kind: str,
+        score: float = 0.0,
+        memory_item_id: int | None = None,
+        procedure_id: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        return await self.feedback.record_feedback(
+            task_id=task_id,
+            feedback_kind=feedback_kind,
+            score=score,
+            memory_item_id=memory_item_id,
+            procedure_id=procedure_id,
+            details=details,
+        )
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 

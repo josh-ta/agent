@@ -596,6 +596,35 @@ async def test_message_service_injects_followup_and_replies_inline(
 
 
 @pytest.mark.asyncio
+async def test_message_service_saves_project_memory_from_active_followup(
+    fake_client,
+    discord_channels,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_paths,
+) -> None:
+    loop = _ReadyLoop()
+    service = MessageHandlingService(
+        agent_loop=loop,  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    inject_q: asyncio.Queue[str] = asyncio.Queue()
+    service._inject_queues[discord_channels["private"].id] = inject_q
+    message = fake_message_factory(channel=discord_channels["private"], content="app host is root@example")
+    monkeypatch.setattr(
+        discord_services_module,
+        "classify",
+        lambda *_args: _parsed(MessageKind.TASK, content="app host is root@example", channel_id=discord_channels["private"].id),
+    )
+
+    await service.handle_message(message)  # type: ignore[arg-type]
+
+    project_memory = (isolated_paths["workspace"] / ".agent-project-memory.md").read_text(encoding="utf-8")
+    assert "root@example" in project_memory
+
+
+@pytest.mark.asyncio
 async def test_message_service_injects_pause_request_for_active_task(
     fake_client,
     discord_channels,

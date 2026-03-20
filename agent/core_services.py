@@ -92,7 +92,7 @@ class SystemPromptBuilder:
    - Use `write_file` for new files or true rewrites.
    - Use `search_files` to locate code before editing.
    - Use `tail_lines=100` with `run_shell` for verbose test output.
-4. After failures: call lesson_save(kind="mistake"). Before complex tasks: call lesson_search.
+4. Before complex tasks: call lesson_search() and procedure_search(). After failures: call lesson_save(kind="mistake").
 5. Use skill_read <name> to load a skill's full procedure before following it.
 6. Use read_channel('private') to catch up on recent conversation history when context is needed.
 7. Each mistake happens only once — record it and move on.
@@ -121,7 +121,7 @@ class SystemPromptBuilder:
 16. Secrets are available via secret tools and secret-aware browser tools:
     - Never reveal secret values in Discord, task notes, memory, files, or final answers.
     - Never paste secrets into shell commands when a secret-aware tool can do the job.
-    - Use secret_list() to discover names, secret_get(name) only when raw text is unavoidable,
+    - Use secret_list()/secret_search() to discover names, secret_get(name) only when raw text is unavoidable,
       and browser_fill_secret/browser_type_secret for login forms.
 17. If the user message includes attachments, inspect the attachment summary/path context first.
     Use read_file on saved attachment paths when you need deeper inspection. Images and PDFs may

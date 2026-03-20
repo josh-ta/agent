@@ -66,6 +66,25 @@ class ResumeTaskRequest(BaseModel):
     author: str = Field(default="api", min_length=1, max_length=200)
 
 
+class TaskFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    feedback_kind: str = Field(min_length=1, max_length=100)
+    score: float = Field(default=1.0, ge=-5.0, le=5.0)
+    memory_item_id: int | None = None
+    procedure_id: int | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskFeedbackResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    task_id: str
+    feedback_kind: str
+    score: float
+
+
 class TaskResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -412,6 +431,46 @@ def create_app(
         await runtime.loop.enqueue(resumed)
         await bridge.emit(TaskQueuedEvent(task_id=task_id, content=resumed.content, source="api"))
         return CreateTaskResponse(id=task_id, status="queued")
+
+    @app.post(
+        "/tasks/{task_id}/feedback",
+        response_model=TaskFeedbackResponse,
+        responses=ERROR_RESPONSES,
+        tags=["tasks"],
+    )
+    async def task_feedback(
+        request: Request,
+        task_id: str,
+        payload: TaskFeedbackRequest,
+    ) -> TaskFeedbackResponse:
+        runtime = _require_runtime(request.app)
+        row = await runtime.sqlite.get_task_record(task_id)
+        if row is None:
+            raise ApiError(
+                status_code=status.HTTP_404_NOT_FOUND,
+                error_code="task_not_found",
+                message=f"Task '{task_id}' was not found.",
+            )
+        if not hasattr(runtime.sqlite, "record_feedback"):
+            raise ApiError(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                error_code="service_unavailable",
+                message="Feedback storage is not available.",
+            )
+        feedback_id = await runtime.sqlite.record_feedback(
+            task_id=task_id,
+            feedback_kind=payload.feedback_kind,
+            score=payload.score,
+            memory_item_id=payload.memory_item_id,
+            procedure_id=payload.procedure_id,
+            details=payload.details,
+        )
+        return TaskFeedbackResponse(
+            id=feedback_id,
+            task_id=task_id,
+            feedback_kind=payload.feedback_kind,
+            score=payload.score,
+        )
 
     @app.get(
         "/conversations/{session_id}",

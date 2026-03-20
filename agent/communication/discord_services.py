@@ -39,6 +39,7 @@ from agent.events import (
 )
 from agent.loop import Task
 from agent.project_memory import (
+    extract_project_memory_facts,
     remove_project_memory_facts,
     render_project_memory,
     save_project_memory_facts,
@@ -741,6 +742,12 @@ class MessageHandlingService:
                 )
         return task_content, attachment_metadata, combined_content
 
+    @staticmethod
+    def _save_project_memory_from_text(text: str) -> None:
+        facts = extract_project_memory_facts(text)
+        if facts:
+            save_project_memory_facts(facts)
+
     async def _maybe_resume_waiting_discord_task(self, message: discord.Message) -> Task | None:
         reference = getattr(getattr(message, "reference", None), "message_id", None)
         suspended = self._agent_loop.wait_registry.pop_for_discord_reply(
@@ -819,6 +826,7 @@ class MessageHandlingService:
         resumed_task = await self._maybe_resume_waiting_discord_task(message)
         if resumed_task is not None:
             await self._acknowledge_message(message)
+            self._save_project_memory_from_text(combined_content)
             task_id = str(resumed_task.metadata.get("task_id", "")).strip()
             if task_id and hasattr(self._agent_loop.memory, "mark_task_queued"):
                 await self._agent_loop.memory.mark_task_queued(task_id, metadata=resumed_task.metadata)
@@ -860,6 +868,7 @@ class MessageHandlingService:
 
         inject_q = self._inject_queues.get(parsed.channel_id)
         if inject_q is not None:
+            self._save_project_memory_from_text(combined_content)
             if decision.intent == TurnIntent.CANCEL_OR_PAUSE:
                 await self._acknowledge_message(message)
                 forget_request = self._is_forget_request(combined_content)

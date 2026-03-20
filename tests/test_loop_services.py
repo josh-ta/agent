@@ -37,6 +37,11 @@ from agent.task_waits import UserInputRequired
 class _MemoryStore:
     def __init__(self) -> None:
         self.saved_lessons: list[tuple[str, str, str]] = []
+        self.episodes: list[tuple[str, float, dict]] = []
+        self.memory_outcomes: list[tuple[list[int], float, float]] = []
+        self.procedure_outcomes: list[tuple[list[int], float, float]] = []
+        self.learning = SimpleNamespace(apply_outcome_to_memory=self._apply_memory_outcome)
+        self.procedures = SimpleNamespace(apply_outcome_to_procedures=self._apply_procedure_outcome)
 
     async def search_lessons(self, query: str, limit: int = 3) -> str:
         return "## Relevant past lessons:\n- Use fixtures."
@@ -53,6 +58,15 @@ class _MemoryStore:
 
     async def get_recent_lessons(self, limit: int = 20) -> str:
         return "- [PATTERN 2026-03-16] Reuse fixtures."
+
+    async def record_episodic_event(self, *, event_kind: str, reward: float, details: dict, **kwargs) -> None:
+        self.episodes.append((event_kind, reward, details))
+
+    async def _apply_memory_outcome(self, ids: list[int], *, success_delta: float = 0.0, failure_delta: float = 0.0) -> None:
+        self.memory_outcomes.append((ids, success_delta, failure_delta))
+
+    async def _apply_procedure_outcome(self, ids: list[int], *, success_delta: float = 0.0, failure_delta: float = 0.0) -> None:
+        self.procedure_outcomes.append((ids, success_delta, failure_delta))
 
 
 class _NullContext:
@@ -81,6 +95,11 @@ class _RetryAgent:
 class _ReflectAgent:
     async def run(self, prompt: str, usage_limits=None):
         return SimpleNamespace(output="Cache setup details after you confirm the environment.")
+
+
+class _ProcedureReflectAgent:
+    async def run(self, prompt: str, usage_limits=None):
+        return SimpleNamespace(output="PROCEDURE: deploy task => Check approval, then verify health.")
 
 
 class _Bridge:
@@ -115,6 +134,39 @@ class _StreamingAgent:
             yield FunctionToolResultEvent(
                 ToolReturnPart(tool_name="run_shell", content="ok", tool_call_id="call-1")
             )
+            yield final
+            return
+
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "revised"
+        yield final
+
+
+class _StreamingAgentInterruptibleAfterTool:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        del prompt, message_history, usage_limits
+        self.calls += 1
+        if self.calls == 1:
+            yield FunctionToolCallEvent(
+                ToolCallPart(tool_name="run_shell", args='{"command": "echo one"}', tool_call_id="call-1")
+            )
+            yield FunctionToolResultEvent(
+                ToolReturnPart(tool_name="run_shell", content="ok\n[exit code: 0]", tool_call_id="call-1")
+            )
+            yield FunctionToolCallEvent(
+                ToolCallPart(tool_name="run_shell", args='{"command": "echo stale"}', tool_call_id="call-2")
+            )
+            yield FunctionToolResultEvent(
+                ToolReturnPart(tool_name="run_shell", content="stale\n[exit code: 0]", tool_call_id="call-2")
+            )
+            final = FinalResultEvent(tool_name=None, tool_call_id=None)
+            final.output = "stale"
             yield final
             return
 
@@ -663,6 +715,30 @@ async def test_run_executor_emits_events_and_folds_injected_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_executor_interrupts_at_safe_boundary_for_injected_message() -> None:
+    bridge = _Bridge()
+    agent = _StreamingAgentInterruptibleAfterTool()
+    executor = RunExecutor(event_bridge=bridge)
+    inject_q: asyncio.Queue[str] = asyncio.Queue()
+    inject_q.put_nowait("use this new password instead")
+
+    result = await executor.run(
+        task=Task(content="start", inject_queue=inject_q),
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert result.output == "revised"
+    assert result.tool_calls == 1
+    assert agent.calls == 2
+    assert not any(
+        isinstance(event, ToolCallStartEvent) and getattr(event, "call_id", "") == "call-2"
+        for event in bridge.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_executor_ignores_empty_thinking_deltas() -> None:
     bridge = _Bridge()
     agent = _StreamingAgentWithEmptyThinkingDelta()
@@ -945,9 +1021,9 @@ async def test_run_executor_followup_injected_message_can_pause_for_user(monkeyp
     assert result.waiting_for_user is True
     assert result.question == "Which environment should I use?"
     assert result.timeout_s == 45
-    assert result.tool_calls == 2
+    assert result.tool_calls == 1
     assert result.user_visible_reply_sent is True
-    assert len(result.attachments) == 1
+    assert result.attachments == []
 
 
 def test_user_input_required_allows_traceback_assignment() -> None:
@@ -1198,6 +1274,73 @@ async def test_reflection_service_updates_memory_md_on_failure(isolated_paths) -
 
 
 @pytest.mark.asyncio
+async def test_reflection_service_saves_failure_recovery_procedure(isolated_paths) -> None:
+    class _ProcedureMemory(_MemoryStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saved_procedures: list[tuple[str, str, str]] = []
+
+        async def save_procedure(self, trigger_text: str, checklist: str, kind: str, **kwargs) -> None:
+            self.saved_procedures.append((trigger_text, checklist, kind))
+
+    memory = _ProcedureMemory()
+    service = ReflectionService(agents={"fast": _ProcedureReflectAgent()}, memory_store=memory)
+
+    await service.reflect(
+        Task(content="deploy task"),
+        TaskResult(
+            task=Task(content="deploy task"),
+            output="Host key verification failed",
+            success=False,
+            elapsed_ms=1.0,
+            status="failed",
+        ),
+        success_count=1,
+        memory_update_interval=10,
+    )
+
+    assert memory.saved_procedures == [("deploy task", "Check approval, then verify health.", "recovery")]
+
+
+@pytest.mark.asyncio
+async def test_task_context_builder_includes_secret_hints_without_values(isolated_paths, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent.secret_store import SecretStore
+
+    secret_path = isolated_paths["workspace"] / "agent-secrets.json"
+    monkeypatch.setattr(settings, "agent_secrets_path", secret_path)
+    monkeypatch.setattr(settings, "agent_secrets_master_key", "unit-test-key")
+    SecretStore(secret_path, master_key="unit-test-key").set(
+        "LOGIN_PASSWORD",
+        "hunter2",
+        purpose="dashboard login",
+        scope="staging",
+    )
+    builder = TaskContextBuilder(memory_store=None, secret_store=SecretStore(secret_path, master_key="unit-test-key"))
+
+    task, _tier, prompt = await builder.build(Task(content="login to the staging dashboard"))
+
+    assert task.metadata.get("retrieved_memory_ids", []) == []
+    assert "Sensitive resources available by explicit request" in prompt
+    assert "LOGIN_PASSWORD" in prompt
+    assert "hunter2" not in prompt
+
+
+def test_task_journal_redacts_stored_secret_values(isolated_paths, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent.secret_store import SecretStore
+
+    secret_path = isolated_paths["workspace"] / "agent-secrets.json"
+    monkeypatch.setattr(settings, "agent_secrets_path", secret_path)
+    monkeypatch.setattr(settings, "agent_secrets_master_key", "unit-test-key")
+    SecretStore(secret_path, master_key="unit-test-key").set("LOGIN_PASSWORD", "hunter2")
+    journal = TaskJournal(isolated_paths["workspace"])
+
+    journal.append("Login", "Use hunter2 to sign in.")
+
+    content = journal.path.read_text(encoding="utf-8")
+    assert "hunter2" not in content
+
+
+@pytest.mark.asyncio
 async def test_reflection_service_saves_success_patterns_and_updates_memory(isolated_paths) -> None:
     memory = _MemoryStore()
     service = ReflectionService(agents={"fast": _ReflectAgent()}, memory_store=memory)
@@ -1206,10 +1349,12 @@ async def test_reflection_service_saves_success_patterns_and_updates_memory(isol
         Task(content="optimize cache"),
         TaskResult(
             task=Task(content="optimize cache"),
-            output="done",
+            output="Tests passed after reusing the cache fixture and verifying health checks.",
             success=True,
             elapsed_ms=1.0,
             tool_calls=8,
+            retrieved_memory_ids=[1, 2],
+            retrieved_procedure_ids=[3],
         ),
         success_count=10,
         memory_update_interval=10,
@@ -1217,6 +1362,9 @@ async def test_reflection_service_saves_success_patterns_and_updates_memory(isol
 
     memory_md = (isolated_paths["identity"] / "MEMORY.md").read_text(encoding="utf-8")
     assert memory.saved_lessons[0][1] == "pattern"
+    assert memory.episodes[0][0] == "success"
+    assert memory.memory_outcomes[0][0] == [1, 2]
+    assert memory.procedure_outcomes[0][0] == [3]
     assert "Recent Lessons" in memory_md
 
 
@@ -1232,7 +1380,7 @@ async def test_reflection_service_tolerates_memory_update_errors(isolated_paths)
         Task(content="optimize cache"),
         TaskResult(
             task=Task(content="optimize cache"),
-            output="done",
+            output="Tests passed after reusing the cache fixture and verifying health checks.",
             success=True,
             elapsed_ms=1.0,
             tool_calls=8,

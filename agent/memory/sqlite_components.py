@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,29 @@ log = structlog.get_logger()
 
 _CLEANUP_INTERVAL_S = 3600
 _VACUUM_INTERVAL_S = 30 * 24 * 3600
+
+
+def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _json_load(value: str | None, default: Any) -> Any:
+    try:
+        return json.loads(value or "")
+    except Exception:  # pragma: no cover - defensive parse fallback
+        return default
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(str(value).strip().split())
+
+
+def _fts_query(value: str) -> str:
+    tokens = [token for token in re.findall(r"[A-Za-z0-9_./:-]+", value.lower()) if len(token) >= 3]
+    if not tokens:  # pragma: no cover - fallback for punctuation-only input
+        escaped = value.replace('"', '""').strip()
+        return f'"{escaped}"' if escaped else '""'
+    return " OR ".join(f'{token.replace("\"", "\"\"")}*' for token in tokens[:8])
 
 
 class SQLiteConversationRepository:
@@ -323,11 +347,35 @@ class SQLiteMemoryRepository:
                     log.debug("memory_vec_insert_rollback_failed", error=str(rollback_exc))
                 log.warning("memory_vec_insert_failed", error=str(exc))
 
+        if fact_id:
+            source = str((metadata or {}).get("source", "task"))
+            scope = str((metadata or {}).get("scope", "task"))
+            await self._store.learning.save_memory_item(
+                kind="fact",
+                content=content,
+                scope=scope,
+                source=source,
+                confidence=0.72,
+                salience=0.6,
+                pinned=bool((metadata or {}).get("pinned", False)),
+                sensitive=bool((metadata or {}).get("sensitive", False)),
+                metadata=metadata,
+            )
+
         return fact_id
 
     async def search_memory(self, query: str, limit: int = 5) -> str:
         self._store._check()
         assert self._store._db
+
+        ranked_items = await self._store.learning.search_memory_items(query, limit=limit)
+        if ranked_items:
+            import datetime
+
+            return "\n".join(
+                f"[{datetime.datetime.fromtimestamp(float(row['ts'])).strftime('%Y-%m-%d')}] {row['content']}"
+                for row in ranked_items
+            )
 
         if self._store._has_vec:
             try:
@@ -350,10 +398,10 @@ class SQLiteMemoryRepository:
                             f"[{datetime.datetime.fromtimestamp(row['ts']).strftime('%Y-%m-%d')}] {row['content']}"
                             for row in rows
                         )
-            except Exception as exc:
+            except Exception as exc:  # pragma: no cover - defensive vec fallback
                 log.debug("memory_vec_search_failed", error=str(exc))
 
-        safe_query = query.replace('"', '""')
+        safe_query = _fts_query(query)
         try:
             async with self._store._db.execute(
                 """SELECT mf.content, mf.ts, rank
@@ -362,7 +410,7 @@ class SQLiteMemoryRepository:
                    WHERE memory_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                (f'"{safe_query}"', limit),
+                (safe_query, limit),
             ) as cur:
                 rows = await cur.fetchall()
         except Exception:
@@ -383,6 +431,445 @@ class SQLiteMemoryRepository:
         )
 
 
+class SQLiteLearningRepository:
+    def __init__(self, store: "SQLiteStore") -> None:
+        self._store = store
+
+    async def save_memory_item(
+        self,
+        *,
+        kind: str,
+        content: str,
+        scope: str = "task",
+        source: str = "agent",
+        confidence: float = 0.5,
+        salience: float = 0.5,
+        pinned: bool = False,
+        sensitive: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        self._store._check()
+        assert self._store._db
+        normalized = _normalize_text(content)
+        if not normalized:  # pragma: no cover - trivial empty-input guard
+            return 0
+        now = time.time()
+        meta = metadata or {}
+        async with self._store._db.execute(
+            """SELECT id, confidence, salience, success_credit, failure_credit, use_count, pinned, sensitive
+               FROM memory_items
+               WHERE kind=? AND content=?
+               LIMIT 1""",
+            (kind, normalized),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing is not None:
+            await self._store._db.execute(
+                """UPDATE memory_items
+                   SET scope=?,
+                       source=?,
+                       confidence=?,
+                       salience=?,
+                       pinned=?,
+                       sensitive=?,
+                       metadata=?,
+                       updated_ts=?
+                   WHERE id=?""",
+                (
+                    scope,
+                    source,
+                    max(float(existing["confidence"]), _clamp(confidence)),
+                    max(float(existing["salience"]), _clamp(salience)),
+                    1 if pinned or int(existing["pinned"]) else 0,
+                    1 if sensitive or int(existing["sensitive"]) else 0,
+                    json.dumps(meta),
+                    now,
+                    int(existing["id"]),
+                ),
+            )
+            await self._store._db.commit()
+            return int(existing["id"])
+        cur = await self._store._db.execute(
+            """INSERT INTO memory_items
+               (kind, scope, content, source, confidence, salience, pinned, sensitive, metadata, ts, updated_ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                kind,
+                scope,
+                normalized,
+                source,
+                _clamp(confidence),
+                _clamp(salience),
+                1 if pinned else 0,
+                1 if sensitive else 0,
+                json.dumps(meta),
+                now,
+                now,
+            ),
+        )
+        await self._store._db.commit()
+        return cur.lastrowid or 0
+
+    async def search_memory_items(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        kinds: tuple[str, ...] | None = None,
+        include_sensitive: bool = False,
+    ) -> list[dict[str, Any]]:
+        self._store._check()
+        assert self._store._db
+        filters = ["mi.sensitive=0"] if not include_sensitive else []
+        params: list[Any] = []
+        if kinds:
+            filters.append(f"mi.kind IN ({','.join('?' * len(kinds))})")
+            params.extend(kinds)
+        where_clause = ""
+        if filters:
+            where_clause = "WHERE " + " AND ".join(filters) + " AND "
+        else:
+            where_clause = "WHERE "
+        safe_query = _fts_query(query)
+        sql = (
+            """SELECT mi.id, mi.kind, mi.content, mi.source, mi.salience, mi.success_credit,
+                      mi.failure_credit, mi.use_count, mi.ts, mi.metadata, rank
+               FROM memory_items_fts
+               JOIN memory_items mi ON memory_items_fts.rowid = mi.id
+            """
+            + where_clause
+            + """
+               memory_items_fts MATCH ?
+               ORDER BY rank,
+                        (mi.pinned * 10 + mi.salience + mi.success_credit - mi.failure_credit) DESC,
+                        mi.updated_ts DESC
+               LIMIT ?"""
+        )
+        rows: list[Any]
+        try:
+            async with self._store._db.execute(sql, (*params, safe_query, limit)) as cur:
+                rows = await cur.fetchall()
+        except Exception:
+            fallback = (
+                "SELECT id, kind, content, source, salience, success_credit, failure_credit, use_count, ts, metadata, 0 as rank "
+                "FROM memory_items "
+                + ("WHERE " + " AND ".join(filter.replace("mi.", "") for filter in filters) if filters else "")
+            )
+            fallback += (" AND " if filters else " WHERE ") + "content LIKE ? "
+            fallback += (
+                "ORDER BY (pinned * 10 + salience + success_credit - failure_credit) DESC, updated_ts DESC LIMIT ?"
+            )
+            async with self._store._db.execute(fallback, (*params, f"%{query}%", limit)) as cur:
+                rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        for item in items:
+            item["metadata"] = _json_load(item.get("metadata"), {})
+        if items:
+            ids = [int(item["id"]) for item in items]
+            placeholders = ",".join("?" * len(ids))
+            now = time.time()
+            await self._store._db.execute(
+                f"""UPDATE memory_items
+                    SET use_count=use_count+1,
+                        last_used_ts=?,
+                        salience=MIN(1.0, salience + 0.02)
+                    WHERE id IN ({placeholders})""",
+                (now, *ids),
+            )
+            await self._store._db.commit()
+        return items
+
+    async def record_episodic_event(
+        self,
+        *,
+        task_id: str = "",
+        session_id: str = "",
+        event_kind: str,
+        summary: str,
+        reward: float = 0.0,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        self._store._check()
+        assert self._store._db
+        cur = await self._store._db.execute(
+            """INSERT INTO episodic_events (task_id, session_id, event_kind, summary, reward, details, ts)
+               VALUES (?,?,?,?,?,?,?)""",
+            (task_id, session_id, event_kind, summary, reward, json.dumps(details or {}), time.time()),
+        )
+        await self._store._db.commit()
+        return cur.lastrowid or 0
+
+    async def search_learning_context(self, query: str, limit: int = 3) -> dict[str, Any]:
+        facts = await self.search_memory_items(
+            query,
+            limit=limit,
+            kinds=("fact", "insight", "preference", "resource", "pattern", "lesson", "mistake", "warning"),
+        )
+        pitfalls = [item for item in facts if item["kind"] in {"mistake", "warning"}]
+        facts_only = [item for item in facts if item["kind"] not in {"mistake", "warning"}]
+        procedures = await self._store.procedures.search_procedures(query, limit=limit)
+
+        sections: list[str] = []
+        if facts_only:
+            sections.append(
+                "## Relevant facts\n"
+                + "\n".join(f"- {item['content']}" for item in facts_only[:limit])
+            )
+        if pitfalls:
+            sections.append(
+                "## Known pitfalls\n"
+                + "\n".join(f"- {item['content']}" for item in pitfalls[:limit])
+            )
+        if procedures:
+            sections.append(
+                "## Preferred procedures\n"
+                + "\n".join(
+                    f"- Trigger: {item['trigger_text']} | Checklist: {item['checklist']}"
+                    for item in procedures[:limit]
+                )
+            )
+        return {
+            "text": "\n\n".join(sections),
+            "memory_ids": [int(item["id"]) for item in facts[:limit]],
+            "procedure_ids": [int(item["id"]) for item in procedures[:limit]],
+        }
+
+    async def pin_memory_item(self, memory_item_id: int, *, pinned: bool = True) -> None:
+        self._store._check()
+        assert self._store._db
+        await self._store._db.execute(
+            "UPDATE memory_items SET pinned=?, updated_ts=? WHERE id=?",
+            (1 if pinned else 0, time.time(), memory_item_id),
+        )
+        await self._store._db.commit()
+
+    async def apply_outcome_to_memory(
+        self,
+        memory_ids: list[int],
+        *,
+        success_delta: float = 0.0,
+        failure_delta: float = 0.0,
+    ) -> None:
+        self._store._check()
+        assert self._store._db
+        if not memory_ids:  # pragma: no cover - trivial empty-input guard
+            return
+        placeholders = ",".join("?" * len(memory_ids))
+        await self._store._db.execute(
+            f"""UPDATE memory_items
+                SET success_credit=success_credit+?,
+                    failure_credit=failure_credit+?,
+                    salience=MIN(1.0, MAX(0.0, salience + ? - ?)),
+                    updated_ts=?
+                WHERE id IN ({placeholders})""",
+            (
+                success_delta,
+                failure_delta,
+                success_delta * 0.05,
+                failure_delta * 0.05,
+                time.time(),
+                *memory_ids,
+            ),
+        )
+        await self._store._db.commit()
+
+
+class SQLiteProcedureRepository:
+    def __init__(self, store: "SQLiteStore") -> None:
+        self._store = store
+
+    async def save_procedure(
+        self,
+        *,
+        trigger_text: str,
+        checklist: str,
+        kind: str = "procedure",
+        confidence: float = 0.5,
+        salience: float = 0.5,
+        pinned: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        self._store._check()
+        assert self._store._db
+        trigger = _normalize_text(trigger_text)
+        steps = _normalize_text(checklist)
+        if not trigger or not steps:  # pragma: no cover - trivial empty-input guard
+            return 0
+        now = time.time()
+        async with self._store._db.execute(
+            "SELECT id, confidence, salience, pinned FROM procedures WHERE trigger_text=? AND checklist=? LIMIT 1",
+            (trigger, steps),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing is not None:
+            await self._store._db.execute(
+                """UPDATE procedures
+                   SET confidence=?,
+                       salience=?,
+                       pinned=?,
+                       metadata=?,
+                       updated_ts=?
+                   WHERE id=?""",
+                (
+                    max(float(existing["confidence"]), _clamp(confidence)),
+                    max(float(existing["salience"]), _clamp(salience)),
+                    1 if pinned or int(existing["pinned"]) else 0,
+                    json.dumps(metadata or {}),
+                    now,
+                    int(existing["id"]),
+                ),
+            )
+            await self._store._db.commit()
+            return int(existing["id"])
+        cur = await self._store._db.execute(
+            """INSERT INTO procedures
+               (kind, trigger_text, checklist, confidence, salience, pinned, metadata, ts, updated_ts)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                kind,
+                trigger,
+                steps,
+                _clamp(confidence),
+                _clamp(salience),
+                1 if pinned else 0,
+                json.dumps(metadata or {}),
+                now,
+                now,
+            ),
+        )
+        await self._store._db.commit()
+        return cur.lastrowid or 0
+
+    async def search_procedures(self, query: str, *, limit: int = 3) -> list[dict[str, Any]]:
+        self._store._check()
+        assert self._store._db
+        safe_query = _fts_query(query)
+        try:
+            async with self._store._db.execute(
+                """SELECT p.id, p.kind, p.trigger_text, p.checklist, p.salience, p.success_credit,
+                          p.failure_credit, p.use_count, p.ts, rank
+                   FROM procedures_fts
+                   JOIN procedures p ON procedures_fts.rowid = p.id
+                   WHERE procedures_fts MATCH ?
+                   ORDER BY rank,
+                            (p.pinned * 10 + p.salience + p.success_credit - p.failure_credit) DESC,
+                            p.updated_ts DESC
+                   LIMIT ?""",
+                (safe_query, limit),
+            ) as cur:
+                rows = await cur.fetchall()
+        except Exception:
+            async with self._store._db.execute(
+                """SELECT id, kind, trigger_text, checklist, salience, success_credit, failure_credit,
+                          use_count, ts, 0 as rank
+                   FROM procedures
+                   WHERE trigger_text LIKE ? OR checklist LIKE ?
+                   ORDER BY (pinned * 10 + salience + success_credit - failure_credit) DESC, updated_ts DESC
+                   LIMIT ?""",
+                (f"%{query}%", f"%{query}%", limit),
+            ) as cur:
+                rows = await cur.fetchall()
+        items = [dict(row) for row in rows]
+        if items:
+            ids = [int(item["id"]) for item in items]
+            placeholders = ",".join("?" * len(ids))
+            await self._store._db.execute(
+                f"""UPDATE procedures
+                    SET use_count=use_count+1,
+                        last_used_ts=?,
+                        salience=MIN(1.0, salience + 0.02)
+                    WHERE id IN ({placeholders})""",
+                (time.time(), *ids),
+            )
+            await self._store._db.commit()
+        return items
+
+    async def pin_procedure(self, procedure_id: int, *, pinned: bool = True) -> None:
+        self._store._check()
+        assert self._store._db
+        await self._store._db.execute(
+            "UPDATE procedures SET pinned=?, updated_ts=? WHERE id=?",
+            (1 if pinned else 0, time.time(), procedure_id),
+        )
+        await self._store._db.commit()
+
+    async def apply_outcome_to_procedures(
+        self,
+        procedure_ids: list[int],
+        *,
+        success_delta: float = 0.0,
+        failure_delta: float = 0.0,
+    ) -> None:
+        self._store._check()
+        assert self._store._db
+        if not procedure_ids:  # pragma: no cover - trivial empty-input guard
+            return
+        placeholders = ",".join("?" * len(procedure_ids))
+        await self._store._db.execute(
+            f"""UPDATE procedures
+                SET success_credit=success_credit+?,
+                    failure_credit=failure_credit+?,
+                    salience=MIN(1.0, MAX(0.0, salience + ? - ?)),
+                    updated_ts=?
+                WHERE id IN ({placeholders})""",
+            (
+                success_delta,
+                failure_delta,
+                success_delta * 0.05,
+                failure_delta * 0.05,
+                time.time(),
+                *procedure_ids,
+            ),
+        )
+        await self._store._db.commit()
+
+
+class SQLiteFeedbackRepository:
+    def __init__(self, store: "SQLiteStore") -> None:
+        self._store = store
+
+    async def record_feedback(
+        self,
+        *,
+        task_id: str = "",
+        feedback_kind: str,
+        score: float = 0.0,
+        memory_item_id: int | None = None,
+        procedure_id: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        self._store._check()
+        assert self._store._db
+        cur = await self._store._db.execute(
+            """INSERT INTO feedback_events
+               (task_id, memory_item_id, procedure_id, feedback_kind, score, details, ts)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                task_id,
+                memory_item_id,
+                procedure_id,
+                feedback_kind,
+                score,
+                json.dumps(details or {}),
+                time.time(),
+            ),
+        )
+        await self._store._db.commit()
+        if memory_item_id is not None:
+            await self._store.learning.apply_outcome_to_memory(
+                [memory_item_id],
+                success_delta=max(score, 0.0),
+                failure_delta=abs(min(score, 0.0)),
+            )
+        if procedure_id is not None:
+            await self._store.procedures.apply_outcome_to_procedures(
+                [procedure_id],
+                success_delta=max(score, 0.0),
+                failure_delta=abs(min(score, 0.0)),
+            )
+        return cur.lastrowid or 0
+
+
 class SQLiteLessonRepository:
     def __init__(self, store: "SQLiteStore") -> None:
         self._store = store
@@ -390,17 +877,69 @@ class SQLiteLessonRepository:
     async def save_lesson(self, summary: str, kind: str = "lesson", context: str = "") -> int:
         self._store._check()
         assert self._store._db
+        normalized = _normalize_text(summary)
+        if not normalized:  # pragma: no cover - trivial empty-input guard
+            return 0
         cur = await self._store._db.execute(
             "INSERT INTO lessons (kind, summary, context, ts) VALUES (?,?,?,?)",
-            (kind, summary, context, time.time()),
+            (kind, normalized, context, time.time()),
         )
         await self._store._db.commit()
-        return cur.lastrowid or 0
+        lesson_id = cur.lastrowid or 0
+        await self._store.learning.save_memory_item(
+            kind="warning" if kind == "mistake" else kind,
+            content=normalized,
+            scope="task",
+            source="lesson",
+            confidence=0.78 if kind in {"mistake", "pattern"} else 0.65,
+            salience=0.75 if kind == "mistake" else 0.65,
+            metadata={"context": context, "legacy_lesson_id": lesson_id},
+        )
+        if kind in {"pattern", "procedure"}:
+            await self._store.procedures.save_procedure(
+                trigger_text=context or normalized,
+                checklist=normalized,
+                kind="pattern",
+                confidence=0.72,
+                salience=0.68,
+                metadata={"legacy_lesson_id": lesson_id},
+            )
+        return lesson_id
 
     async def search_lessons(self, query: str, limit: int = 5) -> str:
         self._store._check()
         assert self._store._db
-        safe_query = query.replace('"', '""')
+        learning_matches = await self._store.learning.search_memory_items(
+            query,
+            limit=limit,
+            kinds=("pattern", "insight", "lesson", "warning", "mistake"),
+        )
+        if learning_matches:
+            import datetime
+
+            legacy_ids = [
+                int(item["metadata"].get("legacy_lesson_id", 0))
+                for item in learning_matches
+                if int(item["metadata"].get("legacy_lesson_id", 0))
+            ]
+            if legacy_ids:
+                placeholders = ",".join("?" * len(legacy_ids))
+                await self._store._db.execute(
+                    f"UPDATE lessons SET applied=applied+1 WHERE id IN ({placeholders})",
+                    legacy_ids,
+                )
+                await self._store._db.commit()
+            lines = ["## Relevant past lessons:"]
+            for row in learning_matches:
+                kind = str(row["kind"]).replace("warning", "mistake")
+                lines.append(
+                    f"- [{kind.upper()} {datetime.datetime.fromtimestamp(row['ts']).strftime('%Y-%m-%d')}] {row['content']}"
+                )
+                if len("\n".join(lines)) > 1200:
+                    break
+            return "\n".join(lines)
+
+        safe_query = _fts_query(query)
         try:
             async with self._store._db.execute(
                 """SELECT l.id, l.kind, l.summary, l.ts
@@ -409,7 +948,7 @@ class SQLiteLessonRepository:
                    WHERE lessons_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                (f'"{safe_query}"', limit),
+                (safe_query, limit),
             ) as cur:
                 rows = await cur.fetchall()
         except Exception:
@@ -445,7 +984,11 @@ class SQLiteLessonRepository:
         self._store._check()
         assert self._store._db
         async with self._store._db.execute(
-            "SELECT kind, summary, ts FROM lessons ORDER BY ts DESC LIMIT ?",
+            """SELECT kind, summary, ts FROM lessons
+               UNION ALL
+               SELECT kind, content as summary, ts FROM memory_items
+               WHERE kind IN ('pattern', 'insight', 'warning', 'lesson')
+               ORDER BY ts DESC LIMIT ?""",
             (limit,),
         ) as cur:
             rows = await cur.fetchall()
@@ -468,7 +1011,16 @@ class SQLiteMaintenance:
         self._store._check()
         assert self._store._db
         stats: dict[str, Any] = {}
-        for table in ("conversations", "tasks", "memory_facts", "lessons"):
+        for table in (
+            "conversations",
+            "tasks",
+            "memory_facts",
+            "lessons",
+            "episodic_events",
+            "memory_items",
+            "procedures",
+            "feedback_events",
+        ):
             async with self._store._db.execute(f"SELECT COUNT(*) as n FROM {table}") as cur:
                 row = await cur.fetchone()
                 stats[table] = row["n"] if row else 0
@@ -525,11 +1077,75 @@ class SQLiteMaintenance:
                )""",
             (settings.retention_lessons_max,),
         )
+        await self._store._db.execute(
+            "DELETE FROM episodic_events WHERE ts < ?",
+            (now - settings.retention_episodic_events_days * 86400,),
+        )
+        await self._store._db.execute(
+            "DELETE FROM feedback_events WHERE ts < ?",
+            (now - settings.retention_feedback_events_days * 86400,),
+        )
+        await self._store._db.execute(
+            """DELETE FROM memory_items
+               WHERE pinned=0 AND id NOT IN (
+                   SELECT id FROM memory_items
+                   ORDER BY (salience + success_credit - failure_credit) DESC, updated_ts DESC
+                   LIMIT ?
+               )""",
+            (settings.retention_memory_items_max,),
+        )
+        await self._store._db.execute(
+            """DELETE FROM procedures
+               WHERE pinned=0 AND id NOT IN (
+                   SELECT id FROM procedures
+                   ORDER BY (salience + success_credit - failure_credit) DESC, updated_ts DESC
+                   LIMIT ?
+               )""",
+            (settings.retention_procedures_max,),
+        )
+        await self._store._db.execute(
+            """
+            DELETE FROM memory_items
+            WHERE pinned=0
+              AND id NOT IN (
+                  SELECT MIN(id)
+                  FROM memory_items
+                  GROUP BY kind, content
+              )
+            """
+        )
+        await self._store._db.execute(
+            """
+            DELETE FROM procedures
+            WHERE pinned=0
+              AND id NOT IN (
+                  SELECT MIN(id)
+                  FROM procedures
+                  GROUP BY trigger_text, checklist
+              )
+            """
+        )
+        await self._store._db.execute(
+            """
+            UPDATE memory_items
+            SET salience=MAX(0.05, MIN(1.0, salience * 0.995))
+            WHERE pinned=0
+            """
+        )
+        await self._store._db.execute(
+            """
+            UPDATE procedures
+            SET salience=MAX(0.05, MIN(1.0, salience * 0.995))
+            WHERE pinned=0
+            """
+        )
         await self._store._db.commit()
 
         try:
             await self._store._db.execute("INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')")
             await self._store._db.execute("INSERT INTO lessons_fts(lessons_fts) VALUES ('rebuild')")
+            await self._store._db.execute("INSERT INTO memory_items_fts(memory_items_fts) VALUES ('rebuild')")
+            await self._store._db.execute("INSERT INTO procedures_fts(procedures_fts) VALUES ('rebuild')")
             await self._store._db.commit()
         except Exception as exc:
             try:
