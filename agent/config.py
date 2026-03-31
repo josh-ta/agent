@@ -90,6 +90,13 @@ class Settings(BaseSettings):
         default=Path("/app/agent/identity"), alias="IDENTITY_PATH"
     )
 
+    # When true, read_file/write_file/search_files/list_dir/delete_file/str_replace reject
+    # paths outside WORKSPACE_PATH (no /tmp, /data, etc. via those tools).
+    filesystem_strict_workspace: bool = Field(
+        default=False,
+        alias="FILESYSTEM_STRICT_WORKSPACE",
+    )
+
     # ── Self-update ───────────────────────────────────────────────────────────
     docker_restart_self: bool = Field(default=True, alias="DOCKER_RESTART_SELF")
     agent_container_name: str = Field(
@@ -109,8 +116,27 @@ class Settings(BaseSettings):
         alias="RESTORE_PENDING_DISCORD_TASKS",
     )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    # ── Permissions (CC-style) ────────────────────────────────────────────────
+    permission_mode: str = Field(default="default", alias="PERMISSION_MODE")
+
+    # ── Context / transcripts ─────────────────────────────────────────────────
+    context_token_warn_threshold: int = Field(default=80_000, alias="CONTEXT_TOKEN_WARN_THRESHOLD")
+    restore_transcript_turns: int = Field(default=8, alias="RESTORE_TRANSCRIPT_TURNS")
     attachment_max_bytes: int = Field(default=10_000_000, alias="ATTACHMENT_MAX_BYTES")
     attachment_text_char_cap: int = Field(default=12_000, alias="ATTACHMENT_TEXT_CHAR_CAP")
+
+    # ── Subagents / background scheduling ───────────────────────────────────
+    subagent_max_tool_calls: int = Field(default=24, alias="SUBAGENT_MAX_TOOL_CALLS")
+    subagent_output_char_cap: int = Field(default=12_000, alias="SUBAGENT_OUTPUT_CHAR_CAP")
+    subagent_instruction_char_cap: int = Field(
+        default=8_000, alias="SUBAGENT_INSTRUCTION_CHAR_CAP"
+    )
+    scheduled_tasks_max_rows: int = Field(default=32, alias="SCHEDULED_TASKS_MAX_ROWS")
+    scheduled_prompt_char_cap: int = Field(default=8_000, alias="SCHEDULED_PROMPT_CHAR_CAP")
+    scheduled_dispatch_per_heartbeat: int = Field(
+        default=5, alias="SCHEDULED_DISPATCH_PER_HEARTBEAT"
+    )
 
     # ── Retention / cleanup ───────────────────────────────────────────────────
     # SQLite

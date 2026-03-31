@@ -99,6 +99,10 @@ class SQLiteTaskRepository:
             migrations.append(("ALTER TABLE tasks ADD COLUMN finished_ts REAL", None))
         if "updated_ts" not in columns:
             migrations.append(("ALTER TABLE tasks ADD COLUMN updated_ts REAL", None))
+        if "input_tokens_est" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN input_tokens_est INTEGER", None))
+        if "output_tokens_est" not in columns:
+            migrations.append(("ALTER TABLE tasks ADD COLUMN output_tokens_est INTEGER", None))
 
         for sql, params in migrations:
             assert params is None
@@ -174,6 +178,8 @@ class SQLiteTaskRepository:
         task_id = str(task.metadata.get("task_id", "")).strip() if task.metadata else ""
         now = time.time()
         if task_id:
+            in_tok = getattr(result, "input_tokens_est", None)
+            out_tok = getattr(result, "output_tokens_est", None)
             await self._store._db.execute(
                 """UPDATE tasks
                    SET source=?,
@@ -188,7 +194,9 @@ class SQLiteTaskRepository:
                        tool_calls=?,
                        started_ts=COALESCE(started_ts, ?),
                        finished_ts=?,
-                       updated_ts=?
+                       updated_ts=?,
+                       input_tokens_est=?,
+                       output_tokens_est=?
                    WHERE task_id=?""",
                 (
                     task.source,
@@ -204,6 +212,8 @@ class SQLiteTaskRepository:
                     now,
                     now if result.status in {"succeeded", "failed"} else None,
                     now,
+                    in_tok if in_tok is not None else None,
+                    out_tok if out_tok is not None else None,
                     task_id,
                 ),
             )
@@ -1020,6 +1030,7 @@ class SQLiteMaintenance:
             "memory_items",
             "procedures",
             "feedback_events",
+            "scheduled_tasks",
         ):
             async with self._store._db.execute(f"SELECT COUNT(*) as n FROM {table}") as cur:
                 row = await cur.fetchone()

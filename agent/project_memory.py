@@ -7,6 +7,9 @@ from typing import Iterable
 from agent.config import settings
 
 PROJECT_MEMORY_FILENAME = ".agent-project-memory.md"
+# CC memdir-style caps for markdown entrypoints loaded into context
+MAX_ENTRYPOINT_LINES = 200
+MAX_ENTRYPOINT_BYTES = 25_000
 _HEADER = (
     "# Project Memory\n\n"
     "_This file is loaded on every turn. Keep durable repo-specific preferences, "
@@ -30,6 +33,43 @@ def project_memory_path() -> Path:
     return settings.workspace_path / PROJECT_MEMORY_FILENAME
 
 
+def truncate_markdown_entrypoint(
+    raw: str,
+    *,
+    max_lines: int = MAX_ENTRYPOINT_LINES,
+    max_bytes: int = MAX_ENTRYPOINT_BYTES,
+) -> str:
+    """Line- then byte-cap long markdown (aligned with CC MEMORY.md policy)."""
+    trimmed = raw.strip()
+    if not trimmed:
+        return ""
+    lines = trimmed.split("\n")
+    line_count = len(lines)
+    byte_count = len(trimmed.encode("utf-8"))
+    was_line = line_count > max_lines
+    was_byte = byte_count > max_bytes
+    if not was_line and not was_byte:
+        return trimmed
+
+    truncated = "\n".join(lines[:max_lines]) if was_line else trimmed
+    tb = truncated.encode("utf-8")
+    if len(tb) > max_bytes:
+        cut = truncated.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+        last_nl = cut.rfind("\n")
+        truncated = cut[:last_nl] if last_nl > 0 else cut
+    if was_line and not was_byte:
+        reason = f"{line_count} lines (limit {max_lines})"
+    elif was_byte and not was_line:
+        reason = f"{byte_count} bytes (limit {max_bytes})"
+    else:
+        reason = f"{line_count} lines and {byte_count} bytes"
+    return (
+        truncated
+        + f"\n\n> WARNING: content exceeded limits ({reason}). "
+        "Keep index entries short; move detail into topic files.\n"
+    )
+
+
 def load_project_memory(*, char_cap: int = 2500) -> str:
     path = project_memory_path()
     try:
@@ -42,6 +82,7 @@ def load_project_memory(*, char_cap: int = 2500) -> str:
     if not text:
         return ""
 
+    text = truncate_markdown_entrypoint(text)
     if len(text) > char_cap:
         text = "[...truncated...]\n\n" + text[-char_cap:]
     return "## Project memory\n" + text

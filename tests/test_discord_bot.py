@@ -57,6 +57,11 @@ class _FakeLoop:
         self.enqueued = None
         self.wait_registry = TaskWaitRegistry()
         self.memory = None
+        self._run_gen = 0
+
+    def allocate_run_generation(self) -> int:
+        self._run_gen += 1
+        return self._run_gen
 
     async def enqueue(self, task) -> None:
         self.enqueued = task
@@ -473,7 +478,11 @@ async def test_discord_bot_wrapper_methods_delegate_to_services(monkeypatch: pyt
     monkeypatch.setattr(bot._messages, "send_reply", fake_send_reply)
     monkeypatch.setattr(bot._presenter, "send_chunked", fake_send_chunked)
     monkeypatch.setattr(bot._messages, "post_bus_status", fake_post_bus_status)
-    monkeypatch.setattr(bot._presenter, "make_sink", lambda channel: ("sink", channel.id))
+    monkeypatch.setattr(
+        bot._presenter,
+        "make_sink",
+        lambda channel, expected_run_generation=None: ("sink", channel.id),
+    )
 
     channel = _FakeChannel(55)
     message = _FakeMessage(channel)

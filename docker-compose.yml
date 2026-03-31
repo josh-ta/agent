@@ -1,3 +1,5 @@
+# Production hardening: prefer a non-root user in the image, drop docker.sock unless
+# self-restart is required, and consider seccomp/apparmor profiles for the browser sidecar.
 services:
   # ─── Main Agent ────────────────────────────────────────────────────────────
   agent:

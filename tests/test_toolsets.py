@@ -19,16 +19,54 @@ class _Agent:
 
 
 class _SQLite:
+    def __init__(self) -> None:
+        self._sched: list[dict] = []
+
     async def get_stats(self):
         return {
             "conversations": 1,
             "tasks": 2,
             "memory_facts": 3,
             "lessons": 4,
+            "scheduled_tasks": len(self._sched),
             "db_size_mb": 1.2,
             "vec_enabled": False,
             "last_cleanup": "never",
         }
+
+    async def scheduled_task_count(self) -> int:
+        return sum(1 for t in self._sched if t.get("enabled", True))
+
+    async def scheduled_task_create(
+        self,
+        *,
+        prompt: str,
+        delay_seconds: float,
+        interval_seconds: float | None,
+        metadata: dict | None = None,
+    ) -> str:
+        tid = f"st-{len(self._sched)}"
+        self._sched.append(
+            {
+                "id": tid,
+                "prompt": prompt,
+                "enabled": True,
+                "next_run_ts": 0.0,
+                "interval_seconds": interval_seconds,
+                "metadata": metadata or {},
+            }
+        )
+        return tid
+
+    async def scheduled_task_list(self, *, include_disabled: bool = False) -> list[dict]:
+        return [t for t in self._sched if include_disabled or t.get("enabled", True)]
+
+    async def scheduled_task_cancel(self, task_id: str) -> bool:
+        for t in self._sched:
+            if t["id"] == task_id and t.get("enabled", True):
+                t["enabled"] = False
+                return True
+        return False
 
     async def search_memory(self, query: str, limit: int = 5) -> str:
         return f"memory:{query}:{limit}"
@@ -105,12 +143,16 @@ async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.Monk
     postgres = _Postgres()
 
     monkeypatch.setattr(toolsets.shell, "shell_run", lambda *args, **kwargs: _async_result("shell"))
-    monkeypatch.setattr(toolsets.filesystem, "read_file", lambda path: f"read:{path}")
+    monkeypatch.setattr(
+        toolsets.filesystem,
+        "read_file",
+        lambda path, encoding="utf-8", **kwargs: f"read:{path}",
+    )
     monkeypatch.setattr(toolsets.filesystem, "write_file", lambda path, content: f"write:{path}:{content}")
     monkeypatch.setattr(toolsets.filesystem, "list_dir", lambda path=".": f"list:{path}")
     monkeypatch.setattr(toolsets.filesystem, "delete_file", lambda path: f"delete:{path}")
     monkeypatch.setattr(toolsets.filesystem, "str_replace_file", lambda *args: "replace")
-    monkeypatch.setattr(toolsets.filesystem, "search_files", lambda *args: "search")
+    monkeypatch.setattr(toolsets.filesystem, "search_files", lambda *args, **kwargs: "search")
     monkeypatch.setattr(toolsets.self_edit, "list_skills", lambda: "skills")
     monkeypatch.setattr(toolsets.self_edit, "read_skill", lambda name: f"skill:{name}")
     monkeypatch.setattr(toolsets.self_edit, "edit_skill", lambda name, content: f"edit-skill:{name}")
@@ -139,7 +181,9 @@ async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.Monk
     monkeypatch.setattr(toolsets.github, "ci_logs_failed", lambda run_id, repo=None: _async_result("ci-logs"))
     monkeypatch.setattr(toolsets.github, "ci_rerun", lambda run_id, failed_only=True, repo=None: _async_result("ci-rerun"))
 
-    toolsets.attach_all_tools(agent, sqlite=sqlite, postgres=postgres)  # type: ignore[arg-type]
+    toolsets.attach_all_tools(
+        agent, sqlite=sqlite, postgres=postgres, subagent_runner=None
+    )  # type: ignore[arg-type]
 
     assert await agent.funcs["run_shell"]("ls") == "shell"
     assert agent.funcs["read_file"]("foo.txt") == "read:foo.txt"
@@ -178,7 +222,9 @@ async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.Monk
     assert await agent.funcs["gh_ci_view"]("1") == "ci-view"
     assert await agent.funcs["gh_ci_logs_failed"]("1") == "ci-logs"
     assert await agent.funcs["gh_ci_rerun"]("1") == "ci-rerun"
-    assert "SQLite (local)" in await agent.funcs["db_stats"]()
+    stats_out = await agent.funcs["db_stats"]()
+    assert "SQLite (local)" in stats_out
+    assert "scheduled_tasks:" in stats_out
     assert await agent.funcs["memory_search"]("parser") == "memory:parser:5"
     assert await agent.funcs["memory_save"]("fact") == "Saved to memory: fact"
     assert await agent.funcs["procedure_save"]("deploy", "check health") == "Saved procedure #9: deploy"
@@ -197,6 +243,11 @@ async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.Monk
     assert await agent.funcs["read_broadcasts"]() == "broadcasts:20"
     assert await agent.funcs["share_memory"]("fact") == "fact"
     assert await agent.funcs["search_shared_memory"]("fact") == "shared:fact:5"
+    assert "(no active scheduled tasks)" in await agent.funcs["list_scheduled_tasks"]()
+    assert "Scheduled one-shot task" in await agent.funcs["schedule_background_task"]("ping", 10)
+    listed = await agent.funcs["list_scheduled_tasks"]()
+    assert "st-0" in listed and "ping" in listed
+    assert (await agent.funcs["cancel_scheduled_task"]("st-0")).startswith("Cancelled")
 
 
 async def _async_result(value):

@@ -12,11 +12,12 @@ from uuid import uuid4
 from fastapi import FastAPI, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.config import settings
 from agent.events import AgentEvent, TaskQueuedEvent, bridge
+from agent.metrics import prometheus_text
 from agent.loop import Task
 from agent.session_router import SessionRouter
 
@@ -280,6 +281,10 @@ def create_app(
     async def healthz() -> HealthResponse:
         return HealthResponse(status="ok")
 
+    @app.get("/metrics", tags=["system"])
+    async def metrics() -> PlainTextResponse:
+        return PlainTextResponse(prometheus_text(), media_type="text/plain; version=0.0.4")
+
     @app.get(
         "/readyz",
         response_model=HealthResponse,
@@ -293,6 +298,39 @@ def create_app(
                 error_code="service_unavailable",
                 message="The control plane runtime is not ready.",
             )
+        runtime = getattr(request.app.state, "runtime", None)
+        mcp_url = settings.browser_mcp_url.strip()
+        if mcp_url and runtime is not None:
+            health_url = mcp_url.replace("/sse", "/health") if "/sse" in mcp_url else mcp_url.rstrip("/") + "/health"
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=2.0) as http_client:
+                    resp = await http_client.get(health_url)
+                if resp.status_code >= 400:
+                    raise ApiError(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        error_code="service_unavailable",
+                        message=f"Browser MCP unhealthy (HTTP {resp.status_code}).",
+                    )
+            except ApiError:
+                raise
+            except Exception as exc:
+                raise ApiError(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    error_code="service_unavailable",
+                    message=f"Browser MCP health check failed: {exc}",
+                ) from exc
+        if settings.has_discord and runtime is not None:
+            bot = getattr(runtime, "bot", None)
+            if bot is not None:
+                client = getattr(bot, "_client", None)
+                if client is not None and hasattr(client, "is_ready") and not client.is_ready():
+                    raise ApiError(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        error_code="service_unavailable",
+                        message="Discord client is not ready.",
+                    )
         return HealthResponse(status="ready")
 
     @app.post(
@@ -321,6 +359,7 @@ def create_app(
             reference_message_id=None,
             metadata=metadata,
         )
+        metadata["run_generation"] = runtime.loop.allocate_run_generation()
 
         await runtime.sqlite.create_task_record(
             task_id=task_id,
@@ -418,6 +457,8 @@ def create_app(
             author=payload.author,
             source="api",
         )
+        if resumed.metadata is not None:
+            resumed.metadata["run_generation"] = runtime.loop.allocate_run_generation()
         await runtime.sqlite.mark_task_queued(task_id, metadata=resumed.metadata)
         if hasattr(runtime.sqlite, "append_session_turn"):
             await runtime.sqlite.append_session_turn(

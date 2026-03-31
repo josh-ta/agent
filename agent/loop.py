@@ -39,6 +39,8 @@ from agent.loop_services import (
 )
 from agent.tools.discord_tools import DiscordAttachment
 from agent.project_memory import extract_project_memory_facts, save_project_memory_facts
+from agent.metrics import Metrics
+from agent.run_guard import RunGuard
 from agent.secret_store import SecretStore
 from agent.task_waits import SuspendedTask, TaskWaitRegistry, task_wait_context
 
@@ -134,6 +136,8 @@ class TaskResult:
     retrieved_memory_ids: list[int] = field(default_factory=list)
     retrieved_procedure_ids: list[int] = field(default_factory=list)
     reward_score: float | None = None
+    input_tokens_est: int | None = None
+    output_tokens_est: int | None = None
 
 
 class AgentLoop:
@@ -181,6 +185,13 @@ class AgentLoop:
             enqueue=self.enqueue,
             wait_registry=self.wait_registry,
         )
+        self._run_guard = RunGuard()
+        self._run_seq = 0
+
+    def allocate_run_generation(self) -> int:
+        """Monotonic id for a task run; assign to task.metadata before sinks register."""
+        self._run_seq += 1
+        return self._run_seq
 
     @property
     def agent(self) -> Agent:  # type: ignore[type-arg]
@@ -298,37 +309,61 @@ class AgentLoop:
             fallback = f"{task.source}:{task.channel_id}:{task.message_id or task_id}"
             task.metadata["session_id"] = fallback
 
-        with bridge.task_context(task_id or None), task_wait_context(
-            task_id=task_id,
-            source=task.source,
-            channel_id=task.channel_id,
-        ):
-            if self.memory and task_id and hasattr(self.memory, "mark_task_running"):
-                await self.memory.mark_task_running(task_id)
+        raw_rg = task.metadata.get("run_generation")
+        if raw_rg is None:
+            run_gen = self.allocate_run_generation()
+            task.metadata["run_generation"] = run_gen
+        else:
+            run_gen = int(raw_rg)
 
-            result = await self._process(task)
+        begun = self._run_guard.begin_run(run_gen)
+        if not begun:
+            log.warning("run_guard_reentrant_recovering", generation=run_gen)
+            self._run_guard.force_idle()
+            begun = self._run_guard.begin_run(run_gen)
+            if not begun:
+                log.error("run_guard_begin_failed", generation=run_gen)
 
-            if (
-                self._postgres is not None
-                and task.source == "a2a"
-                and result.status in {"succeeded", "failed"}
+        structlog.contextvars.bind_contextvars(task_id=task_id, run_generation=run_gen)
+        try:
+            with bridge.task_context(task_id or None), bridge.run_generation_context(
+                run_gen
+            ), task_wait_context(
+                task_id=task_id,
+                source=task.source,
+                channel_id=task.channel_id,
             ):
-                try:
-                    await self._postgres.complete_task(task_id, result.output[:4000])
-                except Exception:
-                    log.warning("a2a_complete_failed", task_id=task_id)
+                if self.memory and task_id and hasattr(self.memory, "mark_task_running"):
+                    await self.memory.mark_task_running(task_id)
 
-            if self.memory:
-                await self.memory.record_task(task, result)
+                result = await self._process(task)
 
-            # Post-task reflection (non-blocking, best-effort)
-            if result.status in {"succeeded", "failed"}:
-                asyncio.create_task(self._reflect(task, result))
+                if (
+                    self._postgres is not None
+                    and task.source == "a2a"
+                    and result.status in {"succeeded", "failed"}
+                ):
+                    try:
+                        await self._postgres.complete_task(task_id, result.output[:4000])
+                    except Exception:
+                        log.warning("a2a_complete_failed", task_id=task_id)
 
-            if task.response_future and not task.response_future.done():
-                task.response_future.set_result(result)
+                if self.memory:
+                    await self.memory.record_task(task, result)
 
-            return result
+                # Post-task reflection (non-blocking, best-effort)
+                if result.status in {"succeeded", "failed"}:
+                    asyncio.create_task(self._reflect(task, result))
+
+                if task.response_future and not task.response_future.done():
+                    task.response_future.set_result(result)
+
+                return result
+        finally:
+            if begun:
+                if not self._run_guard.end_run(run_gen):
+                    log.debug("run_guard_stale_end", generation=run_gen)
+            structlog.contextvars.unbind_contextvars("task_id", "run_generation")
 
     async def run_forever(self) -> None:
         """Process tasks from the queue indefinitely."""
@@ -367,7 +402,7 @@ class AgentLoop:
     async def run_once(self, content: str, source: str = "api") -> TaskResult:
         """Run a single task synchronously (useful for testing/CLI)."""
         task = Task(content=content, source=source)
-        return await self._process(task)
+        return await self._execute_task(task)
 
     def build_resumed_task(
         self,
@@ -583,6 +618,17 @@ class AgentLoop:
             except Exception:
                 pass
 
+        if self.memory and hasattr(self.memory, "append_transcript_entry"):
+            try:
+                await self.memory.append_transcript_entry(
+                    task_id=task_id,
+                    role="user",
+                    content=task.content[:50_000],
+                    kind="message",
+                )
+            except Exception:
+                pass
+
         try:
             run_result = await self._run_executor.run(
                 task=task,
@@ -593,6 +639,8 @@ class AgentLoop:
             result_output = run_result.output
             tool_calls = run_result.tool_calls
             attachments = run_result.attachments
+            in_tok = max(0, getattr(run_result, "input_chars", 0) or 0) // 4
+            out_tok = max(0, getattr(run_result, "output_chars", 0) or 0) // 4
 
             if run_result.waiting_for_user:
                 if task.source == "a2a":
@@ -601,6 +649,7 @@ class AgentLoop:
                         f"Question: {run_result.question or 'Additional context required.'}"
                     )
                     await bridge.emit(TaskErrorEvent(error=blocker[:400]))
+                    Metrics.inc_task_completed(success=False)
                     return TaskResult(
                         task=task,
                         output=blocker,
@@ -613,6 +662,8 @@ class AgentLoop:
                         attachments=attachments,
                         retrieved_memory_ids=retrieved_memory_ids,
                         retrieved_procedure_ids=retrieved_procedure_ids,
+                        input_tokens_est=in_tok,
+                        output_tokens_est=out_tok,
                     )
                 task_id = self.wait_registry.ensure_task_id(task.metadata)
                 task.metadata["wait_state"] = {
@@ -684,6 +735,16 @@ class AgentLoop:
                         deliver_inline_reply=task.response_future is not None,
                     )
                 )
+                if self.memory and hasattr(self.memory, "append_transcript_entry") and run_result.question:
+                    try:
+                        await self.memory.append_transcript_entry(
+                            task_id=task_id,
+                            role="assistant",
+                            content=(run_result.question or "")[:50_000],
+                            kind="question",
+                        )
+                    except Exception:
+                        pass
                 return TaskResult(
                     task=task,
                     output="",
@@ -697,6 +758,8 @@ class AgentLoop:
                     attachments=attachments,
                     retrieved_memory_ids=retrieved_memory_ids,
                     retrieved_procedure_ids=retrieved_procedure_ids,
+                    input_tokens_est=in_tok,
+                    output_tokens_est=out_tok,
                 )
 
             answered_user = run_result.user_visible_reply_sent
@@ -790,6 +853,19 @@ class AgentLoop:
                 except Exception:
                     pass
 
+            if self.memory and hasattr(self.memory, "append_transcript_entry") and final_output:
+                try:
+                    await self.memory.append_transcript_entry(
+                        task_id=task_id,
+                        role="assistant",
+                        content=final_output[:50_000],
+                        kind="assistant",
+                    )
+                except Exception:
+                    pass
+
+            Metrics.inc_task_completed(success=bool(task_succeeded))
+
             return TaskResult(
                 task=task,
                 output=final_output,
@@ -802,6 +878,8 @@ class AgentLoop:
                 tool_calls=tool_calls,
                 retrieved_memory_ids=retrieved_memory_ids,
                 retrieved_procedure_ids=retrieved_procedure_ids,
+                input_tokens_est=in_tok,
+                output_tokens_est=out_tok,
             )
 
         except Exception as exc:
@@ -853,6 +931,8 @@ class AgentLoop:
                     )
                 except Exception:
                     pass
+
+            Metrics.inc_task_completed(success=False)
 
             return TaskResult(
                 task=task,

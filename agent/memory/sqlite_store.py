@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -294,6 +295,46 @@ CREATE INDEX IF NOT EXISTS feedback_events_task_ts_idx
 CREATE INDEX IF NOT EXISTS feedback_events_kind_ts_idx
     ON feedback_events (feedback_kind, ts DESC);
 
+-- Tool permissions (CC-style rules)
+CREATE TABLE IF NOT EXISTS permission_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name       TEXT NOT NULL,
+    rule_behavior   TEXT NOT NULL,
+    rule_content    TEXT DEFAULT '',
+    source          TEXT DEFAULT 'projectSettings',
+    created_ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS permission_rules_tool_idx ON permission_rules (tool_name);
+
+-- Versioned per-task transcript (for resume / audit)
+CREATE TABLE IF NOT EXISTS transcript_entries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    schema_version  INTEGER NOT NULL DEFAULT 1,
+    role            TEXT NOT NULL,
+    kind            TEXT NOT NULL DEFAULT 'message',
+    content         TEXT NOT NULL,
+    metadata        TEXT DEFAULT '{}',
+    ts              REAL NOT NULL,
+    UNIQUE(task_id, seq)
+);
+CREATE INDEX IF NOT EXISTS transcript_task_seq_idx ON transcript_entries (task_id, seq);
+
+-- Background / scheduled prompts (heartbeat enqueues into agent task queue)
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id              TEXT PRIMARY KEY,
+    prompt          TEXT NOT NULL,
+    next_run_ts     REAL NOT NULL,
+    interval_seconds REAL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    created_ts      REAL NOT NULL,
+    last_run_ts     REAL
+);
+CREATE INDEX IF NOT EXISTS scheduled_tasks_due_idx
+    ON scheduled_tasks (enabled, next_run_ts);
+
 -- Internal metadata (cleanup timestamps, etc.)
 CREATE TABLE IF NOT EXISTS _meta (
     key   TEXT PRIMARY KEY,
@@ -349,6 +390,9 @@ class SQLiteStore:
         # Run schema (idempotent CREATE IF NOT EXISTS)
         await self._db.executescript(SCHEMA)
         await self.tasks.migrate()
+        from agent.migrations.runner import run_sqlite_migrations
+
+        await run_sqlite_migrations(self._db)
         await self._db.commit()
 
         # Attempt to load sqlite-vec for vector similarity search
@@ -672,6 +716,78 @@ class SQLiteStore:
         await self._db.execute("DELETE FROM task_checkpoints WHERE task_id=?", (task_id,))
         await self._db.commit()
 
+    # ── Permissions (rules only; mode comes from PERMISSION_MODE env) ─────────
+
+    async def permission_list_rules(self) -> list[dict[str, Any]]:
+        self._check()
+        assert self._db
+        async with self._db.execute(
+            """SELECT tool_name, rule_behavior, rule_content, source
+               FROM permission_rules ORDER BY id ASC"""
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    # ── Transcripts ───────────────────────────────────────────────────────────
+
+    async def append_transcript_entry(
+        self,
+        *,
+        task_id: str,
+        role: str,
+        content: str,
+        kind: str = "message",
+        metadata: dict[str, Any] | None = None,
+        schema_version: int = 1,
+    ) -> None:
+        self._check()
+        assert self._db
+        tid = task_id.strip()
+        if not tid:
+            return
+        async with self._db.execute(
+            "SELECT COALESCE(MAX(seq), -1) + 1 AS n FROM transcript_entries WHERE task_id=?",
+            (tid,),
+        ) as cur:
+            row = await cur.fetchone()
+        seq = int(row[0]) if row else 0
+        now = time.time()
+        await self._db.execute(
+            """INSERT INTO transcript_entries
+               (task_id, seq, schema_version, role, kind, content, metadata, ts)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                tid,
+                seq,
+                schema_version,
+                role,
+                kind,
+                content,
+                json.dumps(metadata or {}),
+                now,
+            ),
+        )
+        await self._db.commit()
+
+    async def list_transcript_entries(self, task_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        self._check()
+        assert self._db
+        async with self._db.execute(
+            """SELECT task_id, seq, schema_version, role, kind, content, metadata, ts
+               FROM transcript_entries WHERE task_id=? ORDER BY seq ASC LIMIT ?""",
+            (task_id.strip(), max(1, min(limit, 500))),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except Exception:
+                item["metadata"] = {}
+            out.append(item)
+        return out
+
     # ── Tasks ─────────────────────────────────────────────────────────────────
 
     async def record_task(self, task: Task, result: TaskResult) -> None:
@@ -872,6 +988,110 @@ class SQLiteStore:
             procedure_id=procedure_id,
             details=details,
         )
+
+    # ── Scheduled tasks (background enqueue) ──────────────────────────────────
+
+    async def scheduled_task_count(self) -> int:
+        self._check()
+        assert self._db
+        async with self._db.execute("SELECT COUNT(*) AS n FROM scheduled_tasks WHERE enabled=1") as cur:
+            row = await cur.fetchone()
+        return int(row["n"] if row else 0)
+
+    async def scheduled_task_create(
+        self,
+        *,
+        prompt: str,
+        delay_seconds: float,
+        interval_seconds: float | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        self._check()
+        assert self._db
+        now = time.time()
+        task_id = str(uuid.uuid4())
+        next_ts = now + max(0.0, float(delay_seconds))
+        meta = json.dumps(metadata or {})
+        await self._db.execute(
+            """INSERT INTO scheduled_tasks
+               (id, prompt, next_run_ts, interval_seconds, enabled, metadata, created_ts, last_run_ts)
+               VALUES (?,?,?,?,1,?,?,NULL)""",
+            (task_id, prompt, next_ts, interval_seconds, meta, now),
+        )
+        await self._db.commit()
+        return task_id
+
+    async def scheduled_task_list(self, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+        self._check()
+        assert self._db
+        q = "SELECT * FROM scheduled_tasks"
+        if not include_disabled:
+            q += " WHERE enabled=1"
+        q += " ORDER BY next_run_ts ASC LIMIT 200"
+        async with self._db.execute(q) as cur:
+            rows = await cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            d = dict(row)
+            try:
+                d["metadata"] = json.loads(d.get("metadata") or "{}")
+            except json.JSONDecodeError:
+                d["metadata"] = {}
+            out.append(d)
+        return out
+
+    async def scheduled_task_cancel(self, task_id: str) -> bool:
+        self._check()
+        assert self._db
+        async with self._db.execute(
+            "SELECT 1 FROM scheduled_tasks WHERE id=? AND enabled=1",
+            (task_id,),
+        ) as cur:
+            if await cur.fetchone() is None:
+                return False
+        await self._db.execute("UPDATE scheduled_tasks SET enabled=0 WHERE id=?", (task_id,))
+        await self._db.commit()
+        return True
+
+    async def scheduled_tasks_claim_due(self, *, now: float, limit: int) -> list[dict[str, Any]]:
+        """Atomically advance next_run / disable one-shots for due rows; returns rows to enqueue."""
+        self._check()
+        assert self._db
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            async with self._db.execute(
+                """SELECT id, prompt, interval_seconds, metadata FROM scheduled_tasks
+                   WHERE enabled=1 AND next_run_ts <= ?
+                   ORDER BY next_run_ts ASC LIMIT ?""",
+                (now, limit),
+            ) as cur:
+                raw = await cur.fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in raw:
+                sid = str(row["id"])
+                prompt = str(row["prompt"])
+                interval = row["interval_seconds"]
+                try:
+                    meta = json.loads(row["metadata"] or "{}")
+                except json.JSONDecodeError:
+                    meta = {}
+                if interval is not None and float(interval) > 0:
+                    nxt = now + float(interval)
+                    await self._db.execute(
+                        "UPDATE scheduled_tasks SET last_run_ts=?, next_run_ts=? WHERE id=?",
+                        (now, nxt, sid),
+                    )
+                else:
+                    await self._db.execute(
+                        "UPDATE scheduled_tasks SET enabled=0, last_run_ts=? WHERE id=?",
+                        (now, sid),
+                    )
+                claimed.append({"id": sid, "prompt": prompt, "metadata": meta})
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        return claimed
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 

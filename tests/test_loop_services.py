@@ -678,7 +678,7 @@ async def test_run_executor_retries_rate_limit(monkeypatch: pytest.MonkeyPatch) 
 
     assert agent.calls == 2
     assert sleeps == [5.0]
-    assert result == RunResult()
+    assert result == RunResult(input_chars=10, output_chars=0)
 
 
 @pytest.mark.asyncio
@@ -1883,3 +1883,40 @@ def test_heartbeat_service_build_a2a_task_uses_unknown_default() -> None:
     assert task.source == "a2a"
     assert task.author == "unknown"
     assert task.metadata["from_agent"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_service_dispatches_scheduled_when_idle() -> None:
+    enqueued: list[Task] = []
+
+    async def _enqueue(task: Task) -> None:
+        enqueued.append(task)
+
+    class _Memory:
+        async def scheduled_tasks_claim_due(self, *, now: float, limit: int) -> list[dict]:
+            return [{"id": "sched-1", "prompt": "tick", "metadata": {"k": 1}}]
+
+    service = HeartbeatService(memory_store=_Memory(), postgres_store=None, enqueue=_enqueue)
+    await service.heartbeat(is_busy=False)
+    assert len(enqueued) == 1
+    assert enqueued[0].source == "scheduled"
+    assert enqueued[0].content == "tick"
+    assert enqueued[0].author == "scheduler"
+    assert enqueued[0].metadata["scheduled_task_id"] == "sched-1"
+    assert enqueued[0].metadata["k"] == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_service_skips_scheduled_when_busy() -> None:
+    enqueued: list[Task] = []
+
+    async def _enqueue(task: Task) -> None:
+        enqueued.append(task)
+
+    class _Memory:
+        async def scheduled_tasks_claim_due(self, *, now: float, limit: int) -> list[dict]:
+            raise AssertionError("should not claim while busy")
+
+    service = HeartbeatService(memory_store=_Memory(), postgres_store=None, enqueue=_enqueue)
+    await service.heartbeat(is_busy=True)
+    assert enqueued == []

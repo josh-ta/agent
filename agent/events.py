@@ -244,6 +244,10 @@ class EventBridge:
             "agent_task_id",
             default=None,
         )
+        self._run_generation_var: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+            "agent_run_generation",
+            default=None,
+        )
         configured_timeout = settings.event_sink_timeout_seconds if sink_timeout_s is None else sink_timeout_s
         self._sink_timeout_s = max(0.1, float(configured_timeout))
 
@@ -263,12 +267,23 @@ class EventBridge:
         finally:
             self._task_id_var.reset(token)
 
+    @contextlib.contextmanager
+    def run_generation_context(self, generation: int | None) -> Iterator[None]:
+        token = self._run_generation_var.set(generation)
+        try:
+            yield
+        finally:
+            self._run_generation_var.reset(token)
+
     async def emit(self, event: AgentEvent) -> None:
         """Deliver an event to all currently registered sinks concurrently."""
         if hasattr(event, "task_id") and getattr(event, "task_id") is None:
             task_id = self._task_id_var.get()
             if task_id is not None:
                 setattr(event, "task_id", task_id)
+        run_gen = self._run_generation_var.get()
+        if run_gen is not None:
+            setattr(event, "run_generation", run_gen)
         if not self._sinks:
             return
         sinks = list(self._sinks.items())
@@ -296,6 +311,9 @@ class EventBridge:
     def current_task_id(self) -> str | None:
         return self._task_id_var.get()
 
+    def current_run_generation(self) -> int | None:
+        return self._run_generation_var.get()
+
 
 # Module-level singleton — import and use directly:
 #   from agent.events import bridge, TextDeltaEvent
@@ -305,3 +323,7 @@ bridge = EventBridge()
 
 def current_task_id() -> str | None:
     return bridge.current_task_id()
+
+
+def current_run_generation() -> int | None:
+    return bridge.current_run_generation()

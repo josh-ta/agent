@@ -130,6 +130,12 @@ async def _build_runtime(*, start_discord: bool) -> RuntimeServices:
     sqlite = SQLiteStore(settings.sqlite_path)
     await sqlite.init()
 
+    from agent.permissions import PermissionEngine, set_permission_engine
+
+    _perm_engine = PermissionEngine(sqlite)
+    await _perm_engine.load()
+    set_permission_engine(_perm_engine)
+
     postgres: PostgresStore | None = None
     if settings.has_postgres:
         postgres = PostgresStore(settings.postgres_url)

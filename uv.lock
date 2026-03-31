@@ -20,12 +20,13 @@ wheels = [
 
 [[package]]
 name = "agent"
-version = "0.8.2"
+version = "0.8.4"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "asyncpg" },
+    { name = "cryptography" },
     { name = "discord-py" },
     { name = "fastapi" },
     { name = "gitpython" },
@@ -62,6 +63,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.10" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "asyncpg", specifier = ">=0.30" },
+    { name = "cryptography", specifier = ">=45.0" },
     { name = "discord-py", specifier = ">=2.4" },
     { name = "fastapi" },
     { name = "gitpython", specifier = ">=3.1" },
@@ -1188,6 +1190,7 @@ wheels = [
 name = "griffelib"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ad/06/eccbd311c9e2b3ca45dbc063b93134c57a1ccc7607c5e545264ad092c4a9/griffelib-2.0.0.tar.gz", hash = "sha256:e504d637a089f5cab9b5daf18f7645970509bf4f53eda8d79ed71cce8bd97934", size = 166312, upload-time = "2026-03-23T21:06:55.954Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4d/51/c936033e16d12b627ea334aaaaf42229c37620d0f15593456ab69ab48161/griffelib-2.0.0-py3-none-any.whl", hash = "sha256:01284878c966508b6d6f1dbff9b6fa607bc062d8261c5c7253cb285b06422a7f", size = 142004, upload-time = "2026-02-09T19:09:40.561Z" },
 ]

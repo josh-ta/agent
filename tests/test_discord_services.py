@@ -39,6 +39,11 @@ class _BusyLoop:
         self.cancelled: list[tuple[int | None, str]] = []
         self.wait_registry = TaskWaitRegistry()
         self.memory = None
+        self._run_gen = 0
+
+    def allocate_run_generation(self) -> int:
+        self._run_gen += 1
+        return self._run_gen
 
     async def enqueue(self, task) -> None:
         self.enqueued = task
@@ -84,6 +89,11 @@ class _ReadyLoop:
         self.front_enqueued = None
         self.cleared: list[tuple[str | None, int | None, str]] = []
         self.cancelled: list[tuple[int | None, str]] = []
+        self._run_gen = 0
+
+    def allocate_run_generation(self) -> int:
+        self._run_gen += 1
+        return self._run_gen
 
     async def enqueue(self, task) -> None:
         self.enqueued = task
@@ -196,7 +206,11 @@ async def test_message_service_busy_queue_preserves_existing_task_id_and_persist
             "source": "discord",
             "author": "Test User",
             "content": "please help",
-            "metadata": {"task_id": "prebuilt-id", "session_id": "discord:101:1"},
+            "metadata": {
+                "task_id": "prebuilt-id",
+                "session_id": "discord:101:1",
+                "run_generation": 1,
+            },
         }
     ]
     assert loop.front_enqueued.metadata["task_id"] == "prebuilt-id"
@@ -1602,6 +1616,13 @@ async def test_message_service_skips_sending_reply_for_empty_or_already_sent_res
         wait_registry = TaskWaitRegistry()
         memory = None
 
+        def __init__(self) -> None:
+            self._run_gen = 0
+
+        def allocate_run_generation(self) -> int:
+            self._run_gen += 1
+            return self._run_gen
+
         async def enqueue(self, task) -> None:
             task.response_future.set_result(results.pop(0))
 
@@ -1662,6 +1683,13 @@ async def test_message_service_sends_attachment_only_results_through_send_reply(
         queue = SimpleNamespace(qsize=lambda: 0)
         wait_registry = TaskWaitRegistry()
         memory = None
+
+        def __init__(self) -> None:
+            self._run_gen = 0
+
+        def allocate_run_generation(self) -> int:
+            self._run_gen += 1
+            return self._run_gen
 
         async def enqueue(self, task) -> None:
             task.response_future.set_result(results.pop(0))

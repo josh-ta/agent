@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic_ai import Agent
 
 from agent.config import settings
+from agent.events import current_task_id
+from agent.metrics import Metrics
+from agent.permissions import get_permission_engine
 from agent.secret_store import SecretNotFoundError, SecretStore, SecretStoreError, mask_secret
 from agent.tools import filesystem, github, self_edit, shell
-from agent.events import current_task_id
 from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
@@ -18,11 +20,23 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 
+def _tool_perm_block(tool_name: str, **kwargs: Any) -> str | None:
+    eng = get_permission_engine()
+    if eng is None:
+        return None
+    result = eng.check_sync(tool_name, kwargs)
+    if result.ok:
+        return None
+    Metrics.inc_permission_denied()
+    return result.message
+
+
 def attach_all_tools(
     agent: Agent,  # type: ignore[type-arg]
     *,
     sqlite: "SQLiteStore | None",
     postgres: "PostgresStore | None",
+    subagent_runner: Any = None,
 ) -> None:
     attach_shell_tools(agent)
     attach_filesystem_tools(agent)
@@ -32,6 +46,11 @@ def attach_all_tools(
     attach_github_tools(agent)
     attach_database_tools(agent, sqlite=sqlite, postgres=postgres)
     attach_secret_tools(agent)
+    attach_schedule_tools(agent, sqlite=sqlite)
+    if subagent_runner is not None:
+        from agent.subagent_runner import attach_run_subagent_tool
+
+        attach_run_subagent_tool(agent, subagent_runner)
     log.info("tools_attached_to_agent")
 
 
@@ -39,16 +58,57 @@ def attach_shell_tools(agent: Agent) -> None:  # type: ignore[type-arg]
     @agent.tool_plain
     async def run_shell(command: str, working_dir: str = "", timeout: int = 30, tail_lines: int = 0) -> str:
         """Run a shell command. Returns combined stdout+stderr + exit code."""
-        return await shell.shell_run(command, working_dir or None, timeout, tail_lines)
+        if msg := _tool_perm_block(
+            "run_shell",
+            command=command,
+            working_dir=working_dir,
+            timeout=timeout,
+            tail_lines=tail_lines,
+        ):
+            return msg
+        return await shell.shell_run(command, working_dir or None, timeout, tail_lines, read_only=False)
+
+    @agent.tool_plain
+    async def run_shell_read_only(
+        command: str, working_dir: str = "", timeout: int = 30, tail_lines: int = 0
+    ) -> str:
+        """Run a read-only shell command (stricter validation; use in plan mode)."""
+        if msg := _tool_perm_block(
+            "run_shell_read_only",
+            command=command,
+            working_dir=working_dir,
+            timeout=timeout,
+            tail_lines=tail_lines,
+        ):
+            return msg
+        return await shell.shell_run(command, working_dir or None, timeout, tail_lines, read_only=True)
 
 
 def attach_filesystem_tools(agent: Agent) -> None:  # type: ignore[type-arg]
     @agent.tool_plain
-    def read_file(path: str) -> str:
-        return filesystem.read_file(path)
+    def read_file(
+        path: str,
+        encoding: str = "utf-8",
+        start_line: int = 1,
+        end_line: int | None = None,
+        max_lines: int = 2000,
+    ) -> str:
+        """Read a file (byte-capped whole file by default).
+
+        Set end_line or start_line>1 for a 1-based inclusive line window.
+        """
+        return filesystem.read_file(
+            path,
+            encoding,
+            start_line=start_line,
+            end_line=end_line,
+            max_lines=max_lines,
+        )
 
     @agent.tool_plain
     def write_file(path: str, content: str) -> str:
+        if msg := _tool_perm_block("write_file", path=path, content=content):
+            return msg
         return filesystem.write_file(path, content)
 
     @agent.tool_plain
@@ -57,15 +117,50 @@ def attach_filesystem_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     def delete_file(path: str) -> str:
+        if msg := _tool_perm_block("delete_file", path=path):
+            return msg
         return filesystem.delete_file(path)
 
     @agent.tool_plain
     def str_replace(path: str, old_str: str, new_str: str, expected_replacements: int = 1) -> str:
+        if msg := _tool_perm_block(
+            "str_replace",
+            path=path,
+            old_str=old_str,
+            new_str=new_str,
+            expected_replacements=expected_replacements,
+        ):
+            return msg
         return filesystem.str_replace_file(path, old_str, new_str, expected_replacements)
 
     @agent.tool_plain
-    def search_files(pattern: str, path: str = ".", file_glob: str = "", context_lines: int = 2) -> str:
-        return filesystem.search_files(pattern, path, file_glob, context_lines)
+    def search_files(
+        pattern: str,
+        path: str = ".",
+        file_glob: str = "",
+        context_lines: int = 2,
+        fixed_string: bool = False,
+        case_sensitive: bool = True,
+        max_matches_per_file: int | None = None,
+        max_total_matches: int | None = None,
+        output_mode: str = "text",
+    ) -> str:
+        """Search with ripgrep. Respects .gitignore (skipped files are not searched).
+
+        Use fixed_string for literals; output_mode 'json' for structured matches.
+        Non-zero exit (e.g. 2) means an rg error, not 'no matches'.
+        """
+        return filesystem.search_files(
+            pattern,
+            path,
+            file_glob,
+            context_lines,
+            fixed_string=fixed_string,
+            case_sensitive=case_sensitive,
+            max_matches_per_file=max_matches_per_file,
+            max_total_matches=max_total_matches,
+            output_mode=output_mode,
+        )
 
 
 def attach_journal_tools(agent: Agent, *, sqlite: "SQLiteStore | None") -> None:  # type: ignore[type-arg]
@@ -146,6 +241,8 @@ def attach_self_edit_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     def skill_edit(name: str, content: str) -> str:
+        if msg := _tool_perm_block("skill_edit", name=name, content=content):
+            return msg
         return self_edit.edit_skill(name, content)
 
     @agent.tool_plain
@@ -154,16 +251,22 @@ def attach_self_edit_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     def identity_edit(filename: str, content: str) -> str:
+        if msg := _tool_perm_block("identity_edit", filename=filename, content=content):
+            return msg
         return self_edit.edit_identity(filename, content)
 
     @agent.tool_plain
     async def agent_restart(reason: str = "manual restart") -> str:
+        if msg := _tool_perm_block("agent_restart", reason=reason):
+            return msg
         return await self_edit.self_restart(reason)
 
 
 def attach_discord_tools(agent: Agent) -> None:  # type: ignore[type-arg]
     @agent.tool_plain
     async def send_discord(channel_id: int, message: str) -> str:
+        if msg := _tool_perm_block("send_discord", channel_id=channel_id, message=message):
+            return msg
         return await discord_send(channel_id, message)
 
     @agent.tool_plain
@@ -176,6 +279,8 @@ def attach_discord_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     async def ask_user_question(question: str, timeout: int = 300) -> str:
+        if msg := _tool_perm_block("ask_user_question", question=question, timeout=timeout):
+            return msg
         return await ask_user(question, timeout)
 
 
@@ -194,14 +299,22 @@ def attach_github_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     async def gh_pr_comment(pr: int, body: str, repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_pr_comment", pr=pr, body=body, repo=repo):
+            return msg
         return await github.pr_comment(pr, body, repo or None)
 
     @agent.tool_plain
     async def gh_pr_review(pr: int, action: str, body: str = "", repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_pr_review", pr=pr, action=action, body=body, repo=repo):
+            return msg
         return await github.pr_review(pr, action, body, repo or None)
 
     @agent.tool_plain
     async def gh_pr_review_inline(pr: int, action: str, body: str, comments: list[dict], repo: str = "") -> str:
+        if msg := _tool_perm_block(
+            "gh_pr_review_inline", pr=pr, action=action, body=body, comments=comments, repo=repo
+        ):
+            return msg
         return await github.pr_review_with_comments(pr, action, body, comments, repo or None)
 
     @agent.tool_plain
@@ -210,6 +323,8 @@ def attach_github_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     async def gh_pr_merge(pr: int, method: str = "squash", repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_pr_merge", pr=pr, method=method, repo=repo):
+            return msg
         return await github.pr_merge(pr, method, repo or None)
 
     @agent.tool_plain
@@ -222,14 +337,20 @@ def attach_github_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     async def gh_issue_comment(issue: int, body: str, repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_issue_comment", issue=issue, body=body, repo=repo):
+            return msg
         return await github.issue_comment(issue, body, repo or None)
 
     @agent.tool_plain
     async def gh_issue_create(title: str, body: str, labels: list[str] | None = None, repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_issue_create", title=title, body=body, labels=labels, repo=repo):
+            return msg
         return await github.issue_create(title, body, labels, repo or None)
 
     @agent.tool_plain
     async def gh_issue_close(issue: int, reason: str = "completed", repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_issue_close", issue=issue, reason=reason, repo=repo):
+            return msg
         return await github.issue_close(issue, reason, repo or None)
 
     @agent.tool_plain
@@ -246,7 +367,97 @@ def attach_github_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     async def gh_ci_rerun(run_id: str, failed_only: bool = True, repo: str = "") -> str:
+        if msg := _tool_perm_block("gh_ci_rerun", run_id=run_id, failed_only=failed_only, repo=repo):
+            return msg
         return await github.ci_rerun(run_id, failed_only, repo or None)
+
+
+def attach_schedule_tools(agent: Agent, *, sqlite: "SQLiteStore | None") -> None:  # type: ignore[type-arg]
+    if sqlite is None:
+
+        @agent.tool_plain
+        async def schedule_background_task(
+            prompt: str,
+            delay_seconds: float = 60,
+            interval_seconds: float | None = None,
+        ) -> str:
+            return "[schedule_background_task requires SQLite — local DB not configured]"
+
+        @agent.tool_plain
+        async def list_scheduled_tasks() -> str:
+            return "(no SQLite — no scheduled tasks)"
+
+        @agent.tool_plain
+        async def cancel_scheduled_task(task_id: str) -> str:
+            return "[cancel_scheduled_task requires SQLite]"
+        return
+
+    @agent.tool_plain
+    async def schedule_background_task(
+        prompt: str,
+        delay_seconds: float = 60,
+        interval_seconds: float | None = None,
+    ) -> str:
+        """Enqueue a prompt after delay_seconds, or repeat every interval_seconds when set (>0)."""
+        if msg := _tool_perm_block(
+            "schedule_background_task",
+            prompt=prompt,
+            delay_seconds=delay_seconds,
+            interval_seconds=interval_seconds,
+        ):
+            return msg
+        p = prompt.strip()
+        cap = settings.scheduled_prompt_char_cap
+        if len(p) > cap:
+            return f"[prompt too long: {len(p)} chars; max {cap}]"
+        if delay_seconds < 0:
+            return "[delay_seconds must be >= 0]"
+        if interval_seconds is not None and interval_seconds <= 0:
+            return "[interval_seconds must be null or > 0]"
+        if interval_seconds is not None and interval_seconds < 30:
+            return "[interval_seconds must be at least 30 seconds]"
+        max_rows = settings.scheduled_tasks_max_rows
+        n = await sqlite.scheduled_task_count()
+        if n >= max_rows:
+            return f"[at most {max_rows} active scheduled tasks; cancel one first]"
+        tid = await sqlite.scheduled_task_create(
+            prompt=p,
+            delay_seconds=float(delay_seconds),
+            interval_seconds=float(interval_seconds) if interval_seconds is not None else None,
+            metadata={"source": "tool"},
+        )
+        kind = "recurring" if interval_seconds else "one-shot"
+        return f"Scheduled {kind} task `{tid}` (delay={delay_seconds}s)."
+
+    @agent.tool_plain
+    async def list_scheduled_tasks() -> str:
+        """List active scheduled background prompts."""
+        rows = await sqlite.scheduled_task_list(include_disabled=False)
+        if not rows:
+            return "(no active scheduled tasks)"
+        lines = ["## Scheduled tasks", ""]
+        import datetime as _dt
+
+        for row in rows:
+            nid = row["id"]
+            nxt = float(row["next_run_ts"])
+            when = _dt.datetime.fromtimestamp(nxt, tz=_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
+            iv = row.get("interval_seconds")
+            ivs = f" every {iv}s" if iv else ""
+            prev = (row.get("prompt") or "")[:120].replace("\n", " ")
+            lines.append(f"- `{nid}` @ {when}{ivs}: {prev}")
+        return "\n".join(lines)
+
+    @agent.tool_plain
+    async def cancel_scheduled_task(task_id: str) -> str:
+        """Disable a scheduled task by id (from list_scheduled_tasks)."""
+        if msg := _tool_perm_block("cancel_scheduled_task", task_id=task_id):
+            return msg
+        tid = task_id.strip()
+        if not tid:
+            return "[task_id required]"
+        ok = await sqlite.scheduled_task_cancel(tid)
+        return f"Cancelled `{tid}`." if ok else f"[no active task `{tid}`]"
 
 
 def attach_secret_tools(agent: Agent) -> None:  # type: ignore[type-arg]
@@ -284,6 +495,16 @@ def attach_secret_tools(agent: Agent) -> None:  # type: ignore[type-arg]
         allowed_tools: list[str] | None = None,
         rotation_hint: str = "",
     ) -> str:
+        if msg := _tool_perm_block(
+            "secret_set",
+            name=name,
+            value="",
+            purpose=purpose,
+            scope=scope,
+            allowed_tools=allowed_tools,
+            rotation_hint=rotation_hint,
+        ):
+            return msg
         try:
             store = _store()
             try:
@@ -335,6 +556,8 @@ def attach_secret_tools(agent: Agent) -> None:  # type: ignore[type-arg]
 
     @agent.tool_plain
     def secret_delete(name: str) -> str:
+        if msg := _tool_perm_block("secret_delete", name=name):
+            return msg
         try:
             removed = _store().delete(name)
             return f"Deleted secret `{name}`." if removed else f"[ERROR: secret not found: {name}]"
@@ -364,6 +587,7 @@ def attach_database_tools(
                     lines.append(f"  memory_items: {stats.get('memory_items', '?')} rows")
                     lines.append(f"  procedures: {stats.get('procedures', '?')} rows")
                     lines.append(f"  feedback_events: {stats.get('feedback_events', '?')} rows")
+                    lines.append(f"  scheduled_tasks: {stats.get('scheduled_tasks', '?')} rows")
                     lines.append(f"  db size: {stats.get('db_size_mb', '?')} MB")
                     lines.append(f"  vec search: {stats.get('vec_enabled', False)}")
                     lines.append(f"  last cleanup: {stats.get('last_cleanup', 'never')}")
@@ -389,11 +613,17 @@ def attach_database_tools(
 
         @agent.tool_plain
         async def memory_save(content: str) -> str:
+            if msg := _tool_perm_block("memory_save", content=content):
+                return msg
             await sqlite.save_memory_fact(content)
             return f"Saved to memory: {content[:80]}"
 
         @agent.tool_plain
         async def procedure_save(trigger_text: str, checklist: str, kind: str = "procedure") -> str:
+            if msg := _tool_perm_block(
+                "procedure_save", trigger_text=trigger_text, checklist=checklist, kind=kind
+            ):
+                return msg
             procedure_id = await sqlite.save_procedure(
                 trigger_text=trigger_text,
                 checklist=checklist,
@@ -412,6 +642,8 @@ def attach_database_tools(
 
         @agent.tool_plain
         async def lesson_save(summary: str, kind: str = "lesson") -> str:
+            if msg := _tool_perm_block("lesson_save", summary=summary, kind=kind):
+                return msg
             await sqlite.save_lesson(summary, kind=kind)
             return f"Lesson recorded [{kind}]: {summary[:80]}"
 

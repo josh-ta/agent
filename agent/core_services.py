@@ -13,6 +13,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from agent.config import settings
+from agent.project_memory import truncate_markdown_entrypoint
 
 log = structlog.get_logger()
 
@@ -47,10 +48,16 @@ class PromptSources:
             if not fp.exists():
                 continue
             text = fp.read_text(encoding="utf-8").strip()
-            cap = memory_char_cap if filename == "MEMORY.md" else identity_char_cap
-            if len(text) > cap:
-                text = "[...truncated...]\n\n" + text[-cap:]
-                log.warning("identity_file_truncated", file=filename, cap=cap)
+            if filename == "MEMORY.md":
+                text = truncate_markdown_entrypoint(text)
+            else:
+                cap = identity_char_cap
+                if len(text) > cap:
+                    text = "[...truncated...]\n\n" + text[-cap:]
+                    log.warning("identity_file_truncated", file=filename, cap=cap)
+            if filename == "MEMORY.md" and len(text) > memory_char_cap:
+                text = "[...truncated...]\n\n" + text[-memory_char_cap:]
+                log.warning("identity_file_truncated", file=filename, cap=memory_char_cap)
             sections.append(text)
         return "\n\n".join(sections)
 

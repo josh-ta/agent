@@ -1,13 +1,14 @@
 """
 Filesystem tools: read, write, list, delete files in or alongside the workspace.
 
-Relative paths are resolved from WORKSPACE_PATH. Absolute paths outside the
-workspace are still allowed for operational use cases such as `/tmp`, but the
-tool logs them so external access is visible.
+Relative paths resolve under WORKSPACE_PATH. When FILESYSTEM_STRICT_WORKSPACE=true,
+all paths must stay inside the workspace (CC-style). When false, paths outside the
+workspace are allowed but logged so operational use of e.g. /tmp remains visible.
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -17,30 +18,76 @@ from agent.config import settings
 
 log = structlog.get_logger()
 
-MAX_READ_BYTES = 32 * 1024  # 32 KB
+MAX_READ_BYTES = 32 * 1024  # 32 KB for whole-file reads
+MAX_LINE_WINDOW = 2000  # max lines returned per read_file line-range call
+
+
+def _workspace_root() -> Path:
+    return settings.workspace_path.resolve()
+
+
+def _strict_workspace_violation(resolved: Path) -> str | None:
+    """If strict mode is on and path is outside workspace, return error message."""
+    if not settings.filesystem_strict_workspace:
+        return None
+    root = _workspace_root()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return (
+            f"[ERROR: path outside workspace (FILESYSTEM_STRICT_WORKSPACE=true): {resolved}. "
+            f"Workspace root: {root}]"
+        )
+    return None
 
 
 def _safe_path(path: str) -> Path:
-    """Resolve a path relative to the workspace and warn on external access."""
-    workspace = settings.workspace_path.resolve()
-    resolved = (workspace / path).resolve()
+    """
+    Resolve path under workspace when relative; absolute paths are resolved as-is.
+    Logs (or rejects in strict mode) when the result lies outside the workspace.
+    """
+    workspace = _workspace_root()
+    raw = Path(path)
+    if raw.is_absolute():
+        resolved = raw.resolve()
+    else:
+        resolved = (workspace / path).resolve()
 
-    # Allow absolute paths that are already under workspace
-    if not str(resolved).startswith(str(workspace)):
-        # For absolute paths outside workspace, still allow (agent may need /tmp etc)
-        # but log it
+    err = _strict_workspace_violation(resolved)
+    if err:
+        raise PermissionError(err)
+
+    if not resolved.is_relative_to(workspace):
         log.warning("path_outside_workspace", path=path, resolved=str(resolved))
 
     return resolved
 
 
-def read_file(path: str, encoding: str = "utf-8") -> str:
+def read_file(
+    path: str,
+    encoding: str = "utf-8",
+    *,
+    start_line: int = 1,
+    end_line: int | None = None,
+    max_lines: int = MAX_LINE_WINDOW,
+) -> str:
     """
     Read a file and return its content.
+
+    Whole-file mode (default): start_line==1 and end_line is None — reads the full
+    file, capped by MAX_READ_BYTES (binary mode unchanged).
+
+    Line-window mode: set end_line and/or start_line>1 — streams only that range,
+    capped at max_lines lines, then applies MAX_READ_BYTES on the slice. Line numbers
+    in the output are 1-based and prefixed for navigation.
 
     Args:
         path: File path (relative to workspace or absolute).
         encoding: Text encoding. Use 'binary' to get hex dump of binary files.
+        start_line: First line to include (1-based). Ignored for encoding=='binary'.
+        end_line: Last line to include (1-based), inclusive; None means end of file
+            in line mode, or full file when start_line==1 (legacy whole-file read).
+        max_lines: Safety cap on how many lines to return in line-window mode.
 
     Returns:
         File content as string, or error message.
@@ -57,11 +104,50 @@ def read_file(path: str, encoding: str = "utf-8") -> str:
             data = fp.read_bytes()
             return data[:MAX_READ_BYTES].hex()
 
-        content = fp.read_text(encoding=encoding, errors="replace")
-        if len(content) > MAX_READ_BYTES:
-            content = content[:MAX_READ_BYTES] + f"\n... [truncated, total {size} bytes]"
-        return content
+        # Legacy: full file with byte cap
+        if start_line == 1 and end_line is None:
+            content = fp.read_text(encoding=encoding, errors="replace")
+            if len(content) > MAX_READ_BYTES:
+                content = content[:MAX_READ_BYTES] + (
+                    f"\n... [truncated, total {size} bytes — use start_line/end_line "
+                    "to read a window]"
+                )
+            return content
 
+        sl = max(1, int(start_line))
+        el = int(end_line) if end_line is not None else None
+        cap = max(1, min(int(max_lines), MAX_LINE_WINDOW))
+
+        lines_out: list[str] = []
+        current = 0
+        with fp.open(encoding=encoding, errors="replace") as handle:
+            for line in handle:
+                current += 1
+                if current < sl:
+                    continue
+                if el is not None and current > el:
+                    break
+                lines_out.append(f"{current:6d}|{line}")
+                if len(lines_out) >= cap:
+                    lines_out.append(
+                        f"... [max_lines={cap} reached; narrow range or raise max_lines]"
+                    )
+                    break
+
+        if el is not None and current < el and len(lines_out) < cap:
+            pass  # EOF before end_line — fine
+
+        if not lines_out and sl > 1:
+            return f"[ERROR: start_line {sl} past end of file (file has {current} lines)]"
+
+        text = "".join(lines_out)
+        if len(text) > MAX_READ_BYTES:
+            text = text[:MAX_READ_BYTES] + "\n... [truncated at byte cap — narrow line range]"
+        header = f"(lines {sl}-{current if lines_out else sl}, path={fp})\n"
+        return header + text
+
+    except PermissionError as exc:
+        return str(exc)
     except Exception as exc:
         return f"[ERROR: {exc}]"
 
@@ -84,6 +170,8 @@ def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
         fp.write_text(content, encoding=encoding)
         log.info("file_written", path=str(fp), size=len(content))
         return f"Written {len(content)} bytes to {fp}"
+    except PermissionError as exc:
+        return str(exc)
     except Exception as exc:
         return f"[ERROR: {exc}]"
 
@@ -120,6 +208,8 @@ def list_dir(path: str = ".") -> str:
                 lines.append(f"  ????             {entry.name}")
 
         return "\n".join(lines)
+    except PermissionError as exc:
+        return str(exc)
     except Exception as exc:
         return f"[ERROR: {exc}]"
 
@@ -142,6 +232,8 @@ def delete_file(path: str) -> str:
             return "[ERROR: use shell 'rm -rf' for directories]"
         fp.unlink()
         return f"Deleted {fp}"
+    except PermissionError as exc:
+        return str(exc)
     except Exception as exc:
         return f"[ERROR: {exc}]"
 
@@ -193,6 +285,8 @@ def str_replace_file(
         fp.write_text(updated, encoding="utf-8")
         log.info("str_replace", path=str(fp), count=count)
         return f"Replaced {count} occurrence(s) in {fp}"
+    except PermissionError as exc:
+        return str(exc)
     except Exception as exc:
         return f"[ERROR: {exc}]"
 
@@ -200,38 +294,136 @@ def str_replace_file(
 MAX_SEARCH_BYTES = 8 * 1024  # 8 KB — enough for ~200 lines of context
 
 
+def _rg_base_cmd(
+    *,
+    context_lines: int,
+    file_glob: str,
+    fixed_string: bool,
+    case_sensitive: bool,
+    max_matches_per_file: int | None,
+) -> list[str]:
+    cmd: list[str] = [
+        "rg",
+        "--line-number",
+        f"--context={context_lines}",
+        "--no-heading",
+        "--no-messages",
+    ]
+    if fixed_string:
+        cmd.append("--fixed-strings")
+    if not case_sensitive:
+        cmd.append("--ignore-case")
+    else:
+        cmd.append("--case-sensitive")
+    if max_matches_per_file is not None and max_matches_per_file > 0:
+        cmd.append(f"--max-count={int(max_matches_per_file)}")
+    if file_glob:
+        cmd += ["--glob", file_glob]
+    return cmd
+
+
+def _collect_rg_json_matches(
+    stdout: str,
+    max_total_matches: int | None,
+) -> tuple[list[dict[str, object]], bool]:
+    """Parse ripgrep --json lines into match records; truncated if over max_total."""
+    out: list[dict[str, object]] = []
+    truncated = False
+    n = 0
+    for raw in stdout.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "match":
+            continue
+        n += 1
+        if max_total_matches is not None and n > max_total_matches:
+            truncated = True
+            break
+        data = obj.get("data") or {}
+        path_obj = data.get("path") or {}
+        ptext = path_obj.get("text") or ""
+        ln = data.get("line_number")
+        ltext = ((data.get("lines") or {}).get("text") or "").rstrip("\n")
+        out.append({"path": ptext, "line_number": ln, "line": ltext})
+    return out, truncated
+
+
+def _matches_as_text(matches: list[dict[str, object]]) -> str:
+    lines: list[str] = []
+    for m in matches:
+        p = str(m.get("path", ""))
+        ln = m.get("line_number", "")
+        lt = str(m.get("line", ""))
+        lines.append(f"{p}:{ln}:{lt}")
+    return "\n".join(lines)
+
+
 def search_files(
     pattern: str,
     path: str = ".",
     file_glob: str = "",
     context_lines: int = 2,
+    *,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
+    max_matches_per_file: int | None = None,
+    max_total_matches: int | None = None,
+    output_mode: str = "text",
 ) -> str:
     """
-    Search files using ripgrep (rg) and return matching lines with context.
+    Search files using ripgrep (rg). Respects .gitignore and ignore files by default
+    (same as running rg in the repo); files ignored by git are not searched unless
+    you narrow path to an unignored subtree.
 
     Args:
-        pattern: Regular expression to search for.
+        pattern: Search pattern (regex unless fixed_string=True).
         path: Directory or file to search (relative to workspace or absolute).
         file_glob: File name filter, e.g. '*.py' or '*.{ts,tsx}'.
-        context_lines: Lines of context to show around each match (default 2).
+        context_lines: Lines of context around each match (text mode only; omitted
+            when output_mode is json or when max_total_matches forces json pipeline).
+        fixed_string: If True, pattern is a literal string (-F).
+        case_sensitive: If False, search case-insensitively (-i).
+        max_matches_per_file: Ripgrep --max-count per file (optional).
+        max_total_matches: Stop after this many matches across the search (uses JSON
+            pipeline; context may be omitted in reconstructed text).
+        output_mode: 'text' (default, file:line:content) or 'json' (structured array).
 
     Returns:
-        Ripgrep output (file:line:content format) or error message.
+        Ripgrep-style text, JSON string, or an explicit no-match / error message.
     """
     try:
         resolved = _safe_path(path)
         if not resolved.exists():
             return f"[ERROR: path not found: {path}]"
 
-        cmd: list[str] = [
-            "rg",
-            "--line-number",
-            f"--context={context_lines}",
-            "--no-heading",
-        ]
-        if file_glob:
-            cmd += ["--glob", file_glob]
-        cmd += [pattern, str(resolved)]
+        use_json = output_mode.strip().lower() == "json" or (
+            max_total_matches is not None and max_total_matches > 0
+        )
+
+        if use_json:
+            cmd = _rg_base_cmd(
+                context_lines=0 if max_total_matches else context_lines,
+                file_glob=file_glob,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
+                max_matches_per_file=max_matches_per_file,
+            )
+            cmd.append("--json")
+            cmd += [pattern, str(resolved)]
+        else:
+            cmd = _rg_base_cmd(
+                context_lines=context_lines,
+                file_glob=file_glob,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
+                max_matches_per_file=max_matches_per_file,
+            )
+            cmd += [pattern, str(resolved)]
 
         result = subprocess.run(
             cmd,
@@ -240,20 +432,62 @@ def search_files(
             timeout=30,
         )
 
+        stderr = (result.stderr or "").strip()
+
+        if result.returncode not in (0, 1):
+            err_bit = stderr[:300] if stderr else "(no stderr)"
+            return (
+                f"[ERROR: ripgrep failed (exit {result.returncode}) — not the same as "
+                f"'no matches'. Detail: {err_bit}]"
+            )
+
+        if use_json:
+            matches, truncated = _collect_rg_json_matches(
+                result.stdout,
+                max_total_matches,
+            )
+            if not matches:
+                return f"(no matches for pattern: {pattern!r})"
+            if output_mode.strip().lower() == "json":
+                payload: dict[str, object] = {
+                    "matches": matches,
+                    "truncated": truncated,
+                    "gitignore": (
+                        "rg respects .gitignore; skipped files do not appear here."
+                    ),
+                }
+                return json.dumps(payload, indent=2)
+
+            text_out = _matches_as_text(matches)
+            if truncated:
+                text_out += (
+                    f"\n... [truncated at max_total_matches={max_total_matches}; "
+                    "context omitted in this summary mode]"
+                )
+            if len(text_out) > MAX_SEARCH_BYTES:
+                text_out = (
+                    text_out[:MAX_SEARCH_BYTES]
+                    + "\n... [truncated at 8KB — refine pattern, path, or file_glob]"
+                )
+            return text_out
+
         output = result.stdout
         if not output and result.returncode == 1:
-            return f"(no matches for pattern: {pattern})"
-        if result.returncode not in (0, 1):
-            return f"[ERROR: rg exited {result.returncode}: {result.stderr[:200]}]"
+            return f"(no matches for pattern: {pattern!r})"
+        if not output and result.returncode == 0:
+            return f"(no matches for pattern: {pattern!r})"
 
         if len(output) > MAX_SEARCH_BYTES:
             output = (
                 output[:MAX_SEARCH_BYTES]
                 + "\n... [truncated at 8KB — refine your pattern or file_glob]"
             )
-        return output or f"(no matches for pattern: {pattern})"
+        return output
+
     except FileNotFoundError:
         return "[ERROR: ripgrep (rg) not found — install it with: apt-get install ripgrep]"
+    except PermissionError as exc:
+        return str(exc)
     except subprocess.TimeoutExpired:
         return "[ERROR: search timed out after 30s — narrow the search path or pattern]"
     except Exception as exc:

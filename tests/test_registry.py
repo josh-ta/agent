@@ -63,6 +63,7 @@ class _FakePostgres:
 
 def test_registry_attaches_base_toolsets() -> None:
     registry = ToolRegistry()
+    registry.register_all(None, None)
     agent = _FakeAgent()
 
     registry.attach_to_agent(agent)  # type: ignore[arg-type]
@@ -72,6 +73,8 @@ def test_registry_attaches_base_toolsets() -> None:
     assert "skill_read" in agent.tool_names
     assert "send_discord" in agent.tool_names
     assert "gh_pr_view" in agent.tool_names
+    assert "run_agent_subtask" in agent.tool_names
+    assert "schedule_background_task" in agent.tool_names
 
 
 def test_registry_attaches_database_tools_when_stores_exist() -> None:
@@ -85,3 +88,5 @@ def test_registry_attaches_database_tools_when_stores_exist() -> None:
     assert "lessons_recent" in agent.tool_names
     assert "list_agents" in agent.tool_names
     assert "search_shared_memory" in agent.tool_names
+    assert "run_agent_subtask" in agent.tool_names
+    assert "list_scheduled_tasks" in agent.tool_names

@@ -28,6 +28,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._sqlite: SQLiteStore | None = None
         self._postgres: PostgresStore | None = None
+        self._subagent_runner: object | None = None
 
     def register_all(
         self,
@@ -36,8 +37,16 @@ class ToolRegistry:
     ) -> None:
         self._sqlite = sqlite
         self._postgres = postgres
+        from agent.subagent_runner import SubagentRunner
+
+        self._subagent_runner = SubagentRunner(sqlite=sqlite, postgres=postgres)
         log.info("tools_registered", sqlite=sqlite is not None, postgres=postgres is not None)
 
     def attach_to_agent(self, agent: Agent) -> None:  # type: ignore[type-arg]
         """Attach all tool functions to the given Pydantic AI agent."""
-        attach_all_tools(agent, sqlite=self._sqlite, postgres=self._postgres)
+        attach_all_tools(
+            agent,
+            sqlite=self._sqlite,
+            postgres=self._postgres,
+            subagent_runner=self._subagent_runner,
+        )

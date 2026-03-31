@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from agent.tools import filesystem
 
@@ -91,11 +94,90 @@ def test_filesystem_safe_path_warns_for_external_absolute_paths(isolated_paths, 
         warnings.append((path, resolved))
 
     monkeypatch.setattr(filesystem.log, "warning", _warn)
+    monkeypatch.setattr(filesystem.settings, "filesystem_strict_workspace", False)
 
     resolved = filesystem._safe_path("/tmp/outside.txt")
 
     assert str(resolved).endswith("/tmp/outside.txt")
     assert warnings == [("/tmp/outside.txt", str(resolved))]
+
+
+def test_filesystem_strict_workspace_blocks_external_paths(isolated_paths, monkeypatch) -> None:
+    monkeypatch.setattr(filesystem.settings, "filesystem_strict_workspace", True)
+    with pytest.raises(PermissionError, match="outside workspace"):
+        filesystem._safe_path("/tmp/outside.txt")
+
+
+def test_filesystem_read_file_line_window(isolated_paths) -> None:
+    p = Path(isolated_paths["workspace"]) / "w.txt"
+    p.write_text("a\nb\nc\nd\n", encoding="utf-8")
+    out = filesystem.read_file(str(p), start_line=2, end_line=3)
+    assert "lines 2-" in out
+    assert "     2|" in out and "b" in out
+    assert "     3|" in out and "c" in out
+    assert "     4|" not in out
+
+
+def test_filesystem_search_uses_json_and_limits(monkeypatch, isolated_paths) -> None:
+    file_path = Path(isolated_paths["workspace"]) / "sample.py"
+    file_path.write_text("x = 1\n", encoding="utf-8")
+
+    match_obj = {
+        "type": "match",
+        "data": {
+            "path": {"text": str(file_path)},
+            "line_number": 1,
+            "lines": {"text": "x = 1\n"},
+        },
+    }
+    json_lines = ['{"type":"begin","data":{}}', json.dumps(match_obj)]
+
+    class _JsonOut:
+        returncode = 0
+        stdout = "\n".join(json_lines)
+        stderr = ""
+
+    monkeypatch.setattr(filesystem.subprocess, "run", lambda *args, **kwargs: _JsonOut())
+    j = filesystem.search_files("x", str(file_path), output_mode="json")
+    assert '"matches"' in j
+    assert "gitignore" in j
+
+    class _Empty:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(filesystem.subprocess, "run", lambda *args, **kwargs: _Empty())
+    assert "no matches" in filesystem.search_files("z", str(file_path), output_mode="json")
+
+
+def test_filesystem_search_max_total_matches_reconstructs_text(monkeypatch, isolated_paths) -> None:
+    file_path = Path(isolated_paths["workspace"]) / "multi.py"
+    file_path.write_text("x\nx\nx\n", encoding="utf-8")
+    chunk = []
+    for i in range(3):
+        chunk.append(
+            json.dumps(
+                {
+                    "type": "match",
+                    "data": {
+                        "path": {"text": str(file_path)},
+                        "line_number": i + 1,
+                        "lines": {"text": "x\n"},
+                    },
+                }
+            )
+        )
+
+    class _R:
+        returncode = 0
+        stdout = "\n".join(chunk)
+        stderr = ""
+
+    monkeypatch.setattr(filesystem.subprocess, "run", lambda *args, **kwargs: _R())
+    out = filesystem.search_files("x", str(file_path), max_total_matches=2, output_mode="text")
+    assert out.count(str(file_path)) == 2
+    assert "truncated at max_total_matches=2" in out
 
 
 def test_filesystem_read_file_supports_binary_and_truncation(isolated_paths) -> None:
@@ -108,7 +190,8 @@ def test_filesystem_read_file_supports_binary_and_truncation(isolated_paths) -> 
     truncated = filesystem.read_file(str(text_path))
 
     assert binary.startswith("0001706e67")
-    assert truncated.endswith(f"... [truncated, total {filesystem.MAX_READ_BYTES + 5} bytes]")
+    assert f"truncated, total {filesystem.MAX_READ_BYTES + 5} bytes" in truncated
+    assert "start_line/end_line" in truncated
 
 
 def test_filesystem_search_handles_no_matches_errors_truncation_and_timeouts(isolated_paths, monkeypatch) -> None:
@@ -121,7 +204,7 @@ def test_filesystem_search_handles_no_matches_errors_truncation_and_timeouts(iso
         stderr = ""
 
     monkeypatch.setattr(filesystem.subprocess, "run", lambda *args, **kwargs: _NoMatches())
-    assert filesystem.search_files("missing", str(file_path)) == "(no matches for pattern: missing)"
+    assert filesystem.search_files("missing", str(file_path)) == "(no matches for pattern: 'missing')"
 
     class _Error:
         returncode = 2
@@ -129,7 +212,8 @@ def test_filesystem_search_handles_no_matches_errors_truncation_and_timeouts(iso
         stderr = "bad regex"
 
     monkeypatch.setattr(filesystem.subprocess, "run", lambda *args, **kwargs: _Error())
-    assert "rg exited 2" in filesystem.search_files("bad", str(file_path))
+    out = filesystem.search_files("bad", str(file_path))
+    assert "ripgrep failed" in out and "exit 2" in out
 
     class _Large:
         returncode = 0
@@ -172,6 +256,21 @@ def test_filesystem_search_passes_file_glob(monkeypatch, isolated_paths) -> None
 
     assert result == "match\n"
     assert "--glob" in captured["cmd"]
+    assert "--case-sensitive" in captured["cmd"]
+
+    class _Result2:
+        returncode = 0
+        stdout = "ok\n"
+        stderr = ""
+
+    def fake_run2(cmd, *args, **kwargs):
+        captured["cmd2"] = cmd
+        return _Result2()
+
+    monkeypatch.setattr(filesystem.subprocess, "run", fake_run2)
+    filesystem.search_files("v", str(file_path), fixed_string=True, case_sensitive=False)
+    assert "--fixed-strings" in captured["cmd2"]
+    assert "--ignore-case" in captured["cmd2"]
 
 
 def test_filesystem_helpers_handle_general_exceptions_and_edge_directory_cases(isolated_paths, monkeypatch) -> None:

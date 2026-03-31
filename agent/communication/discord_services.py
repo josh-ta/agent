@@ -57,6 +57,7 @@ SILENT_TOOLS = frozenset(
     {
         "read_file",
         "list_dir",
+        "run_shell_read_only",
         "memory_save",
         "lesson_search",
         "task_resume",
@@ -157,7 +158,11 @@ class DiscordEventPresenter:
         except discord.HTTPException as exc:
             log.warning("send_attachment_failed", error=str(exc))
 
-    def make_sink(self, channel: discord.abc.Messageable):  # type: ignore[return]
+    def make_sink(
+        self,
+        channel: discord.abc.Messageable,
+        expected_run_generation: int | None = None,
+    ):  # type: ignore[return]
         shell_lines: list[str] = []
         shell_msg: discord.Message | None = None
 
@@ -166,6 +171,11 @@ class DiscordEventPresenter:
 
         async def sink(event: AgentEvent) -> None:
             nonlocal shell_lines, shell_msg
+
+            if expected_run_generation is not None:
+                rg = getattr(event, "run_generation", None)
+                if rg is not None and rg != expected_run_generation:
+                    return
 
             if isinstance(event, TaskStartEvent):
                 await _send("🟢 Working on it.")
@@ -339,6 +349,7 @@ class MessageHandlingService:
             attachment_metadata=attachment_metadata,
             session_id_seed=session_id_seed,
         )
+        metadata["run_generation"] = self._agent_loop.allocate_run_generation()
         self._sticky_sessions[parsed.channel_id] = metadata["session_id"]
         await self._persist_task_record(
             metadata=metadata,
@@ -971,6 +982,7 @@ class MessageHandlingService:
         )
         self._active_sessions[parsed.channel_id] = metadata["session_id"]
         self._sticky_sessions[parsed.channel_id] = metadata["session_id"]
+        metadata["run_generation"] = self._agent_loop.allocate_run_generation()
         await self._persist_task_record(
             metadata=metadata,
             parsed=parsed,
@@ -998,8 +1010,12 @@ class MessageHandlingService:
         )
 
         sink_tag = f"discord_{parsed.channel_id}_{id(task)}"
+        run_gen = int(metadata["run_generation"])
         if private_channel is not None:
-            self._bridge.register(sink_tag, self._presenter.make_sink(private_channel))  # type: ignore[arg-type]
+            self._bridge.register(
+                sink_tag,
+                self._presenter.make_sink(private_channel, expected_run_generation=run_gen),
+            )  # type: ignore[arg-type]
 
         typing_ctx = private_channel.typing() if private_channel is not None else message.channel.typing()  # type: ignore[union-attr]
         try:

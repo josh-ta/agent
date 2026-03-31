@@ -13,6 +13,11 @@ from agent.loop import Task
 from agent.task_waits import SuspendedTask, TaskWaitRegistry
 
 
+@pytest.fixture(autouse=True)
+def _disable_browser_mcp_health_for_readyz(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_module.settings, "browser_mcp_url", "")
+
+
 class _FakeSQLite:
     def __init__(self) -> None:
         self.created: list[dict[str, object]] = []
@@ -149,6 +154,11 @@ class _FakeLoop:
     def __init__(self) -> None:
         self.enqueued: list[Task] = []
         self.wait_registry = TaskWaitRegistry()
+        self._run_gen = 0
+
+    def allocate_run_generation(self) -> int:
+        self._run_gen += 1
+        return self._run_gen
 
     async def enqueue(self, task: Task) -> None:
         self.enqueued.append(task)
@@ -220,6 +230,11 @@ def test_post_tasks_still_works_without_optional_session_storage() -> None:
     class _Loop:
         def __init__(self) -> None:
             self.enqueued: list[Task] = []
+            self._rg = 0
+
+        def allocate_run_generation(self) -> int:
+            self._rg += 1
+            return self._rg
 
         async def enqueue(self, task: Task) -> None:
             self.enqueued.append(task)

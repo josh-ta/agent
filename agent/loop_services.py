@@ -33,6 +33,7 @@ from pydantic_ai.usage import UsageLimits
 
 from agent.attachment_ingest import inline_prompt_parts_from_metadata, render_attachment_context
 from agent.config import settings
+from agent.metrics import Metrics
 from agent.events import (
     ProgressEvent,
     ShellDoneEvent,
@@ -73,6 +74,8 @@ class RunResult:
     timeout_s: int = 300
     attachments: list[DiscordAttachment] = field(default_factory=list)
     shell_failures: list[str] = field(default_factory=list)
+    input_chars: int = 0
+    output_chars: int = 0
 
 
 class TaskJournal:
@@ -153,6 +156,7 @@ class TaskContextBuilder:
         channel_context = await self._load_channel_history(normalized_task) if not session_context else ""
         resume_context = self._load_resume_context(normalized_task)
         checkpoint_context = await self._load_checkpoint_context(normalized_task)
+        transcript_context = await self._load_transcript_context(normalized_task)
         attachment_context = self._load_attachment_context(normalized_task)
         secret_context = self._load_secret_context(normalized_task.content)
 
@@ -171,6 +175,8 @@ class TaskContextBuilder:
             parts.append(lessons_context)
         if checkpoint_context:
             parts.append(checkpoint_context)
+        if transcript_context:
+            parts.append(transcript_context)
         if resume_context:
             parts.append(resume_context)
         if attachment_context:
@@ -241,6 +247,27 @@ class TaskContextBuilder:
             return await self._memory.get_session_context(session_id, limit=10, char_cap=2200)
         except Exception:
             return ""
+
+    async def _load_transcript_context(self, task: "Task") -> str:
+        limit = max(0, int(getattr(settings, "restore_transcript_turns", 0) or 0))
+        if limit <= 0:
+            return ""
+        task_id = str((task.metadata or {}).get("task_id", "")).strip()
+        if not task_id or not self._memory or not hasattr(self._memory, "list_transcript_entries"):
+            return ""
+        try:
+            rows = await self._memory.list_transcript_entries(task_id, limit=limit)
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        lines = ["## Transcript checkpoint (persisted)"]
+        for row in rows:
+            role = str(row.get("role", ""))
+            kind = str(row.get("kind", ""))
+            content = str(row.get("content", ""))[:2000]
+            lines.append(f"- **{role}** ({kind}): {content}")
+        return "\n".join(lines)
 
     async def _load_checkpoint_context(self, task: "Task") -> str:
         task_id = str((task.metadata or {}).get("task_id", "")).strip()
@@ -353,6 +380,21 @@ class RunExecutor:
         )
         self._model_event_idle_timeout_s = max(1.0, float(configured_timeout))
 
+    async def _maybe_warn_context(self, total_chars: int) -> None:
+        est = max(0, total_chars) // 4
+        threshold = max(1000, int(settings.context_token_warn_threshold))
+        if est < threshold:
+            return
+        Metrics.inc_context_warn()
+        await self._bridge.emit(
+            ProgressEvent(
+                message=(
+                    f"⚠️ Estimated context usage ~{est} tokens (threshold {threshold}). "
+                    "Consider narrowing scope or summarizing."
+                )
+            )
+        )
+
     async def run(
         self,
         *,
@@ -390,12 +432,15 @@ class RunExecutor:
             try:
                 progress_watchdog = loop.create_task(self._progress_watchdog(progress_state))
                 activity_sink_tag = f"run_executor_activity_{id(progress_state)}"
+                _rg = (task.metadata or {}).get("run_generation")
+                _expected_rg = int(_rg) if _rg is not None else None
                 if hasattr(self._bridge, "register"):
                     self._bridge.register(
                         activity_sink_tag,
                         self._make_activity_sink(
                             progress_state=progress_state,
                             task_id=str((task.metadata or {}).get("task_id", "")).strip() or None,
+                            expected_run_generation=_expected_rg,
                         ),
                     )
                 async with agent.run_mcp_servers():
@@ -524,6 +569,9 @@ class RunExecutor:
                         user_visible_reply_sent = user_visible_reply_sent or followup_result.user_visible_reply_sent
                         attachments.extend(followup_result.attachments)
                         if followup_result.waiting_for_user:
+                            up = self._compose_user_prompt(prompt, task)
+                            ic, oc = len(up), len(result_output)
+                            await self._maybe_warn_context(ic + oc)
                             return RunResult(
                                 output=result_output,
                                 tool_calls=tool_calls,
@@ -533,19 +581,29 @@ class RunExecutor:
                                 timeout_s=followup_result.timeout_s,
                                 attachments=attachments,
                                 shell_failures=shell_failures + followup_result.shell_failures,
+                                input_chars=ic,
+                                output_chars=oc,
                             )
                         shell_failures.extend(followup_result.shell_failures)
 
+                up = self._compose_user_prompt(prompt, task)
+                ic, oc = len(up), len(result_output)
+                await self._maybe_warn_context(ic + oc)
                 return RunResult(
                     output=result_output,
                     tool_calls=tool_calls,
                     user_visible_reply_sent=user_visible_reply_sent,
                     attachments=attachments,
                     shell_failures=shell_failures,
+                    input_chars=ic,
+                    output_chars=oc,
                 )
 
             except Exception as exc:
                 if isinstance(exc, UserInputRequired):
+                    up = self._compose_user_prompt(prompt, task)
+                    ic = len(up)
+                    await self._maybe_warn_context(ic)
                     return RunResult(
                         tool_calls=tool_calls,
                         user_visible_reply_sent=user_visible_reply_sent,
@@ -554,6 +612,8 @@ class RunExecutor:
                         timeout_s=exc.timeout_s,
                         attachments=attachments,
                         shell_failures=shell_failures,
+                        input_chars=ic,
+                        output_chars=0,
                     )
                 exc_str = str(exc)
                 is_context_overflow = "prompt is too long" in exc_str or ("400" in exc_str and "maximum" in exc_str)
@@ -632,8 +692,13 @@ class RunExecutor:
         *,
         progress_state: dict[str, object],
         task_id: str | None,
+        expected_run_generation: int | None = None,
     ):
         async def sink(event: object) -> None:
+            if expected_run_generation is not None:
+                rg = getattr(event, "run_generation", None)
+                if rg is not None and rg != expected_run_generation:
+                    return
             event_task_id = getattr(event, "task_id", None)
             if task_id is not None and event_task_id not in {None, task_id}:
                 return
@@ -1016,6 +1081,7 @@ class HeartbeatService:
             await self._memory.heartbeat()
 
         await self._expire_waiting_tasks()
+        await self._dispatch_scheduled_tasks(is_busy=is_busy)
 
         if self._postgres is not None and not is_busy:
             try:
@@ -1027,6 +1093,32 @@ class HeartbeatService:
                     await self._enqueue(self._build_a2a_task(row))
             except Exception as exc:
                 log.warning("a2a_poll_error", error=str(exc))
+
+    async def _dispatch_scheduled_tasks(self, *, is_busy: bool) -> None:
+        """When idle, claim due SQLite scheduled rows and enqueue tasks."""
+        if is_busy or self._memory is None or not hasattr(self._memory, "scheduled_tasks_claim_due"):
+            return
+        from agent.config import settings
+        from agent.loop import Task
+
+        now = time.time()
+        limit = max(1, int(settings.scheduled_dispatch_per_heartbeat))
+        try:
+            rows = await self._memory.scheduled_tasks_claim_due(now=now, limit=limit)
+        except Exception as exc:
+            log.warning("scheduled_dispatch_error", error=str(exc))
+            return
+        for row in rows:
+            meta = dict(row.get("metadata") or {})
+            meta["scheduled_task_id"] = row["id"]
+            task = Task(
+                content=row["prompt"],
+                source="scheduled",
+                author="scheduler",
+                metadata=meta,
+            )
+            await self._enqueue(task)
+            log.info("scheduled_task_enqueued", scheduled_task_id=row["id"][:8])
 
     async def _expire_waiting_tasks(self) -> None:
         if self._memory is None or not hasattr(self._memory, "list_waiting_task_records"):

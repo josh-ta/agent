@@ -28,6 +28,8 @@ import structlog
 
 from agent.config import settings
 from agent.events import bridge, ShellStartEvent, ShellOutputEvent, ShellDoneEvent
+from agent.metrics import Metrics
+from agent.tools.shell_policy import resolve_shell_cwd, validate_shell_command
 
 log = structlog.get_logger()
 
@@ -76,6 +78,8 @@ async def shell_run(
     working_dir: str | None = None,
     timeout: int = 120,
     tail_lines: int = 0,
+    *,
+    read_only: bool = False,
 ) -> str:
     """
     Execute a shell command and return combined stdout + stderr.
@@ -96,16 +100,17 @@ async def shell_run(
     Returns:
         Combined output string with exit code appended.
     """
-    if not working_dir:
-        cwd = settings.workspace_path
-        cwd.mkdir(parents=True, exist_ok=True)
-    else:
-        requested = Path(working_dir)
-        cwd = requested if requested.is_absolute() else settings.workspace_path / requested
-        if not cwd.exists():
-            return f"[ERROR: working_dir not found: {cwd}]"
-        if not cwd.is_dir():
-            return f"[ERROR: working_dir is not a directory: {cwd}]"
+    policy_err = validate_shell_command(command, read_only=read_only)
+    if policy_err is not None:
+        Metrics.inc_shell_blocked()
+        return policy_err
+
+    cwd, cwd_err = resolve_shell_cwd(working_dir, settings.workspace_path)
+    if cwd_err is not None:
+        Metrics.inc_shell_blocked()
+        return cwd_err
+    assert cwd is not None
+    cwd.mkdir(parents=True, exist_ok=True)
 
     remote_validation_error = _validate_remote_command(command)
     if remote_validation_error is not None:
