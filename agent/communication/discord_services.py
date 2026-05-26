@@ -755,6 +755,10 @@ class MessageHandlingService:
                 await self._agent_loop.enqueue(task)
                 result = await response_future
         finally:
+            if result is not None and not result.waiting_for_user and result.output:
+                finalize_reply = getattr(sink, "finalize_reply", None)
+                if finalize_reply is not None:
+                    await finalize_reply(result.output)  # type: ignore[misc]
             reply_delivered = getattr(sink, "reply_delivered", lambda: False)()
             self._session_state.pop_inject_queue(parsed.channel_id)
             self._session_state.pop_active_session(parsed.channel_id)

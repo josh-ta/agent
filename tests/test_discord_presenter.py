@@ -71,13 +71,29 @@ async def test_presenter_streams_text_deltas(fake_client, fake_message_factory, 
         session_state=DiscordSessionState(),
         reply_to=message,  # type: ignore[arg-type]
     )
-    await sink(TextDeltaEvent(delta="Hel"))
-    await sink(TextDeltaEvent(delta="lo"))
-    await sink(TextTurnEndEvent(text="Hello", is_final=True))
-    assert message.replies
-    final = message.reply_messages[0].edits[-1] if message.reply_messages[0].edits else message.reply_messages[0].content
-    assert "Hello" in final
+    await sink(TextDeltaEvent(delta="Hello! How can I assist "))
+    await sink(TextDeltaEvent(delta="you today? 😊"))
+    assert message.replies == []
+    await sink.finalize_reply("Hello! How can I assist you today? 😊")  # type: ignore[attr-defined]
+    assert message.replies == ["Hello! How can I assist you today? 😊"]
     assert sink.reply_delivered()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_presenter_keeps_longer_stream_buffer_on_short_final_turn(fake_client, fake_message_factory, discord_channels) -> None:
+    channel = FakeChannel(id=1)
+    message = fake_message_factory(channel=discord_channels["private"], content="hello")
+    presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
+    sink = presenter.make_sink(
+        channel,
+        debounce_seconds=0,
+        reply_to=message,  # type: ignore[arg-type]
+    )
+    await sink(TextDeltaEvent(delta="Hello! How can I assist "))
+    await sink(TextTurnEndEvent(text="you today? 😊", is_final=True))
+    assert message.replies[0] == "Hello! How can I assist"
+    await sink.finalize_reply("Hello! How can I assist you today? 😊")  # type: ignore[attr-defined]
+    assert message.reply_messages[0].edits[-1] == "Hello! How can I assist you today? 😊"
 
 
 @pytest.mark.asyncio

@@ -362,7 +362,6 @@ class DiscordEventPresenter:
 
             if isinstance(event, TextDeltaEvent):
                 reply_buffer += event.delta
-                await _update_reply(reply_buffer, final=False)
                 return
 
             if isinstance(event, ThinkingEndEvent):
@@ -376,7 +375,9 @@ class DiscordEventPresenter:
 
             if isinstance(event, TextTurnEndEvent):
                 if event.is_final and event.text:
-                    reply_buffer = event.text
+                    # PartEndEvent text can be a trailing segment only; keep the fuller buffer.
+                    if len(event.text.strip()) > len(reply_buffer.strip()):
+                        reply_buffer = event.text
                     await _update_reply(reply_buffer, final=True)
                 elif not event.is_final and event.text:
                     await status.handle_progress(event.text[:240])
@@ -413,8 +414,18 @@ class DiscordEventPresenter:
                 if channel_id is not None and session_state is not None:
                     session_state.clear_cancelling(channel_id)
 
+        async def finalize_reply(text: str) -> None:
+            """Apply the authoritative task output to the user-visible reply."""
+            nonlocal reply_buffer
+            cleaned = text.strip()
+            if not cleaned:
+                return
+            reply_buffer = cleaned
+            await _update_reply(reply_buffer, final=True)
+
         sink.finalize_status = status.finalize  # type: ignore[attr-defined]
         sink.mark_stopped = status.set_stopped  # type: ignore[attr-defined]
+        sink.finalize_reply = finalize_reply  # type: ignore[attr-defined]
         sink.reply_delivered = lambda: reply_delivered  # type: ignore[attr-defined]
         sink.reply_text = lambda: reply_buffer  # type: ignore[attr-defined]
         return sink
