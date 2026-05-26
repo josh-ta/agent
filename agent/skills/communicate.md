@@ -95,6 +95,19 @@ read_discord(DISCORD_BUS_CHANNEL_ID, limit=20)
 
 ## Checking Agent Status
 
+Use `/status` in your private channel for queue depth, active work, and current model tiers.
+
+## Runtime configuration (no redeploy)
+
+Change models and other safe settings from Discord without restarting the container:
+
+- `/config` — interactive wizard (pick a setting, then send the new value)
+- `/config AGENT_MODEL:claude-sonnet-4-5` — set directly
+- `/config list` — show current values
+- `/config cancel` — exit the wizard
+
+Model changes reload agents immediately for the next task. Overrides persist in `/data/runtime-overrides.json` across restarts.
+
 If Postgres is enabled:
 ```
 list_agents()

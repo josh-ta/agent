@@ -27,6 +27,7 @@ jobs:
           agent/communication
           agent/tools/web_search.py
           agent/tools/http_client.py
+          agent/runtime_config.py
           agent/config.py
 
       - name: Mypy
@@ -38,4 +39,5 @@ jobs:
           agent/communication/discord_constants.py
           agent/tools/web_search.py
           agent/tools/http_client.py
+          agent/runtime_config.py
           agent/config.py

@@ -10,6 +10,7 @@ First production-ready release focused on Discord reliability, core agent capabi
 - Streams final answers via `TextDeltaEvent` preview messages
 - Optional per-task threads in the private channel (`DISCORD_USE_TASK_THREADS`, default on)
 - Clearer cancel UX with `/force-cancel` and accurate cancellation feedback
+- **`/config` command** — change models and safe settings from Discord without redeploying
 - Restores pending Discord tasks on restart by default
 - Retries Discord sends on rate limits; surfaces delivery failures
 

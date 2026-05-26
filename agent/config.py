@@ -126,6 +126,10 @@ class Settings(BaseSettings):
         default=True,
         alias="RESTORE_PENDING_DISCORD_TASKS",
     )
+    runtime_overrides_path: Path = Field(
+        default=Path("/data/runtime-overrides.json"),
+        alias="RUNTIME_OVERRIDES_PATH",
+    )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # ── Permissions (CC-style) ────────────────────────────────────────────────

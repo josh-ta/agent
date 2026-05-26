@@ -17,6 +17,7 @@ def test_parse_native_command_force_cancel() -> None:
 def test_command_help_mentions_threads_and_force_cancel() -> None:
     text = command_help_text()
     assert "/force-cancel" in text
+    assert "/config" in text
 
 
 def test_discord_session_state_cancel_tracking() -> None:

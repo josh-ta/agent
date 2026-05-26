@@ -226,6 +226,7 @@ async def test_registered_slash_commands_route_expected_names(monkeypatch: pytes
         ("clear", ""),
         ("resume", ""),
         ("help", ""),
+        ("config", ""),
         ("queue", "do work"),
         ("replace", "do work"),
     ]

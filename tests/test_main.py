@@ -193,7 +193,7 @@ async def test_build_runtime_wires_sqlite_only(monkeypatch: pytest.MonkeyPatch, 
             calls.append(("register_all", (sqlite.__class__.__name__, postgres)))
 
     class _Loop:
-        def __init__(self, agents, *, memory_store, postgres_store) -> None:
+        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None) -> None:
             self.agents = agents
             self.memory_store = memory_store
             self.postgres_store = postgres_store
@@ -257,7 +257,7 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
             calls.append(("register_all", (sqlite.__class__.__name__, postgres.__class__.__name__)))
 
     class _Loop:
-        def __init__(self, agents, *, memory_store, postgres_store) -> None:
+        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None) -> None:
             self.agents = agents
             self.memory_store = memory_store
             self.postgres_store = postgres_store
@@ -314,7 +314,7 @@ async def test_build_runtime_restores_pending_tasks_when_supported(monkeypatch: 
             return None
 
     class _Loop:
-        def __init__(self, agents, *, memory_store, postgres_store) -> None:
+        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None) -> None:
             self.waiting = 0
             self.pending = 0
 

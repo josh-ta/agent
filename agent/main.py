@@ -125,7 +125,10 @@ async def _build_runtime(*, start_discord: bool) -> RuntimeServices:
     from agent.loop import AgentLoop
     from agent.memory.postgres_store import PostgresStore
     from agent.memory.sqlite_store import SQLiteStore
+    from agent.runtime_config import apply_stored_overrides
     from agent.tools.registry import ToolRegistry
+
+    apply_stored_overrides()
 
     sqlite = SQLiteStore(settings.sqlite_path)
     await sqlite.init()
@@ -146,7 +149,7 @@ async def _build_runtime(*, start_discord: bool) -> RuntimeServices:
     registry = ToolRegistry()
     registry.register_all(sqlite, postgres)
     agents = create_agents(registry)
-    loop = AgentLoop(agents, memory_store=sqlite, postgres_store=postgres)
+    loop = AgentLoop(agents, memory_store=sqlite, postgres_store=postgres, tool_registry=registry)
     await loop.restore_waiting_tasks()
     restored = 0
     if hasattr(loop, "restore_pending_tasks"):

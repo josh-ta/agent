@@ -52,6 +52,7 @@ def parse_native_command(content: str) -> NativeCommand | None:
         "memory",
         "remember",
         "unremember",
+        "config",
     }:
         return None
     return NativeCommand(name=name, argument=argument)
@@ -71,6 +72,8 @@ def command_help_text() -> str:
         "- `/clear` — drop queued tasks in this channel\n"
         "- `/resume` — repeat the current waiting question\n"
         "- `/forget` — discard the current task and queued stale work\n"
+        "- `/config` — change settings without redeploying (wizard)\n"
+        "- `/config KEY:VALUE` — set a runtime setting (e.g. `AGENT_MODEL:claude-sonnet-4-5`)\n"
         "- `/help` — show this help"
     )
 
@@ -110,6 +113,13 @@ class CommandHandler:
         if command.name == "memory":
             await self._service._reply_safe(message, render_project_memory())  # noqa: SLF001
             return True
+
+        if command.name == "config":
+            return await self._service._config.handle_command(  # noqa: SLF001
+                message=message,
+                parsed=parsed,
+                command=command,
+            )
 
         if command.name in {"remember", "unremember"} and not task_content.strip():
             await self._service._reply_safe(message, f"Usage: `/{command.name} <text>`")  # noqa: SLF001

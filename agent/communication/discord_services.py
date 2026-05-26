@@ -16,6 +16,7 @@ import structlog
 
 from agent.attachment_ingest import ingest_discord_attachments
 from agent.communication.discord_commands import CommandHandler, NativeCommand, parse_native_command
+from agent.communication.discord_config import ConfigCommandHandler
 from agent.communication.discord_constants import MAX_REPLY_LEN, allows_inline_reply
 from agent.communication.discord_presenter import DiscordEventPresenter
 from agent.communication.discord_session import DiscordSessionState
@@ -66,6 +67,7 @@ class MessageHandlingService:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._session_router = SessionRouter()
         self._commands = CommandHandler(self)
+        self._config = ConfigCommandHandler(self)
         self._bridge.register(self._waiting_sink_tag, self._make_waiting_prompt_sink())
 
     @property
@@ -466,6 +468,11 @@ class MessageHandlingService:
 
         if parsed.kind in {MessageKind.IGNORE, MessageKind.BUS}:
             return
+
+        if self._is_private_channel(parsed.channel_id) and self._config.has_wizard(parsed.channel_id):
+            handled = await self._config.maybe_handle_wizard(message, parsed)
+            if handled:
+                return
 
         raw_task_content = (
             a2a_to_task_content(parsed.a2a_payload)

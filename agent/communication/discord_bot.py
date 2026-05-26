@@ -129,6 +129,13 @@ class DiscordBot:
         async def help_cmd(interaction: discord.Interaction) -> None:
             await self._handle_slash_command(interaction, "help")
 
+        @self._tree.command(name="config", description="View or change runtime settings without redeploying")
+        @discord.app_commands.describe(
+            setting="Optional KEY:VALUE, e.g. AGENT_MODEL:claude-sonnet-4-5",
+        )
+        async def config_cmd(interaction: discord.Interaction, setting: str = "") -> None:
+            await self._handle_slash_command(interaction, "config", setting)
+
         @self._tree.command(name="queue", description="Queue a new task")
         @discord.app_commands.describe(task="Task to add to the back of the queue")
         async def queue(interaction: discord.Interaction, task: str) -> None:

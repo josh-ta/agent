@@ -150,9 +150,10 @@ class AgentLoop:
     has no knowledge of Discord or any other output channel.
     """
 
-    def __init__(self, agents: dict[str, Agent], memory_store: Any = None, postgres_store: Any = None) -> None:  # type: ignore[type-arg]
+    def __init__(self, agents: dict[str, Agent], memory_store: Any = None, postgres_store: Any = None, tool_registry: Any = None) -> None:  # type: ignore[type-arg]
         # agents dict: {"fast": Agent, "smart": Agent, "best": Agent}
         self.agents = agents
+        self._tool_registry = tool_registry
         # Fallback: if only one agent passed (legacy), use it for all tiers
         if isinstance(agents, Agent):  # type: ignore[arg-type]
             self.agents = {"fast": agents, "smart": agents, "best": agents}
@@ -197,6 +198,23 @@ class AgentLoop:
     def agent(self) -> Agent:  # type: ignore[type-arg]
         """Default agent (smart tier) — used by reflection passes."""
         return self.agents.get("smart") or next(iter(self.agents.values()))
+
+    def reload_agents(self) -> None:
+        """Rebuild tier agents after runtime model settings change."""
+        if self._tool_registry is None:
+            log.warning("agent_reload_skipped", reason="tool_registry_unavailable")
+            return
+        from agent.core import create_agents
+
+        self.agents = create_agents(self._tool_registry)
+        self._reflection_service._agents = self.agents
+        log.info(
+            "agents_reloaded",
+            fast=settings.model_fast,
+            smart=settings.model_smart,
+            best=settings.model_best,
+            default=settings.agent_model,
+        )
 
     async def enqueue(self, task: Task) -> None:
         """Add a task to the processing queue."""
