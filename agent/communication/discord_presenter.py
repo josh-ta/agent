@@ -16,8 +16,6 @@ from agent.communication.discord_constants import (
     SILENT_TOOLS,
     STATUS_EMBED_DEBOUNCE_SECONDS,
     escape_codeblock,
-    escape_md_italics,
-    format_args,
     summarize_tool_activity,
 )
 from agent.events import (
