@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 import structlog
 
+from agent.config import settings
 from agent.memory.sqlite_components import (
     SQLiteConversationRepository,
     SQLiteFeedbackRepository,
@@ -402,11 +403,12 @@ class SQLiteStore:
             await self._db.load_extension(sqlite_vec.loadable_path())
             await self._db.enable_load_extension(False)
             self._has_vec = True
+            dim = max(1, int(settings.embedding_dimensions))
             # Create vec0 virtual table for memory_facts embeddings
-            await self._db.execute("""
+            await self._db.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
                     fact_id INTEGER PRIMARY KEY,
-                    embedding float[1536]
+                    embedding float[{dim}]
                 )
             """)
             await self._db.commit()
@@ -1125,19 +1127,6 @@ class SQLiteStore:
 # ── Embedding helper (mirrors postgres_store pattern) ─────────────────────────
 
 async def _embed(text: str) -> list[float] | None:
-    """Generate an embedding via OpenAI. Returns None on any failure."""
-    from agent.config import settings
-    if not settings.has_embeddings:
-        return None
-    try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.secret_value(settings.openai_api_key))
-        resp = await client.embeddings.create(
-            model=settings.embedding_model,
-            input=text,
-            encoding_format="float",
-        )
-        return resp.data[0].embedding
-    except Exception as exc:
-        log.warning("sqlite_embed_failed", error=str(exc))
-        return None
+    from agent.embeddings import embed_text
+
+    return await embed_text(text)

@@ -22,8 +22,9 @@ class Settings(BaseSettings):
     mistral_api_key: SecretStr = Field(default=SecretStr(""), alias="MISTRAL_API_KEY")
     xai_api_key: SecretStr = Field(default=SecretStr(""), alias="XAI_API_KEY")
     agent_model: str = Field(default="claude-haiku-4-5", alias="AGENT_MODEL")
-    # Embedding model used for semantic memory search (requires OPENAI_API_KEY)
+    # Embedding model for semantic memory search (OpenAI or Ollama via OPENAI_BASE_URL)
     embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
+    embedding_dimensions: int = Field(default=1536, alias="EMBEDDING_DIMENSIONS")
     openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
     mistral_base_url: str = Field(default="https://api.mistral.ai/v1", alias="MISTRAL_BASE_URL")
     xai_base_url: str = Field(default="https://api.x.ai/v1", alias="XAI_BASE_URL")
@@ -208,8 +209,25 @@ class Settings(BaseSettings):
 
     @property
     def has_embeddings(self) -> bool:
-        """True when we can generate embeddings (needs OpenAI key)."""
+        """True when embeddings are configured for OpenAI or a compatible local server."""
+        if not self.embedding_model.strip():
+            return False
+        if self.openai_base_url.strip():
+            return True
         return bool(self.secret_value(self.openai_api_key))
+
+    @property
+    def uses_local_llm(self) -> bool:
+        return bool(self.openai_base_url.strip())
+
+    def openai_compatible_api_key(self) -> str:
+        """API key for OpenAI-compatible endpoints; Ollama accepts any non-empty placeholder."""
+        key = self.secret_value(self.openai_api_key)
+        if key:
+            return key
+        if self.openai_base_url.strip():
+            return "ollama"
+        return ""
 
     @staticmethod
     def secret_value(value: SecretStr | str) -> str:

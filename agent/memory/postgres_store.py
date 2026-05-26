@@ -34,21 +34,9 @@ log = structlog.get_logger()
 # ── Embeddings ────────────────────────────────────────────────────────────────
 
 async def _embed(text: str) -> list[float] | None:
-    """Generate an embedding vector via OpenAI.  Returns None on any failure."""
-    if not settings.has_embeddings:
-        return None
-    try:
-        from openai import AsyncOpenAI  # soft import — already a dep via pydantic-ai
-        client = AsyncOpenAI(api_key=settings.secret_value(settings.openai_api_key))
-        resp = await client.embeddings.create(
-            model=settings.embedding_model,
-            input=text,
-            encoding_format="float",
-        )
-        return resp.data[0].embedding
-    except Exception as exc:
-        log.warning("embedding_failed", error=str(exc))
-        return None
+    from agent.embeddings import embed_text
+
+    return await embed_text(text)
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────

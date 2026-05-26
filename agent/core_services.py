@@ -250,7 +250,7 @@ class ModelFactory:
             return self._build_openai_compatible_model(
                 model_string.split(":", 1)[1],
                 base_url=settings.openai_base_url,
-                api_key=settings.secret_value(settings.openai_api_key),
+                api_key=settings.openai_compatible_api_key(),
             )
         return model_string
 

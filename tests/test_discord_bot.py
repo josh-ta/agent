@@ -104,7 +104,7 @@ class _FakeResponse:
     def is_done(self) -> bool:
         return self._done
 
-    async def send_message(self, content: str) -> None:
+    async def send_message(self, content: str, **kwargs) -> None:
         self.sent.append(content)
         self._done = True
 
@@ -113,7 +113,7 @@ class _FakeFollowup:
     def __init__(self) -> None:
         self.sent: list[str] = []
 
-    async def send(self, content: str) -> None:
+    async def send(self, content: str, **kwargs) -> None:
         self.sent.append(content)
 
 
@@ -179,6 +179,56 @@ async def test_start_bot_handles_login_failure(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_handle_slash_command_rejects_non_private_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    bus_channel = _FakeChannel(999)
+    interaction = _FakeInteraction(bus_channel)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_agent_channel_id", 101)
+
+    await bot._handle_slash_command(interaction, "status")
+
+    assert interaction.response.sent
+    assert "private channel" in interaction.response.sent[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_handle_slash_command_reports_when_handler_produces_no_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    channel = _FakeChannel(101)
+    interaction = _FakeInteraction(channel)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_agent_channel_id", 101)
+
+    async def noop_handle_message(_message) -> None:
+        return None
+
+    monkeypatch.setattr(bot._messages, "handle_message", noop_handle_message)
+
+    await bot._handle_slash_command(interaction, "status")
+
+    assert interaction.response.sent
+    assert "did not produce a response" in interaction.response.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_slash_command_reports_handler_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    channel = _FakeChannel(101)
+    interaction = _FakeInteraction(channel)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_agent_channel_id", 101)
+
+    async def boom(_message) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bot._messages, "handle_message", boom)
+
+    await bot._handle_slash_command(interaction, "status")
+
+    assert interaction.response.sent == ["❌ Something went wrong handling that command."]
+
+
+@pytest.mark.asyncio
 async def test_handle_slash_command_routes_through_message_service(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
     channel = _FakeChannel(101)
@@ -190,6 +240,7 @@ async def test_handle_slash_command_routes_through_message_service(monkeypatch: 
         await message.reply("ok")
 
     monkeypatch.setattr(bot._messages, "handle_message", fake_handle_message)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_agent_channel_id", 101)
 
     await bot._handle_slash_command(interaction, "status")
 

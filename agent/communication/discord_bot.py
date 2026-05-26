@@ -169,9 +169,34 @@ class DiscordBot:
     ) -> None:
         if interaction.channel is None or interaction.user is None:
             return
+
+        async def _respond(text: str, *, ephemeral: bool = False) -> None:
+            response = interaction.response
+            if response is not None and hasattr(response, "is_done") and not response.is_done():
+                await response.send_message(text, ephemeral=ephemeral)  # type: ignore[arg-type]
+                return
+            followup = getattr(interaction, "followup", None)
+            if followup is not None:
+                await followup.send(text, ephemeral=ephemeral)  # type: ignore[arg-type]
+
+        if interaction.channel.id != settings.discord_agent_channel_id:
+            await _respond(
+                f"Use `/{name}` in <#{settings.discord_agent_channel_id}> — this agent's private channel.",
+                ephemeral=True,
+            )
+            return
+
         content = f"/{name} {argument}".strip()
         message = _SlashCommandMessage(interaction=interaction, content=content)
-        await self._messages.handle_message(message)  # type: ignore[arg-type]
+        try:
+            await self._messages.handle_message(message)  # type: ignore[arg-type]
+        except Exception:
+            log.warning("slash_command_failed", command=name, exc=traceback.format_exc())
+            await _respond("❌ Something went wrong handling that command.")
+            return
+
+        if not message.replies:
+            await _respond("💬 That command did not produce a response.")
 
     async def start_bot(self) -> None:
         """Connect to Discord and run the bot indefinitely."""

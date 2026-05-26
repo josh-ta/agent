@@ -1199,18 +1199,6 @@ class SQLiteMaintenance:
 
 
 async def embed_text(text: str) -> list[float] | None:
-    if not settings.has_embeddings:
-        return None
-    try:
-        from openai import AsyncOpenAI
+    from agent.embeddings import embed_text as _embed_text
 
-        client = AsyncOpenAI(api_key=settings.secret_value(settings.openai_api_key))
-        resp = await client.embeddings.create(
-            model=settings.embedding_model,
-            input=text,
-            encoding_format="float",
-        )
-        return resp.data[0].embedding
-    except Exception as exc:
-        log.warning("sqlite_embed_failed", error=str(exc))
-        return None
+    return await _embed_text(text)
