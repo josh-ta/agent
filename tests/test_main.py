@@ -193,7 +193,7 @@ async def test_build_runtime_wires_sqlite_only(monkeypatch: pytest.MonkeyPatch, 
             calls.append(("register_all", (sqlite.__class__.__name__, postgres)))
 
     class _Loop:
-        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None) -> None:
+        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None, chat_agent=None) -> None:
             self.agents = agents
             self.memory_store = memory_store
             self.postgres_store = postgres_store
@@ -207,6 +207,7 @@ async def test_build_runtime_wires_sqlite_only(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(sqlite_store_module, "SQLiteStore", _SQLiteStore)
     monkeypatch.setattr(registry_module, "ToolRegistry", _Registry)
     monkeypatch.setattr(core_module, "create_agents", lambda registry: {"fast": "agent", "registry": registry})
+    monkeypatch.setattr(core_module, "create_chat_agent", lambda: "chat-agent")
     monkeypatch.setattr(core_module, "set_postgres", lambda postgres: calls.append(("set_postgres", postgres)))
     monkeypatch.setattr(loop_module, "AgentLoop", _Loop)
     monkeypatch.setattr(discord_bot_module, "DiscordBot", lambda loop: ("bot", loop))
@@ -257,7 +258,7 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
             calls.append(("register_all", (sqlite.__class__.__name__, postgres.__class__.__name__)))
 
     class _Loop:
-        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None) -> None:
+        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None, chat_agent=None) -> None:
             self.agents = agents
             self.memory_store = memory_store
             self.postgres_store = postgres_store
@@ -277,6 +278,7 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(postgres_store_module, "PostgresStore", _PostgresStore)
     monkeypatch.setattr(registry_module, "ToolRegistry", _Registry)
     monkeypatch.setattr(core_module, "create_agents", lambda registry: {"smart": "agent", "registry": registry})
+    monkeypatch.setattr(core_module, "create_chat_agent", lambda: "chat-agent")
     monkeypatch.setattr(core_module, "set_postgres", lambda postgres: calls.append(("set_postgres", postgres.url)))
     monkeypatch.setattr(loop_module, "AgentLoop", _Loop)
     monkeypatch.setattr(discord_bot_module, "DiscordBot", _Bot)
@@ -314,7 +316,7 @@ async def test_build_runtime_restores_pending_tasks_when_supported(monkeypatch: 
             return None
 
     class _Loop:
-        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None) -> None:
+        def __init__(self, agents, *, memory_store, postgres_store, tool_registry=None, chat_agent=None) -> None:
             self.waiting = 0
             self.pending = 0
 
@@ -330,6 +332,7 @@ async def test_build_runtime_restores_pending_tasks_when_supported(monkeypatch: 
     monkeypatch.setattr(sqlite_store_module, "SQLiteStore", _SQLiteStore)
     monkeypatch.setattr(registry_module, "ToolRegistry", _Registry)
     monkeypatch.setattr(core_module, "create_agents", lambda registry: {"fast": "agent"})
+    monkeypatch.setattr(core_module, "create_chat_agent", lambda: "chat-agent")
     monkeypatch.setattr(loop_module, "AgentLoop", _Loop)
 
     runtime = await _build_runtime(start_discord=False)

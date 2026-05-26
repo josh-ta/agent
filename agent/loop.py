@@ -150,9 +150,17 @@ class AgentLoop:
     has no knowledge of Discord or any other output channel.
     """
 
-    def __init__(self, agents: dict[str, Agent], memory_store: Any = None, postgres_store: Any = None, tool_registry: Any = None) -> None:  # type: ignore[type-arg]
+    def __init__(
+        self,
+        agents: dict[str, Agent],
+        memory_store: Any = None,
+        postgres_store: Any = None,
+        tool_registry: Any = None,
+        chat_agent: Agent | None = None,
+    ) -> None:  # type: ignore[type-arg]
         # agents dict: {"fast": Agent, "smart": Agent, "best": Agent}
         self.agents = agents
+        self.chat_agent = chat_agent
         self._tool_registry = tool_registry
         # Fallback: if only one agent passed (legacy), use it for all tiers
         if isinstance(agents, Agent):  # type: ignore[arg-type]
@@ -204,9 +212,10 @@ class AgentLoop:
         if self._tool_registry is None:
             log.warning("agent_reload_skipped", reason="tool_registry_unavailable")
             return
-        from agent.core import create_agents
+        from agent.core import create_agents, create_chat_agent
 
         self.agents = create_agents(self._tool_registry)
+        self.chat_agent = create_chat_agent()
         self._reflection_service._agents = self.agents
         log.info(
             "agents_reloaded",
@@ -560,11 +569,29 @@ class AgentLoop:
         self._task_count += 1
         start = asyncio.get_running_loop().time()
 
-        # Parse user model override (/fast, /smart, /best) and classify tier
+        # Parse user model override (/fast, /smart, /best) and classify tier/mode
         content, forced_tier = _parse_override(task.content)
         tier = forced_tier or _classify_tier(content)
-        agent = self.agents.get(tier, self.agent)
-        task, tier, base_prompt = await self._context_builder.build(task)
+
+        from agent.task_router import classify_execution_mode
+
+        execution_mode = "agent"
+        if settings.auto_chat_routing:
+            execution_mode = classify_execution_mode(
+                content,
+                source=task.source,
+                metadata=task.metadata,
+            )
+
+        if execution_mode == "chat" and self.chat_agent is not None:
+            task, tier, base_prompt = await self._context_builder.build_chat(task)
+            agent = self.chat_agent
+        else:
+            task, tier, base_prompt = await self._context_builder.build(task)
+            agent = self.agents.get(tier, self.agent)
+            execution_mode = "agent"
+
+        task.metadata["execution_mode"] = execution_mode
         task_id = self.wait_registry.ensure_task_id(task.metadata)
         session_id = str(task.metadata.get("session_id", "")).strip()
         retrieved_memory_ids = [int(item) for item in task.metadata.get("retrieved_memory_ids", [])]
@@ -577,6 +604,7 @@ class AgentLoop:
             "task_start",
             n=self._task_count,
             tier=tier,
+            mode=execution_mode,
             forced=forced_tier is not None,
             source=task.source,
             author=task.author,
@@ -632,7 +660,8 @@ class AgentLoop:
                         task_id=task_id,
                         metadata={"author": task.author},
                     )
-                await self._maybe_promote_memory_fact(task=task)
+                if execution_mode == "agent":
+                    await self._maybe_promote_memory_fact(task=task)
             except Exception:
                 pass
 

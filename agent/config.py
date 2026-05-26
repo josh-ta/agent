@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # Defaults to False — set THINKING_ENABLED=true only when deep reasoning is needed.
     thinking_enabled: bool = Field(default=False, alias="THINKING_ENABLED")
     thinking_budget_tokens: int = Field(default=1000, alias="THINKING_BUDGET_TOKENS")
+    # Route short conversational Discord messages through a lightweight chat agent
+    # (no tools, tiny prompt) instead of the full tool-using agent stack.
+    auto_chat_routing: bool = Field(default=True, alias="AUTO_CHAT_ROUTING")
 
     # ── Identity ──────────────────────────────────────────────────────────────
     agent_name: str = Field(default="agent-1", alias="AGENT_NAME")

@@ -62,6 +62,38 @@ def create_agent(registry: ToolRegistry, model_string: str) -> Agent:  # type: i
     return agent
 
 
+def create_chat_agent() -> Agent:  # type: ignore[type-arg]
+    """Same Bob, lightweight turn — no tools, small prompt, recent session context."""
+    model_string = settings.model_string_for("fast")
+    model = _model_factory.build_model(model_string)
+    model_settings = _model_factory.model_settings(model_string)
+    name = settings.agent_name
+
+    agent: Agent = Agent(  # type: ignore[type-arg]
+        model=model,
+        model_settings=model_settings,
+        retries=1,
+    )
+
+    @agent.system_prompt
+    def _chat_system_prompt() -> str:
+        identity_path = settings.identity_path / "IDENTITY.md"
+        identity = ""
+        if identity_path.exists():
+            identity = identity_path.read_text(encoding="utf-8").strip()[:800]
+        if not identity:
+            identity = f"You are {name}, a helpful teammate in Discord."
+        return (
+            f"{identity}\n\n"
+            "This message is conversational — reply naturally and briefly (often one sentence).\n"
+            "Stay in character. Match the user's tone (greeting → greet back, thanks → acknowledge).\n"
+            "Do not run tools on this turn; the user will ask plainly when they want work done."
+        )
+
+    log.info("chat_agent_created", model=model_string)
+    return agent
+
+
 def create_agents(registry: ToolRegistry) -> dict[str, Agent]:  # type: ignore[type-arg]
     """Create fast/smart/best agent tiers, reusing the same MCP + tool registry."""
     tiers = {

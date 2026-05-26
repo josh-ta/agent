@@ -121,7 +121,7 @@ async def _run_once(task: str) -> None:
 
 async def _build_runtime(*, start_discord: bool) -> RuntimeServices:
     from agent.communication.discord_bot import DiscordBot
-    from agent.core import create_agents, set_postgres
+    from agent.core import create_agents, create_chat_agent, set_postgres
     from agent.loop import AgentLoop
     from agent.memory.postgres_store import PostgresStore
     from agent.memory.sqlite_store import SQLiteStore
@@ -149,7 +149,14 @@ async def _build_runtime(*, start_discord: bool) -> RuntimeServices:
     registry = ToolRegistry()
     registry.register_all(sqlite, postgres)
     agents = create_agents(registry)
-    loop = AgentLoop(agents, memory_store=sqlite, postgres_store=postgres, tool_registry=registry)
+    chat_agent = create_chat_agent()
+    loop = AgentLoop(
+        agents,
+        memory_store=sqlite,
+        postgres_store=postgres,
+        tool_registry=registry,
+        chat_agent=chat_agent,
+    )
     await loop.restore_waiting_tasks()
     restored = 0
     if hasattr(loop, "restore_pending_tasks"):

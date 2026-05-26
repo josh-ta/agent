@@ -190,6 +190,31 @@ class TaskContextBuilder:
         parts.append(normalized_task.content)
         return normalized_task, tier, "\n\n---\n\n".join(parts)
 
+    async def build_chat(self, task: "Task") -> tuple["Task", str, str]:
+        """Conversational turn: recent session + user message (no tools/memory search)."""
+        from agent.loop import Task as LoopTask
+        from agent.loop import _parse_override
+
+        content, forced_tier = _parse_override(task.content)
+        tier = forced_tier or "fast"
+        normalized_task = LoopTask(
+            content=content,
+            source=task.source,
+            author=task.author,
+            channel_id=task.channel_id,
+            message_id=task.message_id,
+            metadata=task.metadata,
+            created_at=task.created_at,
+            inject_queue=task.inject_queue,
+            response_future=task.response_future,
+        )
+        session_context = await self._load_session_context(normalized_task)
+        parts: list[str] = []
+        if session_context:
+            parts.append(session_context)
+        parts.append(normalized_task.content)
+        return normalized_task, tier, "\n\n---\n\n".join(parts)
+
     @staticmethod
     def _load_project_context() -> str:
         return load_project_memory()
