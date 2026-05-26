@@ -29,8 +29,9 @@ Do NOT call `send_discord` at the end to summarize — your final text response 
 | `#agent-comms` | Structured JSON task routing between agents (machine-readable) |
 | `#agent-bus` | Brief status announcements to all agents |
 
-**Only post to agent-comms and agent-bus.** Your thinking, tool calls, and progress
-streaming automatically appear in your private channel — never in comms or bus.
+**Only post to agent-comms and agent-bus.** Tool progress streams into a **task thread**
+(with a single status embed) when `DISCORD_USE_TASK_THREADS` is enabled. Your final answer
+appears in the private channel with a live preview while generating.
 `#agent-comms` is raw JSON only: no plain-text replies, no queue notices, and no receipt acks.
 
 ## Sending a Task to Another Agent

@@ -22,7 +22,6 @@ services:
       - ./agent/skills:/app/agent/skills          # Editable skills (survives image rebuild)
       - ./agent/identity:/app/agent/identity      # Editable identity
       - ~/.ssh:/root/.ssh:ro                      # SSH key for GitHub (read-only)
-      - /var/run/docker.sock:/var/run/docker.sock # Self-restart capability
     depends_on:
       browser:
         condition: service_healthy
@@ -37,6 +36,20 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+
+  agent-self-restart:
+    extends:
+      service: agent
+    container_name: ${AGENT_NAME:-agent-1}-self-restart
+    profiles:
+      - self-restart
+    volumes:
+      - agent_data:/data
+      - ./workspace:/workspace
+      - ./agent/skills:/app/agent/skills
+      - ./agent/identity:/app/agent/identity
+      - ~/.ssh:/root/.ssh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
 
   # ─── Browser Sidecar (Playwright MCP + noVNC) ─────────────────────────────
   browser:

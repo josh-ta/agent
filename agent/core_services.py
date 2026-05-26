@@ -205,7 +205,33 @@ class ModelFactory:
                 servers.append(MCPServerHTTP(url=settings.browser_mcp_url))
             except Exception as exc:
                 log.warning("browser_mcp_unavailable", error=str(exc))
+        for name, url in self._extra_mcp_servers().items():
+            try:
+                servers.append(MCPServerHTTP(url=url))
+            except Exception as exc:
+                log.warning("mcp_server_unavailable", name=name, error=str(exc))
         return servers
+
+    @staticmethod
+    def _extra_mcp_servers() -> dict[str, str]:
+        raw = settings.mcp_servers_json.strip()
+        if not raw:
+            return {}
+        try:
+            import json
+
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            log.warning("mcp_servers_json_invalid", error=str(exc))
+            return {}
+        if not isinstance(parsed, dict):
+            log.warning("mcp_servers_json_invalid", error="expected JSON object")
+            return {}
+        out: dict[str, str] = {}
+        for key, value in parsed.items():
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                out[key] = value.strip()
+        return out
 
     def build_model(self, model_string: str) -> str | OpenAIChatModel:
         if model_string.startswith("xai:"):

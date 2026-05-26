@@ -248,6 +248,8 @@ Agents communicate by posting JSON in `#agent-comms`:
 
 ## Architecture
 
+See [docs/architecture.md](docs/architecture.md) for event flow, Discord threading/streaming model, control plane auth, and deployment topology.
+
 ```
 VPS (Docker host)
 ├── agent container        ← Python + your configured model provider(s)

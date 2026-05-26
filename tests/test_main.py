@@ -268,8 +268,9 @@ async def test_build_runtime_wires_postgres_and_bot(monkeypatch: pytest.MonkeyPa
             return 0
 
     class _Bot:
-        def __init__(self, loop) -> None:
+        def __init__(self, loop, **kwargs) -> None:
             self.loop = loop
+            self.restored_task_count = kwargs.get("restored_task_count", 0)
 
     monkeypatch.setattr(settings, "postgres_url", "postgresql://example")
     monkeypatch.setattr(sqlite_store_module, "SQLiteStore", _SQLiteStore)

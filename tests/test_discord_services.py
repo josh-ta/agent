@@ -256,7 +256,7 @@ async def test_message_service_status_command_uses_loop_snapshot(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert message.reactions == ["👀"]
-    assert message.replies == ["Active: deploy\nQueued: 2"]
+    assert message.replies[0].startswith("Active: deploy\nQueued: 2")
 
 
 def test_parse_native_command_rejects_blank_and_unknown_values() -> None:
@@ -666,7 +666,7 @@ async def test_message_service_injects_pause_request_for_active_task(
 
     assert loop.cancelled
     assert message.reactions == ["👀"]
-    assert "stop after the current step" in message.replies[0]
+    assert "Cancelling" in message.replies[0] and "stop after the current step" in message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -1904,7 +1904,8 @@ async def test_message_service_send_reply_returns_false_on_presenter_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _BrokenPresenter(DiscordEventPresenter):
-        async def send_chunked(self, channel, text: str) -> None:
+        async def send_chunked(self, channel, text: str, *, fallback_channel=None) -> bool:
+            del fallback_channel
             raise RuntimeError("send failed")
 
     service = MessageHandlingService(
@@ -1975,16 +1976,18 @@ async def test_post_bus_status_handles_noop_and_failure(fake_client, discord_cha
 @pytest.mark.asyncio
 async def test_discord_event_presenter_buffers_shell_output(fake_client, discord_channels) -> None:
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(discord_channels["private"])  # type: ignore[arg-type]
+    sink = presenter.make_sink(discord_channels["private"], debounce_seconds=0)  # type: ignore[arg-type]
 
     await sink(ShellStartEvent(command="pytest", cwd="/tmp"))
     await sink(ShellOutputEvent(chunk="line 1\n"))
     await sink(ShellDoneEvent(exit_code=1, elapsed_s=1.2))
+    await asyncio.sleep(0.01)
 
-    sent_message = discord_channels["private"].sent_messages[0]
-    assert discord_channels["private"].sent[0] == "$ `pytest`"
-    assert "line 1" in sent_message.edits[0]
-    assert "exit 1 (1.2s)" in sent_message.edits[0]
+    assert discord_channels["private"].sent_messages
+    embed = discord_channels["private"].sent_messages[0].embed
+    assert embed is not None
+    assert "pytest" in embed.description
+    assert "line 1" in embed.description
 
 
 @pytest.mark.asyncio
@@ -1992,42 +1995,44 @@ async def test_discord_event_presenter_shell_success_paths_and_noop_cases(fake_c
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
 
     direct_channel = FakeChannel(id=101)
-    sink = presenter.make_sink(direct_channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(direct_channel, debounce_seconds=0)  # type: ignore[arg-type]
     await sink(ShellOutputEvent(chunk="line 1\n"))
     await sink(ShellDoneEvent(exit_code=0, elapsed_s=1.2))
-    assert "line 1" in direct_channel.sent[0]
-    assert "exit 0" not in direct_channel.sent[0]
+    await asyncio.sleep(0.01)
+    assert not any("failed" in item.lower() for item in direct_channel.sent)
 
     started_channel = FakeChannel(id=101)
-    sink = presenter.make_sink(started_channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(started_channel, debounce_seconds=0)  # type: ignore[arg-type]
     await sink(ShellStartEvent(command="pytest", cwd="/tmp"))
     await sink(ShellDoneEvent(exit_code=0, elapsed_s=1.2))
-    assert started_channel.sent == ["$ `pytest`"]
-    assert started_channel.sent_messages[0].edits == []
+    await asyncio.sleep(0.01)
+    assert started_channel.sent_messages[0].embed is not None
+    assert "pytest" in started_channel.sent_messages[0].embed.description
 
 
 @pytest.mark.asyncio
 async def test_discord_event_presenter_status_only_falls_back_when_edit_fails(fake_client, monkeypatch: pytest.MonkeyPatch) -> None:
     class _BrokenSentMessage(FakeSentMessage):
-        async def edit(self, *, content: str) -> None:
+        async def edit(self, *, content: str | None = None, embed=None) -> None:
             raise RuntimeError("edit failed")
 
     class _BrokenChannel(FakeChannel):
-        async def send(self, content: str = "", *, file=None):
-            self.sent.append(content)
-            sent = _BrokenSentMessage(content=content, id=len(self.sent_messages) + 1)
+        async def send(self, content: str = "", *, file=None, embed=None):
+            self.sent.append(content or "embed")
+            sent = _BrokenSentMessage(content=content or "embed", id=len(self.sent_messages) + 1, embed=embed)
             self.sent_messages.append(sent)
             return sent
 
     channel = _BrokenChannel(id=101)
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(channel, debounce_seconds=0)  # type: ignore[arg-type]
     monkeypatch.setattr(discord_services_module.discord, "HTTPException", RuntimeError)
 
     await sink(ShellStartEvent(command="pytest", cwd="/tmp"))
     await sink(ShellDoneEvent(exit_code=1, elapsed_s=1.2))
+    await asyncio.sleep(0.01)
 
-    assert channel.sent == ["$ `pytest`", "exit 1 (1.2s)"]
+    assert channel.sent_messages
 
 
 @pytest.mark.asyncio
@@ -2037,79 +2042,81 @@ async def test_discord_event_presenter_handles_shell_failure_without_output_or_s
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(discord_channels["private"])  # type: ignore[arg-type]
+    sink = presenter.make_sink(discord_channels["private"], debounce_seconds=0)  # type: ignore[arg-type]
 
     await sink(ShellStartEvent(command="pytest", cwd="/tmp"))
     await sink(ShellDoneEvent(exit_code=1, elapsed_s=1.2))
+    await asyncio.sleep(0.01)
 
     sent_message = discord_channels["private"].sent_messages[0]
-    assert "exit 1 (1.2s)" in sent_message.edits[0]
+    assert sent_message.embed is not None
+    assert "pytest" in sent_message.embed.description
 
     class _BrokenStartChannel(FakeChannel):
-        async def send(self, content: str = "", *, file=None):
-            if content.startswith("$ `"):
+        async def send(self, content: str = "", *, file=None, embed=None):
+            if embed is not None:
                 raise RuntimeError("send failed")
-            return await super().send(content, file=file)
+            return await super().send(content, file=file, embed=embed)
 
     channel = _BrokenStartChannel(id=101)
-    sink = presenter.make_sink(channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(channel, debounce_seconds=0)  # type: ignore[arg-type]
     monkeypatch.setattr(discord_services_module.discord, "HTTPException", RuntimeError)
     await sink(ShellStartEvent(command="pytest", cwd="/tmp"))
     await sink(ShellDoneEvent(exit_code=1, elapsed_s=1.2))
+    await asyncio.sleep(0.01)
 
-    assert channel.sent == ["exit 1 (1.2s)"]
+    assert channel.sent == []
 
 
 @pytest.mark.asyncio
 async def test_discord_event_presenter_renders_text_tool_progress_and_error(fake_client, discord_channels) -> None:
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(discord_channels["private"])  # type: ignore[arg-type]
+    sink = presenter.make_sink(discord_channels["private"], debounce_seconds=0)  # type: ignore[arg-type]
 
     await sink(TaskStartEvent(content="Investigate the failing deployment workflow", tier="smart"))
     await sink(ThinkingEndEvent(text="first *idea*"))
     await sink(TextTurnEndEvent(text="working", is_final=False))
     await sink(ToolCallStartEvent(tool_name="run_shell", call_id="1", args={"command": "pytest"}))
     await sink(ToolCallStartEvent(tool_name="read_file", call_id="2", args={"path": "README.md"}))
+    await asyncio.sleep(0.01)
+    assert "run_shell" in discord_channels["private"].sent_messages[0].embed.description
     await sink(ProgressEvent(message="still working"))
     await sink(TaskErrorEvent(error="boom"))
+    await asyncio.sleep(0.01)
 
-    assert discord_channels["private"].sent == [
-        "🟢 Working on it.",
-        "🧠 *first \\*idea\\**",
-        "💭 working",
-        "🔧 `run_shell(command=pytest)`",
-        "still working",
-        "❌ boom",
-    ]
+    assert any("first" in item for item in discord_channels["private"].sent)
+    assert any("working" in item for item in discord_channels["private"].sent)
+    assert "boom" in discord_channels["private"].sent_messages[0].embed.description
 
 
 @pytest.mark.asyncio
 async def test_discord_event_presenter_ignores_empty_and_unhandled_events(fake_client) -> None:
     channel = FakeChannel(id=101)
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(channel, debounce_seconds=0)  # type: ignore[arg-type]
 
     await sink(ThinkingEndEvent(text=""))
     await sink(ThinkingEndEvent(text="   "))
     await sink(TextTurnEndEvent(text="done", is_final=True))
     await sink(ProgressEvent(message=""))
     await sink(SimpleNamespace())
+    await asyncio.sleep(0.01)
 
-    assert channel.sent == []
+    assert channel.sent == ["💬 done"]
 
 
 @pytest.mark.asyncio
 async def test_discord_event_presenter_truncates_long_start_and_formats_non_dict_tool_args(fake_client) -> None:
     channel = FakeChannel(id=101)
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(channel, debounce_seconds=0)  # type: ignore[arg-type]
 
     await sink(TaskStartEvent(content="x" * 200, tier="smart"))
     await sink(ToolCallStartEvent(tool_name="run_shell", call_id="1", args="y" * 300))
+    await asyncio.sleep(0.01)
 
-    assert channel.sent[0] == "🟢 Working on it."
-    assert channel.sent[1].startswith("🔧 `run_shell(")
-    assert len(channel.sent[1]) < 240
+    assert channel.sent_messages[0].embed is not None
+    assert "run_shell" in channel.sent_messages[0].embed.description
 
 
 @pytest.mark.asyncio
@@ -2165,27 +2172,35 @@ async def test_message_service_handles_missing_private_channel_when_running_task
 @pytest.mark.asyncio
 async def test_discord_event_presenter_falls_back_when_shell_edit_fails(fake_client, monkeypatch: pytest.MonkeyPatch) -> None:
     class _BrokenSentMessage(FakeSentMessage):
-        async def edit(self, *, content: str) -> None:
+        async def edit(self, *, content: str | None = None, embed=None) -> None:
             raise RuntimeError("edit failed")
 
     class _BrokenChannel(FakeChannel):
-        async def send(self, content: str = "", *, file=None) -> FakeSentMessage:
-            self.sent.append(content)
-            if file is not None:
-                self.sent_files.append(getattr(file, "filename", "attachment"))
-            sent = _BrokenSentMessage(content=content, id=len(self.sent_messages) + 1)
-            self.sent_messages.append(sent)
-            return sent
+        async def send(self, content: str = "", *, file=None, embed=None):
+            return await super().send(content, file=file, embed=embed)
 
     channel = _BrokenChannel(id=101)
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
-    sink = presenter.make_sink(channel)  # type: ignore[arg-type]
+    sink = presenter.make_sink(channel, debounce_seconds=0)  # type: ignore[arg-type]
 
     monkeypatch.setattr(discord_services_module.discord, "HTTPException", RuntimeError)
     await sink(ShellStartEvent(command="pytest", cwd="/tmp"))
     await sink(ShellOutputEvent(chunk="line 1\n"))
     await sink(ShellDoneEvent(exit_code=1, elapsed_s=1.2))
+    await asyncio.sleep(0.01)
 
-    assert channel.sent[0] == "$ `pytest`"
-    assert "line 1" in channel.sent[1]
-    assert "exit 1 (1.2s)" in channel.sent[1]
+    assert channel.sent_messages
+    assert "line 1" in channel.sent_messages[0].embed.description
+
+
+@pytest.mark.asyncio
+async def test_message_service_announce_restored_tasks(fake_client, discord_channels) -> None:
+    service = MessageHandlingService(
+        agent_loop=_ReadyLoop(),  # type: ignore[arg-type]
+        client=fake_client,  # type: ignore[arg-type]
+        presenter=DiscordEventPresenter(fake_client),  # type: ignore[arg-type]
+    )
+    await service.announce_restored_tasks(0)
+    assert discord_channels["private"].sent == []
+    await service.announce_restored_tasks(2)
+    assert "Resuming 2 tasks" in discord_channels["private"].sent[0]

@@ -38,10 +38,16 @@ class FakeSentMessage:
     content: str
     id: int = 1
     edits: list[str] = field(default_factory=list)
+    embed: Any = None
+    embed_edits: list[Any] = field(default_factory=list)
 
-    async def edit(self, *, content: str) -> None:
-        self.content = content
-        self.edits.append(content)
+    async def edit(self, *, content: str | None = None, embed: Any = None) -> None:
+        if content is not None:
+            self.content = content
+            self.edits.append(content)
+        if embed is not None:
+            self.embed = embed
+            self.embed_edits.append(embed)
 
 
 @dataclass
@@ -77,11 +83,15 @@ class FakeChannel:
     def typing(self) -> NullAsyncContext:
         return NullAsyncContext()
 
-    async def send(self, content: str = "", *, file=None) -> FakeSentMessage:
-        self.sent.append(content)
+    async def send(self, content: str = "", *, file=None, embed=None) -> FakeSentMessage:
+        if embed is not None:
+            label = getattr(embed, "description", None) or getattr(embed, "title", None) or "embed"
+            self.sent.append(str(label))
+        else:
+            self.sent.append(content)
         if file is not None:
             self.sent_files.append(getattr(file, "filename", "attachment"))
-        sent = FakeSentMessage(content=content, id=len(self.sent_messages) + 1)
+        sent = FakeSentMessage(content=content if embed is None else str(label), id=len(self.sent_messages) + 1, embed=embed)
         self.sent_messages.append(sent)
         return sent
 

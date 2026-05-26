@@ -148,9 +148,10 @@ async def _build_runtime(*, start_discord: bool) -> RuntimeServices:
     agents = create_agents(registry)
     loop = AgentLoop(agents, memory_store=sqlite, postgres_store=postgres)
     await loop.restore_waiting_tasks()
+    restored = 0
     if hasattr(loop, "restore_pending_tasks"):
-        await loop.restore_pending_tasks()
-    bot = DiscordBot(loop) if start_discord else None
+        restored = await loop.restore_pending_tasks()
+    bot = DiscordBot(loop, restored_task_count=restored) if start_discord else None
     return RuntimeServices(sqlite=sqlite, postgres=postgres, loop=loop, bot=bot)
 
 

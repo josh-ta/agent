@@ -492,3 +492,99 @@ def search_files(
         return "[ERROR: search timed out after 30s — narrow the search path or pattern]"
     except Exception as exc:
         return f"[ERROR: {exc}]"
+
+
+def apply_patch(path: str, patch: str) -> str:
+    """Apply a unified diff patch to a single file."""
+    if not patch.strip():
+        return "[ERROR: patch is empty]"
+    try:
+        resolved = _safe_path(path)
+    except PermissionError as exc:
+        return str(exc)
+    if not resolved.exists():
+        return f"[ERROR: file not found: {path}]"
+
+    original = resolved.read_text(encoding="utf-8")
+    updated, err = _apply_unified_patch(original, patch)
+    if err:
+        return err
+    resolved.write_text(updated, encoding="utf-8")
+    log.info("apply_patch", path=str(resolved))
+    return f"Patched {resolved} ({len(patch)} chars of diff)."
+
+
+def _apply_unified_patch(original: str, patch: str) -> tuple[str, str | None]:
+    import re
+
+    if "<<<<<<<" in patch and "=======" in patch and ">>>>>>>" in patch:
+        return _apply_conflict_markers(original, patch)
+
+    lines = patch.splitlines()
+    file_lines = original.splitlines(keepends=True)
+    if original and not original.endswith("\n"):
+        file_lines = [line + "\n" for line in original.splitlines()]
+    out: list[str] = []
+    idx = 0
+    hunk_header = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("@@"):
+            i += 1
+            continue
+        match = hunk_header.match(line)
+        if not match:
+            return original, f"[ERROR: invalid hunk header: {line}]"
+        old_start = int(match.group(1)) - 1
+        while idx < old_start:
+            if idx >= len(file_lines):
+                return original, f"[ERROR: patch starts beyond file end at line {old_start + 1}]"
+            out.append(file_lines[idx])
+            idx += 1
+        i += 1
+        while i < len(lines) and not lines[i].startswith("@@"):
+            hline = lines[i]
+            if hline.startswith(" "):
+                if idx >= len(file_lines):
+                    return original, "[ERROR: patch extends beyond file end]"
+                out.append(file_lines[idx])
+                idx += 1
+            elif hline.startswith("-"):
+                if idx >= len(file_lines):
+                    return original, "[ERROR: delete beyond file end]"
+                if file_lines[idx].rstrip("\n") != hline[1:].rstrip("\n"):
+                    return original, f"[ERROR: delete mismatch at line {idx + 1}]"
+                idx += 1
+            elif hline.startswith("+"):
+                addition = hline[1:]
+                if not addition.endswith("\n"):
+                    addition += "\n"
+                out.append(addition)
+            elif hline.startswith("\\"):
+                pass
+            else:
+                return original, f"[ERROR: invalid patch line: {hline}]"
+            i += 1
+    out.extend(file_lines[idx:])
+    if not out and patch.strip():
+        return original, "[ERROR: unsupported patch format — use unified diff or conflict markers]"
+    if idx == 0 and not any(line.startswith("@@") for line in lines) and "<<<<<<<" not in patch:
+        return original, "[ERROR: unsupported patch format — use unified diff or conflict markers]"
+    return "".join(out), None
+
+
+def _apply_conflict_markers(original: str, patch: str) -> tuple[str, str | None]:
+    marker_old = "<<<<<<<"
+    marker_sep = "======="
+    marker_new = ">>>>>>>"
+    before, rest = patch.split(marker_old, 1)
+    old_part, rest2 = rest.split(marker_sep, 1)
+    new_part, after = rest2.split(marker_new, 1)
+    needle = old_part.strip("\n")
+    if needle not in original:
+        return original, "[ERROR: patch old block not found in file]"
+    updated = original.replace(needle, new_part.strip("\n"), 1)
+    if before or after:
+        updated = before + updated + after
+    return updated, None

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version as package_version
-from typing import Any, AsyncIterator, Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, Query, Request, status
@@ -17,10 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent.config import settings
 from agent.events import AgentEvent, TaskQueuedEvent, bridge
-from agent.metrics import prometheus_text
 from agent.loop import Task
+from agent.metrics import prometheus_text
 from agent.session_router import SessionRouter
-
 
 TaskState = Literal["queued", "running", "waiting_for_user", "succeeded", "failed"]
 ErrorCode = Literal[
@@ -244,6 +244,26 @@ def create_app(
         description="Minimal FastAPI control plane for submitting tasks and streaming task events.",
         lifespan=lifespan,
     )
+
+    _PUBLIC_PATHS = {"/healthz", "/readyz", "/metrics"}
+
+    @app.middleware("http")
+    async def control_plane_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
+        if request.url.path in _PUBLIC_PATHS:
+            return await call_next(request)
+        expected = settings.secret_value(settings.control_plane_api_key)
+        if expected:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {expected}":
+                payload = ErrorResponse(
+                    error_code="invalid_request",
+                    message="Unauthorized.",
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content=payload.model_dump(mode="json"),
+                )
+        return await call_next(request)
 
     @app.exception_handler(ApiError)
     async def handle_api_error(_request: Request, exc: ApiError) -> JSONResponse:

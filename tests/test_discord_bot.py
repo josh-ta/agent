@@ -221,6 +221,7 @@ async def test_registered_slash_commands_route_expected_names(monkeypatch: pytes
         ("remember", "do work"),
         ("unremember", "do work"),
         ("cancel", ""),
+        ("force-cancel", ""),
         ("forget", ""),
         ("clear", ""),
         ("resume", ""),
@@ -514,6 +515,9 @@ async def test_setup_events_registers_handlers_and_routes_callbacks(monkeypatch:
     bot._announce_online = _announce_online  # type: ignore[assignment]
     bot._handle_message = _handle_message  # type: ignore[assignment]
     bot._sync_app_commands = _sync_app_commands  # type: ignore[assignment]
+    bot._warn_missing_guild_id = lambda: asyncio.sleep(0)  # type: ignore[assignment]
+    bot._restored_task_count = 0
+    bot.announce_restored_tasks = lambda count: asyncio.sleep(0)  # type: ignore[assignment]
 
     warnings: list[str] = []
     infos: list[str] = []
@@ -532,3 +536,48 @@ async def test_setup_events_registers_handlers_and_routes_callbacks(monkeypatch:
     assert seen == [("sync", None), ("ready", None), ("message", 7)]
     assert infos == ["discord_ready", "discord_resumed"]
     assert warnings == ["discord_disconnected"]
+
+
+@pytest.mark.asyncio
+async def test_warn_missing_guild_id_posts_setup_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop(), restored_task_count=0)  # type: ignore[arg-type]
+    channel = _FakeChannel(101)
+    bot._client = SimpleNamespace(get_channel=lambda _cid: channel)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_guild_id", None)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_agent_channel_id", 101)
+
+    await bot._warn_missing_guild_id()
+
+    assert channel.sent
+    assert "DISCORD_GUILD_ID" in channel.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_on_ready_announces_restored_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = object.__new__(DiscordBot)
+    bot._client = _EventClient()
+    bot._restored_task_count = 3
+    restored: list[int] = []
+
+    async def _sync_app_commands() -> None:
+        return None
+
+    async def _announce_online() -> None:
+        return None
+
+    async def _warn_missing_guild_id() -> None:
+        return None
+
+    async def announce_restored_tasks(count: int) -> None:
+        restored.append(count)
+
+    bot._sync_app_commands = _sync_app_commands  # type: ignore[assignment]
+    bot._announce_online = _announce_online  # type: ignore[assignment]
+    bot._warn_missing_guild_id = _warn_missing_guild_id  # type: ignore[assignment]
+    bot.announce_restored_tasks = announce_restored_tasks  # type: ignore[assignment]
+    bot._handle_message = lambda _message: asyncio.sleep(0)  # type: ignore[assignment]
+    bot._setup_events()
+
+    await bot._client.handlers["on_ready"]()
+
+    assert restored == [3]

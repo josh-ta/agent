@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     curl \
     ca-certificates \
+    gosu \
     docker.io \
     gnupg \
     && mkdir -p /etc/apt/keyrings \
@@ -29,6 +30,9 @@ RUN pip install --no-cache-dir -e .
 
 # Create data/workspace directories (container runs as root — simplest for bind mounts)
 RUN mkdir -p /data /workspace
+
+RUN groupadd -r agent && useradd -r -g agent -d /app -s /bin/bash agent \
+    && chown -R agent:agent /app /data /workspace
 
 # Entrypoint wrapper: configures git identity + gh auth at runtime from env vars
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh

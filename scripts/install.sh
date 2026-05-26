@@ -422,6 +422,30 @@ configure_env() {
         "$(current_val DISCORD_COMMS_CHANNEL_ID)"
 
     echo ""
+    echo -e "${CYAN}── Agent 1.0 settings (optional) ───────────────────${NC}"
+    prompt_var "DISCORD_USE_TASK_THREADS" \
+        "Route task detail to per-task threads (true/false)" \
+        "$(current_val DISCORD_USE_TASK_THREADS)"
+    prompt_var "RESTORE_PENDING_DISCORD_TASKS" \
+        "Restore queued Discord tasks after restart (true/false)" \
+        "$(current_val RESTORE_PENDING_DISCORD_TASKS)"
+    prompt_var "CONTROL_PLANE_API_KEY" \
+        "Bearer token for /tasks and SSE (leave blank to disable auth)" \
+        "$(current_val CONTROL_PLANE_API_KEY)" 1
+    prompt_var "WEB_SEARCH_PROVIDER" \
+        "Web search provider (tavily or brave)" \
+        "$(current_val WEB_SEARCH_PROVIDER)"
+    prompt_var "WEB_SEARCH_API_KEY" \
+        "Web search API key" \
+        "$(current_val WEB_SEARCH_API_KEY)" 1
+    prompt_var "HTTP_ALLOWED_HOSTS" \
+        "Comma-separated hosts allowed for http_request tool" \
+        "$(current_val HTTP_ALLOWED_HOSTS)"
+    prompt_var "MCP_SERVERS" \
+        "Extra MCP sidecars as JSON, e.g. {\"notes\":[\"http://notes:8080/sse\"]}" \
+        "$(current_val MCP_SERVERS)"
+
+    echo ""
     success "Configuration saved to .env"
 }
 

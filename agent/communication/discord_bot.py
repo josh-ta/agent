@@ -18,7 +18,6 @@ import structlog
 
 from agent.communication.discord_services import (
     DiscordEventPresenter,
-    MAX_REPLY_LEN,
     MessageHandlingService,
 )
 from agent.config import settings
@@ -32,8 +31,9 @@ log = structlog.get_logger()
 class DiscordBot:
     """Wraps a discord.py Client and connects it to the AgentLoop."""
 
-    def __init__(self, loop: AgentLoop) -> None:
+    def __init__(self, loop: AgentLoop, *, restored_task_count: int = 0) -> None:
         self._agent_loop = loop
+        self._restored_task_count = restored_task_count
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -68,6 +68,9 @@ class DiscordBot:
             )
             await self._sync_app_commands()
             await self._announce_online()
+            await self._warn_missing_guild_id()
+            if self._restored_task_count > 0:
+                await self.announce_restored_tasks(self._restored_task_count)
 
         @client.event
         async def on_message(message: discord.Message) -> None:
@@ -105,6 +108,10 @@ class DiscordBot:
         @self._tree.command(name="cancel", description="Cancel the current task after the next safe step")
         async def cancel(interaction: discord.Interaction) -> None:
             await self._handle_slash_command(interaction, "cancel")
+
+        @self._tree.command(name="force-cancel", description="Request immediate stop after the current safe step")
+        async def force_cancel(interaction: discord.Interaction) -> None:
+            await self._handle_slash_command(interaction, "force-cancel")
 
         @self._tree.command(name="forget", description="Discard the current task and queued stale work")
         async def forget(interaction: discord.Interaction) -> None:
@@ -198,6 +205,23 @@ class DiscordBot:
 
     def _make_discord_sink(self, channel: discord.abc.Messageable):  # type: ignore[return]
         return self._presenter.make_sink(channel)
+
+    async def _warn_missing_guild_id(self) -> None:
+        if settings.discord_guild_id or not settings.discord_agent_channel_id:
+            return
+        channel = self._client.get_channel(settings.discord_agent_channel_id)
+        if channel is None:
+            return
+        try:
+            await channel.send(  # type: ignore[union-attr]
+                "⚠️ `DISCORD_GUILD_ID` is not set — slash commands may sync slowly or fail. "
+                "Set it in `.env` for reliable command registration."
+            )
+        except discord.HTTPException as exc:
+            log.warning("guild_warning_failed", error=str(exc))
+
+    async def announce_restored_tasks(self, count: int) -> None:
+        await self._messages.announce_restored_tasks(count)
 
     async def _announce_online(self) -> None:
         """Post an online announcement to the bus channel."""

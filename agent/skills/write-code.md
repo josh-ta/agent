@@ -7,8 +7,8 @@ Use this skill when asked to write, debug, or refactor code in any language.
 1. **Understand requirements**: Ask clarifying questions if the spec is ambiguous.
 2. **Plan**: Think through the approach before writing. Consider edge cases.
 3. **Write to workspace**: Create the file in `/workspace` using `write_file`.
-   - Always include a header comment explaining purpose and usage.
-   - Keep functions small and focused.
+   - For multi-hunk edits prefer `apply_patch` with a unified diff.
+   - Use `str_replace` for one-line surgical changes.
 4. **Validate**: Run the code with `run_shell` to check for syntax errors and basic functionality.
    ```
    run_shell("python /workspace/myscript.py")

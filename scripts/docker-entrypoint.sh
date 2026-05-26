@@ -91,7 +91,7 @@ fi
 
 # ── Start agent ────────────────────────────────────────────────────────────────
 if [[ "${CONTROL_PLANE_ENABLED:-true}" == "true" ]]; then
-    exec python -m agent.main serve-api "$@"
+    exec gosu agent python -m agent.main serve-api "$@"
 fi
 
-exec python -m agent.main start "$@"
+exec gosu agent python -m agent.main start "$@"

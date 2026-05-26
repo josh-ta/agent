@@ -525,3 +525,13 @@ async def test_attach_secret_tools_and_procedure_search_cover_empty_fallback_pat
     monkeypatch.setattr(toolsets, "SecretStore", _SecretStoreSearchError)
     toolsets.attach_secret_tools(error_agent)  # type: ignore[arg-type]
     assert "search failed" in error_agent.funcs["secret_search"]("tok")
+
+
+def test_attach_web_and_patch_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = _Agent()
+    monkeypatch.setattr(toolsets, "_tool_perm_block", lambda *args, **kwargs: None)
+    toolsets.attach_filesystem_tools(agent)  # type: ignore[arg-type]
+    toolsets.attach_web_tools(agent)  # type: ignore[arg-type]
+    assert "apply_patch" in agent.funcs
+    assert "web_search" in agent.funcs
+    assert "http_request" in agent.funcs

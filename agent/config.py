@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     discord_bus_channel_id: int = Field(default=0, alias="DISCORD_BUS_CHANNEL_ID")
     discord_comms_channel_id: int = Field(default=0, alias="DISCORD_COMMS_CHANNEL_ID")
     discord_guild_id: int = Field(default=0, alias="DISCORD_GUILD_ID")
+    discord_use_task_threads: bool = Field(default=True, alias="DISCORD_USE_TASK_THREADS")
 
     # ── Databases ─────────────────────────────────────────────────────────────
     sqlite_path: Path = Field(default=Path("/data/agent.db"), alias="SQLITE_PATH")
@@ -58,6 +59,15 @@ class Settings(BaseSettings):
     browser_mcp_url: str = Field(
         default="http://browser:3080/sse", alias="BROWSER_MCP_URL"
     )
+    # JSON object mapping MCP name -> SSE URL, e.g. {"custom": "http://host:3081/sse"}
+    mcp_servers_json: str = Field(default="", alias="MCP_SERVERS")
+
+    # Web search (tavily or brave)
+    web_search_provider: str = Field(default="", alias="WEB_SEARCH_PROVIDER")
+    web_search_api_key: SecretStr = Field(default=SecretStr(""), alias="WEB_SEARCH_API_KEY")
+
+    # Comma-separated host allowlist for http_request tool (empty = deny all)
+    http_allowed_hosts: str = Field(default="", alias="HTTP_ALLOWED_HOSTS")
 
     # ── Control plane ─────────────────────────────────────────────────────────
     control_plane_enabled: bool = Field(default=True, alias="CONTROL_PLANE_ENABLED")
@@ -67,6 +77,7 @@ class Settings(BaseSettings):
         default=15,
         alias="CONTROL_PLANE_SSE_PING_SECONDS",
     )
+    control_plane_api_key: SecretStr = Field(default=SecretStr(""), alias="CONTROL_PLANE_API_KEY")
 
     # ── Proxy (optional — routes browser traffic through a residential/ISP proxy)
     # Format: http://user:pass@host:port  or  socks5://user:pass@host:port
@@ -112,7 +123,7 @@ class Settings(BaseSettings):
         alias="MODEL_EVENT_IDLE_TIMEOUT_SECONDS",
     )
     restore_pending_discord_tasks: bool = Field(
-        default=False,
+        default=True,
         alias="RESTORE_PENDING_DISCORD_TASKS",
     )
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

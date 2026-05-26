@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent"
-version = "0.8.4"
+version = "1.0.0"
 description = "Autonomous self-modifying AI agent platform"
 requires-python = ">=3.12"
 dependencies = [
@@ -55,6 +55,9 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"agent/communication/*.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

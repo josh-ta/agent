@@ -10,7 +10,8 @@ from agent.events import current_task_id
 from agent.metrics import Metrics
 from agent.permissions import get_permission_engine
 from agent.secret_store import SecretNotFoundError, SecretStore, SecretStoreError, mask_secret
-from agent.tools import filesystem, github, self_edit, shell
+from agent.tools import filesystem, github, http_client, self_edit, shell
+from agent.tools import web_search as web_search_api
 from agent.tools.discord_tools import ask_user, discord_read, discord_read_named, discord_send
 
 if TYPE_CHECKING:
@@ -40,6 +41,7 @@ def attach_all_tools(
 ) -> None:
     attach_shell_tools(agent)
     attach_filesystem_tools(agent)
+    attach_web_tools(agent)
     attach_journal_tools(agent, sqlite=sqlite)
     attach_self_edit_tools(agent)
     attach_discord_tools(agent)
@@ -161,6 +163,43 @@ def attach_filesystem_tools(agent: Agent) -> None:  # type: ignore[type-arg]
             max_total_matches=max_total_matches,
             output_mode=output_mode,
         )
+
+    @agent.tool_plain
+    def apply_patch(path: str, patch: str) -> str:
+        """Apply a unified diff or marker-style patch to a file."""
+        if msg := _tool_perm_block("apply_patch", path=path, patch=patch):
+            return msg
+        return filesystem.apply_patch(path, patch)
+
+
+def attach_web_tools(agent: Agent) -> None:  # type: ignore[type-arg]
+    @agent.tool_plain
+    async def web_search(query: str, max_results: int = 5) -> str:
+        """Search the web using the configured provider (Tavily or Brave)."""
+        if msg := _tool_perm_block("web_search", query=query, max_results=max_results):
+            return msg
+        return await web_search_api.web_search(query, max_results)
+
+    @agent.tool_plain
+    async def http_request(
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        body: str = "",
+        timeout: float = 30,
+    ) -> str:
+        """Call an allowed external HTTP host (see HTTP_ALLOWED_HOSTS)."""
+        if msg := _tool_perm_block(
+            "http_request",
+            method=method,
+            url=url,
+            headers=headers,
+            body=body,
+            timeout=timeout,
+        ):
+            return msg
+        return await http_client.http_request(method, url, headers, body, timeout)
+
 
 
 def attach_journal_tools(agent: Agent, *, sqlite: "SQLiteStore | None") -> None:  # type: ignore[type-arg]

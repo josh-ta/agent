@@ -929,3 +929,91 @@ def test_get_task_unexpected_error_returns_internal_error() -> None:
 
     assert response.status_code == 500
     assert response.json()["error_code"] == "internal_error"
+
+
+def test_control_plane_requires_api_key_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(app_module.settings, "control_plane_api_key", SecretStr("secret-key"))
+    runtime = SimpleNamespace(sqlite=_FakeSQLite(), loop=_FakeLoop(), bot=None)
+    client = TestClient(
+        create_app(runtime, start_background_runtime=False, shutdown_runtime=False),
+        raise_server_exceptions=False,
+    )
+
+    with client:
+        denied = client.post("/tasks", json={"content": "hello"})
+        assert denied.status_code == 401
+        allowed = client.post(
+            "/tasks",
+            json={"content": "hello"},
+            headers={"Authorization": "Bearer secret-key"},
+        )
+        assert allowed.status_code == 202
+        public = client.get("/healthz")
+        assert public.status_code == 200
+
+
+def test_readyz_checks_browser_mcp_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_module.settings, "browser_mcp_url", "http://browser:8080/sse")
+
+    class _HealthyClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def get(self, url: str):
+            assert url == "http://browser:8080/health"
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr("httpx.AsyncClient", _HealthyClient)
+    client, _, _ = _build_app()
+    with client:
+        assert client.get("/readyz").json() == {"status": "ready"}
+
+
+def test_readyz_fails_when_browser_mcp_unhealthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_module.settings, "browser_mcp_url", "http://browser:8080/sse")
+
+    class _UnhealthyClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def get(self, url: str):
+            return SimpleNamespace(status_code=503)
+
+    monkeypatch.setattr("httpx.AsyncClient", _UnhealthyClient)
+    client, _, _ = _build_app()
+    with client:
+        response = client.get("/readyz")
+        assert response.status_code == 503
+        assert "Browser MCP unhealthy" in response.json()["message"]
+
+
+def test_readyz_fails_when_discord_client_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(app_module.settings, "discord_bot_token", SecretStr("token"))
+
+    class _NotReadyClient:
+        def is_ready(self) -> bool:
+            return False
+
+    bot = SimpleNamespace(_client=_NotReadyClient())
+    client, sqlite, loop = _build_app()
+    with client:
+        client.app.state.runtime = SimpleNamespace(sqlite=sqlite, loop=loop, bot=bot)
+        response = client.get("/readyz")
+        assert response.status_code == 503
+        assert "Discord client is not ready" in response.json()["message"]
