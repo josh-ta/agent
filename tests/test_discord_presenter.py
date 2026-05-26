@@ -55,27 +55,29 @@ async def test_status_embed_manager_flush_and_finalize() -> None:
     await manager.flush()
     assert channel.sent_messages
     await manager.finalize(success=True)
-    assert channel.sent_messages[0].embed_edits
+    assert channel.sent_messages[0].deleted
 
 
 @pytest.mark.asyncio
-async def test_presenter_streams_text_deltas(fake_client) -> None:
+async def test_presenter_streams_text_deltas(fake_client, fake_message_factory, discord_channels) -> None:
     channel = FakeChannel(id=1)
-    main = FakeChannel(id=2)
+    message = fake_message_factory(channel=discord_channels["private"], content="hello")
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
     sink = presenter.make_sink(
         channel,
         debounce_seconds=0,
-        main_channel=main,
+        main_channel=channel,
         channel_id=7,
         session_state=DiscordSessionState(),
+        reply_to=message,  # type: ignore[arg-type]
     )
     await sink(TextDeltaEvent(delta="Hel"))
     await sink(TextDeltaEvent(delta="lo"))
     await sink(TextTurnEndEvent(text="Hello", is_final=True))
-    assert main.sent_messages
-    final = main.sent_messages[0].edits[-1] if main.sent_messages[0].edits else main.sent_messages[0].content
+    assert message.replies
+    final = message.reply_messages[0].edits[-1] if message.reply_messages[0].edits else message.reply_messages[0].content
     assert "Hello" in final
+    assert sink.reply_delivered()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -119,7 +121,8 @@ async def test_presenter_sink_covers_lifecycle_events(fake_client) -> None:
     await asyncio.sleep(0.01)
 
     assert channel.sent_messages
-    assert any("thought" in item for item in channel.sent)
+    assert channel.sent_messages[0].deleted
+    assert not any("thought" in item for item in channel.sent)
 
 
 @pytest.mark.asyncio
@@ -215,8 +218,9 @@ async def test_status_embed_manager_progress_with_cancel_hint() -> None:
 async def test_status_embed_manager_edits_existing_message() -> None:
     channel = FakeChannel(id=1)
     manager = StatusEmbedManager(channel, debounce_seconds=0)
+    await manager.handle_tool("run_shell", {"command": "ls"})
     await manager.flush()
-    await manager.handle_tool("read_file", {"path": "x"})
+    await manager.handle_tool("browser_navigate", {"url": "https://example.com"})
     await manager.flush()
     assert channel.sent_messages[0].embed_edits
 
@@ -285,7 +289,9 @@ async def test_presenter_sink_non_final_text_turn(fake_client) -> None:
     presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
     sink = presenter.make_sink(channel, debounce_seconds=0)
     await sink(TextTurnEndEvent(text="intermediate answer", is_final=False))
+    await asyncio.sleep(0.01)
     assert channel.sent_messages
+    assert "intermediate answer" in channel.sent_messages[0].embed.description
 
 
 @pytest.mark.asyncio

@@ -1210,7 +1210,7 @@ async def test_message_service_reacts_when_accepting_new_task(
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert message.reactions == ["👀", "🏁"]
+    assert message.reactions == []
 
 
 @pytest.mark.asyncio
@@ -1303,7 +1303,7 @@ async def test_message_service_prompts_and_marks_waiting_for_user(
     await service.handle_message(message)  # type: ignore[arg-type]
 
     assert "Which environment?" in message.replies[0]
-    assert message.reactions == ["👀", "⏸️"]
+    assert message.reactions == ["⏸️"]
     pending = loop.wait_registry.pending_for_channel(discord_channels["private"].id)
     assert len(pending) == 1
     assert pending[0].prompt_message_id == 1
@@ -1474,7 +1474,7 @@ async def test_message_service_waiting_without_prompt_id_skips_binding_and_memor
     pending = loop.wait_registry.pending_for_channel(discord_channels["private"].id)
     assert pending[0].prompt_message_id is None
     assert loop.memory.waiting_calls == 0
-    assert message.reactions == ["👀", "⏸️"]
+    assert message.reactions == ["⏸️"]
 
 
 @pytest.mark.asyncio
@@ -2079,14 +2079,13 @@ async def test_discord_event_presenter_renders_text_tool_progress_and_error(fake
     await sink(ToolCallStartEvent(tool_name="run_shell", call_id="1", args={"command": "pytest"}))
     await sink(ToolCallStartEvent(tool_name="read_file", call_id="2", args={"path": "README.md"}))
     await asyncio.sleep(0.01)
-    assert "run_shell" in discord_channels["private"].sent_messages[0].embed.description
+    assert "Running a command" in discord_channels["private"].sent_messages[0].embed.description
     await sink(ProgressEvent(message="still working"))
     await sink(TaskErrorEvent(error="boom"))
     await asyncio.sleep(0.01)
 
-    assert any("first" in item for item in discord_channels["private"].sent)
-    assert any("working" in item for item in discord_channels["private"].sent)
-    assert "boom" in discord_channels["private"].sent_messages[0].embed.description
+    assert "working" in discord_channels["private"].sent_messages[0].embed.description
+    assert discord_channels["private"].sent_messages[0].deleted
 
 
 @pytest.mark.asyncio
@@ -2102,7 +2101,7 @@ async def test_discord_event_presenter_ignores_empty_and_unhandled_events(fake_c
     await sink(SimpleNamespace())
     await asyncio.sleep(0.01)
 
-    assert channel.sent == ["💬 done"]
+    assert channel.sent == ["done"]
 
 
 @pytest.mark.asyncio
@@ -2116,7 +2115,7 @@ async def test_discord_event_presenter_truncates_long_start_and_formats_non_dict
     await asyncio.sleep(0.01)
 
     assert channel.sent_messages[0].embed is not None
-    assert "run_shell" in channel.sent_messages[0].embed.description
+    assert "Running a command" in channel.sent_messages[0].embed.description
 
 
 @pytest.mark.asyncio
@@ -2166,7 +2165,7 @@ async def test_message_service_handles_missing_private_channel_when_running_task
 
     await service.handle_message(message)  # type: ignore[arg-type]
 
-    assert message.reactions == ["👀", "🏁"]
+    assert message.reactions == []
 
 
 @pytest.mark.asyncio

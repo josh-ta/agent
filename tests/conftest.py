@@ -40,6 +40,7 @@ class FakeSentMessage:
     edits: list[str] = field(default_factory=list)
     embed: Any = None
     embed_edits: list[Any] = field(default_factory=list)
+    deleted: bool = False
 
     async def edit(self, *, content: str | None = None, embed: Any = None) -> None:
         if content is not None:
@@ -48,6 +49,9 @@ class FakeSentMessage:
         if embed is not None:
             self.embed = embed
             self.embed_edits.append(embed)
+
+    async def delete(self) -> None:
+        self.deleted = True
 
 
 @dataclass

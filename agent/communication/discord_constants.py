@@ -42,6 +42,27 @@ def escape_codeblock(text: str) -> str:
     return text.replace("```", "`` `")
 
 
+def summarize_tool_activity(tool_name: str, args: object) -> str:
+    """Short user-facing label for status updates — not raw tool internals."""
+    labels = {
+        "run_shell": "Running a command",
+        "query_postgres": "Querying the database",
+        "browser_navigate": "Browsing the web",
+        "browser_screenshot": "Capturing a screenshot",
+        "web_search": "Searching the web",
+        "http_request": "Fetching a URL",
+        "write_file": "Writing a file",
+        "str_replace": "Editing a file",
+        "send_discord": "Sending a message",
+        "ask_user_question": "Waiting for your answer",
+    }
+    if tool_name in labels:
+        return labels[tool_name]
+    if tool_name in SILENT_TOOLS:
+        return "Working…"
+    return f"Using `{tool_name}`"
+
+
 def format_args(args: object) -> str:
     if isinstance(args, dict):
         parts = []

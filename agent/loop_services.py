@@ -450,7 +450,7 @@ class RunExecutor:
             loop = asyncio.get_running_loop()
             progress_state = {
                 "last_activity_at": loop.time(),
-                "activity": "thinking through the task",
+                "activity": "thinking about your request",
             }
             progress_watchdog: asyncio.Task[None] | None = None
 
@@ -875,7 +875,7 @@ class RunExecutor:
             if now - last_activity_at < interval_s:
                 continue
             activity = str(progress_state.get("activity") or "working on the task")
-            await self._bridge.emit(ProgressEvent(message=f"⏳ Still working — {activity}."))
+            await self._bridge.emit(ProgressEvent(message=f"⏳ Still working — {activity}"))
             progress_state["last_activity_at"] = now
 
     @staticmethod

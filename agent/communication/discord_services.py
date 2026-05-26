@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import discord
@@ -134,22 +135,14 @@ class MessageHandlingService:
         task_content: str,
         private_channel: discord.abc.Messageable | None,
     ) -> tuple[discord.abc.Messageable, discord.abc.Messageable | None]:
-        """Return (stream_channel, main_channel_for_replies)."""
+        """Return (work_channel, reply_channel). Thread creation is deferred until tools run."""
+        _ = task_content
         originating = parsed.channel_id
-        if (
-            settings.discord_use_task_threads
-            and private_channel is not None
-            and originating == settings.discord_agent_channel_id
-        ):
-            thread = await self._presenter.create_task_thread(
-                private_channel,
-                task_summary=task_content,
-            )
-            if thread is not None:
-                return thread, private_channel
         if originating == settings.discord_agent_channel_id:
-            return private_channel or originating, private_channel  # type: ignore[return-value]
-        return private_channel or originating, originating  # type: ignore[return-value]
+            target = private_channel or originating  # type: ignore[return-value]
+            return target, target
+        target = private_channel or originating  # type: ignore[return-value]
+        return target, originating  # type: ignore[return-value]
 
     async def _enqueue_deferred_task(
         self,
@@ -275,7 +268,7 @@ class MessageHandlingService:
         except Exception as exc:
             await self._reply_safe(message, f"❌ {exc}")
             return
-        await self._handle_task_result(parsed=parsed, message=message, result=result)
+        await self._handle_task_result(parsed=parsed, message=message, result=result, reply_delivered=False)
 
     async def _handle_task_result(
         self,
@@ -283,6 +276,7 @@ class MessageHandlingService:
         parsed: ParsedMessage,
         message: discord.Message,
         result: TaskResult,
+        reply_delivered: bool = False,
     ) -> None:
         self._session_state.clear_cancelling(parsed.channel_id)
         if result.waiting_for_user:
@@ -305,7 +299,11 @@ class MessageHandlingService:
             return
 
         delivery_confirmed = False
-        if result.user_visible_reply_sent:
+        if reply_delivered:
+            delivery_confirmed = True
+            if result.attachments:
+                delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
+        elif result.user_visible_reply_sent:
             if result.attachments:
                 delivery_confirmed = await self.send_reply(parsed, "", message, attachments=result.attachments)
             else:
@@ -316,7 +314,27 @@ class MessageHandlingService:
         else:
             delivery_confirmed = await self.send_reply(parsed, result.output, message, attachments=result.attachments)
 
-        await self._mark_task_finished(message, success=bool(result.success and delivery_confirmed))
+        _ = delivery_confirmed
+
+    def _maybe_create_task_thread(
+        self,
+        *,
+        parsed: ParsedMessage,
+        task_content: str,
+        private_channel: discord.abc.Messageable | None,
+    ) -> Callable[[], Awaitable[discord.abc.Messageable | None]] | None:
+        if not settings.discord_use_task_threads:
+            return None
+        if private_channel is None or parsed.channel_id != settings.discord_agent_channel_id:
+            return None
+
+        async def _create() -> discord.abc.Messageable | None:
+            return await self._presenter.create_task_thread(
+                private_channel,
+                task_summary=task_content,
+            )
+
+        return _create
 
     async def _acknowledge_message(self, message: discord.Message, emoji: str = "👀") -> None:
         try:
@@ -713,23 +731,31 @@ class MessageHandlingService:
         )
         sink_tag = f"discord_{parsed.channel_id}_{id(task)}"
         run_gen = int(metadata["run_generation"])
+        create_thread_fn = self._maybe_create_task_thread(
+            parsed=parsed,
+            task_content=task_content,
+            private_channel=private_channel,  # type: ignore[arg-type]
+        )
         sink = self._presenter.make_sink(
             stream_channel,
             expected_run_generation=run_gen,
             main_channel=main_channel,
             channel_id=parsed.channel_id,
             session_state=self._session_state,
+            reply_to=message,
+            create_thread_fn=create_thread_fn,
         )
         self._bridge.register(sink_tag, sink)
 
         typing_ctx = stream_channel.typing() if hasattr(stream_channel, "typing") else message.channel.typing()  # type: ignore[union-attr]
         result: TaskResult | None = None
+        reply_delivered = False
         try:
             async with typing_ctx:
                 await self._agent_loop.enqueue(task)
-                await self._acknowledge_message(message)
                 result = await response_future
         finally:
+            reply_delivered = getattr(sink, "reply_delivered", lambda: False)()
             self._session_state.pop_inject_queue(parsed.channel_id)
             self._session_state.pop_active_session(parsed.channel_id)
             self._session_state.clear_cancelling(parsed.channel_id)
@@ -740,7 +766,12 @@ class MessageHandlingService:
 
         if result is None:
             return
-        await self._handle_task_result(parsed=parsed, message=message, result=result)
+        await self._handle_task_result(
+            parsed=parsed,
+            message=message,
+            result=result,
+            reply_delivered=reply_delivered,
+        )
 
     async def send_reply(
         self,
