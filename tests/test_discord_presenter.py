@@ -91,9 +91,9 @@ async def test_presenter_keeps_longer_stream_buffer_on_short_final_turn(fake_cli
     )
     await sink(TextDeltaEvent(delta="Hello! How can I assist "))
     await sink(TextTurnEndEvent(text="you today? 😊", is_final=True))
-    assert message.replies[0] == "Hello! How can I assist"
+    assert message.replies == []
     await sink.finalize_reply("Hello! How can I assist you today? 😊")  # type: ignore[attr-defined]
-    assert message.reply_messages[0].edits[-1] == "Hello! How can I assist you today? 😊"
+    assert message.replies == ["Hello! How can I assist you today? 😊"]
 
 
 @pytest.mark.asyncio

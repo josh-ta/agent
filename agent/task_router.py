@@ -58,6 +58,11 @@ def _has_attachments(metadata: dict[str, Any]) -> bool:
     return bool(metadata.get("attachment_names"))
 
 
+def requires_tool_use(content: str) -> bool:
+    """True when the user request clearly needs tools (SQL, files, shell, etc.)."""
+    return bool(_WORK_RE.search(content.strip()))
+
+
 def classify_execution_mode(
     content: str,
     *,

@@ -375,10 +375,9 @@ class DiscordEventPresenter:
 
             if isinstance(event, TextTurnEndEvent):
                 if event.is_final and event.text:
-                    # PartEndEvent text can be a trailing segment only; keep the fuller buffer.
+                    # Keep the fullest text internally; only finalize_reply posts to Discord.
                     if len(event.text.strip()) > len(reply_buffer.strip()):
                         reply_buffer = event.text
-                    await _update_reply(reply_buffer, final=True)
                 elif not event.is_final and event.text:
                     await status.handle_progress(event.text[:240])
                 return

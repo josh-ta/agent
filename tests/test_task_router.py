@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent.task_router import classify_execution_mode
+from agent.task_router import classify_execution_mode, requires_tool_use
 
 
 @pytest.mark.parametrize(

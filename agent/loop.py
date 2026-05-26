@@ -65,7 +65,8 @@ _BEST_KEYWORDS = re.compile(
 _SMART_KEYWORDS = re.compile(
     r"\b(code|implement|write|create|fix|debug|test|pr|"
     r"pull\s+request|commit|clone|install|setup|configure|"
-    r"research|summarize|search|find|build|run|script|sql)\b",
+    r"research|summarize|search|find|build|run|script|sql|"
+    r"csv|export|database|postgres|query|ticket\s+limit)\b",
     re.IGNORECASE,
 )
 _DEPLOY_KEYWORDS = re.compile(
@@ -592,6 +593,8 @@ class AgentLoop:
             execution_mode = "agent"
 
         task.metadata["execution_mode"] = execution_mode
+        if execution_mode == "agent" and tier == "fast":
+            tier = "smart"
         task_id = self.wait_registry.ensure_task_id(task.metadata)
         session_id = str(task.metadata.get("session_id", "")).strip()
         retrieved_memory_ids = [int(item) for item in task.metadata.get("retrieved_memory_ids", [])]
@@ -1048,10 +1051,14 @@ class AgentLoop:
         return fallback, False
 
     async def _is_answer_acceptable(self, *, task: Task, output: str, tool_calls: int) -> bool:
+        from agent.task_router import requires_tool_use
+
         text = output.strip()
         if not text:
             return False
         if text.startswith(("[ERROR", "Error: [No reply", "⏳ Still working", "🔧", "🟢", "💭")):
+            return False
+        if tool_calls == 0 and requires_tool_use(task.content):
             return False
         if tool_calls == 0 and len(text.split()) >= 2:
             return True

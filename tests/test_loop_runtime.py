@@ -1034,11 +1034,26 @@ async def test_loop_wrapper_methods_delegate_to_services(monkeypatch: pytest.Mon
 @pytest.mark.asyncio
 async def test_is_answer_acceptable_rejects_empty_and_status_like_outputs() -> None:
     loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()})
-    task = Task(content="Fix parser")
+    task = Task(content="The weather is nice today")
 
     assert await loop._is_answer_acceptable(task=task, output="", tool_calls=0) is False
     assert await loop._is_answer_acceptable(task=task, output="[ERROR] nope", tool_calls=1) is False
     assert await loop._is_answer_acceptable(task=task, output="Looks good", tool_calls=0) is True
+
+
+@pytest.mark.asyncio
+async def test_is_answer_acceptable_rejects_toolless_work_requests() -> None:
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()})
+    task = Task(content="Give me a csv file of arena events from the database")
+
+    assert (
+        await loop._is_answer_acceptable(
+            task=task,
+            output="Here is the data you asked for in plain text.",
+            tool_calls=0,
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

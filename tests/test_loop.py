@@ -8,6 +8,7 @@ import pytest
 import agent.loop as loop_module
 from agent.events import TaskDoneEvent
 from agent.loop import AgentLoop, Task, _classify_tier, _parse_override
+from agent.task_router import requires_tool_use
 from agent.loop_services import RunResult
 
 
@@ -105,6 +106,17 @@ def test_parse_override_and_classify_tier() -> None:
     assert _classify_tier("please design the production deployment architecture for this service") == "best"
     assert _classify_tier("hello there") == "fast"
     assert _classify_tier("can you take a quick look at this small patch today") == "fast"
+    assert (
+        _classify_tier(
+            "Give me a csv file of all upcoming arena/stadium events in my database with a ticket limit of 4"
+        )
+        == "smart"
+    )
+
+
+def test_requires_tool_use() -> None:
+    assert requires_tool_use("export a csv from postgres") is True
+    assert requires_tool_use("hello") is False
 
 
 def test_agent_loop_legacy_single_agent_init_branch(monkeypatch: pytest.MonkeyPatch) -> None:
