@@ -123,8 +123,17 @@ class Settings(BaseSettings):
     progress_heartbeat_seconds: int = Field(default=20, alias="PROGRESS_HEARTBEAT_SECONDS")
     event_sink_timeout_seconds: float = Field(default=5.0, alias="EVENT_SINK_TIMEOUT_SECONDS")
     model_event_idle_timeout_seconds: float = Field(
-        default=600.0,
+        default=900.0,
         alias="MODEL_EVENT_IDLE_TIMEOUT_SECONDS",
+    )
+    openai_http_read_timeout_seconds: float = Field(
+        default=1800.0,
+        alias="OPENAI_HTTP_READ_TIMEOUT_SECONDS",
+    )
+    # 0 = do not override provider/model defaults. Set explicitly only to tune cost/latency.
+    openrouter_max_tokens: int = Field(
+        default=0,
+        alias="OPENROUTER_MAX_TOKENS",
     )
     restore_pending_discord_tasks: bool = Field(
         default=True,

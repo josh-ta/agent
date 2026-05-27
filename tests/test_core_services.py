@@ -206,15 +206,26 @@ def test_model_factory_model_settings_cover_non_reasoning_openai(monkeypatch: py
     }
 
 
-def test_model_factory_disables_openrouter_qwen_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "thinking_enabled", False)
+def test_model_factory_openrouter_optional_token_cap_and_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(settings, "agent_name", "agent-1")
     monkeypatch.setattr(settings, "openai_base_url", "https://openrouter.ai/api/v1")
 
-    settings_map = ModelFactory().model_settings("openai:qwen/qwen3-14b")
-
-    assert settings_map == {
+    monkeypatch.setattr(settings, "thinking_enabled", False)
+    monkeypatch.setattr(settings, "openrouter_max_tokens", 0)
+    kimi = ModelFactory().model_settings("openai:moonshotai/kimi-k2.6")
+    assert kimi == {
         "openai_prompt_cache_key": "agent-1",
         "openai_prompt_cache_retention": "24h",
-        "extra_body": {"reasoning": {"enabled": False}},
+    }
+
+    monkeypatch.setattr(settings, "thinking_enabled", True)
+    monkeypatch.setattr(settings, "openrouter_max_tokens", 65536)
+    qwen = ModelFactory().model_settings("openai:qwen/qwen3-14b")
+    assert qwen == {
+        "openai_prompt_cache_key": "agent-1",
+        "openai_prompt_cache_retention": "24h",
+        "max_tokens": 65536,
+        "extra_body": {"reasoning": {"enabled": True}},
     }

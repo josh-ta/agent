@@ -481,10 +481,7 @@ class RunExecutor:
 
                     while True:
                         try:
-                            event = await asyncio.wait_for(
-                                anext(event_iter),
-                                timeout=self._model_event_idle_timeout_s,
-                            )
+                            event = await self._await_next_stream_event(event_iter, progress_state)
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError as exc:
@@ -726,6 +723,25 @@ class RunExecutor:
                     with contextlib.suppress(asyncio.CancelledError):
                         await progress_watchdog
 
+    async def _await_next_stream_event(
+        self,
+        event_iter: object,
+        progress_state: dict[str, object],
+    ) -> object:
+        """Wait for the next model event, but only fail after real inactivity."""
+        poll_s = 1.0
+        loop = asyncio.get_running_loop()
+        while True:
+            now = loop.time()
+            idle_s = now - float(progress_state["last_activity_at"])
+            if idle_s >= self._model_event_idle_timeout_s:
+                raise asyncio.TimeoutError()
+            wait_s = min(poll_s, self._model_event_idle_timeout_s - idle_s)
+            try:
+                return await asyncio.wait_for(anext(event_iter), timeout=wait_s)
+            except asyncio.TimeoutError:
+                continue
+
     @staticmethod
     async def _close_event_stream(event_iter: object) -> None:
         aclose = getattr(event_iter, "aclose", None)
@@ -737,8 +753,8 @@ class RunExecutor:
     def _model_timeout_message(self, progress_state: dict[str, object]) -> str:
         activity = str(progress_state.get("activity") or "waiting for the model")
         return (
-            "Model turn timed out after "
-            f"{self._model_event_idle_timeout_s:.0f}s without a new model event while {activity}."
+            "Task stalled after "
+            f"{self._model_event_idle_timeout_s:.0f}s with no activity while {activity}."
         )
 
     def _make_activity_sink(
@@ -762,6 +778,12 @@ class RunExecutor:
                 self._set_progress_activity(progress_state, "streaming shell output")
             elif isinstance(event, ShellDoneEvent):
                 self._set_progress_activity(progress_state, "reviewing shell results")
+            elif isinstance(event, ToolCallStartEvent):
+                self._set_progress_activity(progress_state, f"running `{event.tool_name}`")
+            elif isinstance(event, ToolResultEvent):
+                self._set_progress_activity(progress_state, f"reviewing results from `{event.tool_name}`")
+            elif isinstance(event, ThinkingDeltaEvent):
+                self._set_progress_activity(progress_state, "reasoning about your request")
 
         return sink
 
@@ -905,7 +927,6 @@ class RunExecutor:
                 continue
             activity = str(progress_state.get("activity") or "working on the task")
             await self._bridge.emit(ProgressEvent(message=f"⏳ Still working — {activity}"))
-            progress_state["last_activity_at"] = now
 
     @staticmethod
     def _mark_progress_activity(progress_state: dict[str, object]) -> None:

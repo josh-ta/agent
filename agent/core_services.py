@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
 import structlog
 from pydantic_ai.mcp import MCPServerHTTP
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -296,20 +297,31 @@ class ModelFactory:
         if is_groq and settings.thinking_enabled:
             model_settings["groq_reasoning_format"] = "parsed"
 
-        # Qwen3 on OpenRouter often spends the whole turn in reasoning text without
-        # emitting tool calls. Disable provider reasoning so tool use is reliable.
-        if (
-            is_openai
-            and settings.openai_base_url.strip()
-            and "qwen" in model_string.lower()
-        ):
-            extra_body = dict(model_settings.get("extra_body") or {})
-            extra_body.setdefault("reasoning", {"enabled": False})
-            model_settings["extra_body"] = extra_body
+        if is_openai and settings.openai_base_url.strip():
+            max_tokens = int(settings.openrouter_max_tokens)
+            if max_tokens > 0:
+                model_settings["max_tokens"] = max_tokens
+
+            if settings.thinking_enabled:
+                model_lower = model_string.lower()
+                if any(tag in model_lower for tag in ("qwen", "kimi", "moonshot")):
+                    extra_body = dict(model_settings.get("extra_body") or {})
+                    extra_body.setdefault("reasoning", {"enabled": True})
+                    model_settings["extra_body"] = extra_body
 
         return model_settings or None
 
     @staticmethod
     def _build_openai_compatible_model(model_name: str, *, base_url: str, api_key: str) -> OpenAIChatModel:
-        provider = OpenAIProvider(base_url=base_url or None, api_key=api_key or None)
+        http_client: httpx.AsyncClient | None = None
+        if base_url.strip():
+            read_timeout = max(60.0, float(settings.openai_http_read_timeout_seconds))
+            http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=30.0, read=read_timeout, write=30.0, pool=30.0),
+            )
+        provider = OpenAIProvider(
+            base_url=base_url or None,
+            api_key=api_key or None,
+            http_client=http_client,
+        )
         return OpenAIChatModel(model_name, provider=provider)

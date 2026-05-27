@@ -931,7 +931,7 @@ async def test_run_executor_times_out_stalled_model_turn() -> None:
     executor = RunExecutor(event_bridge=bridge, model_event_idle_timeout_s=1)
     agent = _HungStreamAgent()
 
-    with pytest.raises(RuntimeError, match="Model turn timed out"):
+    with pytest.raises(RuntimeError, match="Task stalled"):
         await executor.run(
             task=Task(content="hang forever"),
             agent=agent,  # type: ignore[arg-type]
@@ -940,9 +940,37 @@ async def test_run_executor_times_out_stalled_model_turn() -> None:
         )
 
     assert any(
-        isinstance(event, ProgressEvent) and "Model turn timed out" in event.message
+        isinstance(event, ProgressEvent) and "Task stalled" in event.message
         for event in bridge.events
     )
+
+
+@pytest.mark.asyncio
+async def test_run_executor_activity_timeout_resets_on_stream_events() -> None:
+    bridge = _Bridge()
+    executor = RunExecutor(event_bridge=bridge, model_event_idle_timeout_s=2)
+
+    class _StreamingThinkingAgent:
+        def run_mcp_servers(self) -> _NullContext:
+            return _NullContext()
+
+        async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+            del prompt, message_history, usage_limits
+            for _ in range(4):
+                await asyncio.sleep(0.6)
+                yield PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta="think"))
+            final = FinalResultEvent(tool_name=None, tool_call_id=None)
+            final.output = "done"
+            yield final
+
+    result = await executor.run(
+        task=Task(content="think slowly"),
+        agent=_StreamingThinkingAgent(),  # type: ignore[arg-type]
+        base_prompt="think slowly",
+        tier="smart",
+    )
+
+    assert result.output == "done"
 
 
 @pytest.mark.asyncio

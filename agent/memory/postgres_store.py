@@ -138,7 +138,7 @@ class PostgresStore:
             self._url,
             min_size=1,
             max_size=5,
-            command_timeout=10,
+            command_timeout=120,
         )
         log.info("postgres_connected")
 
