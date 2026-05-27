@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent.task_router import classify_execution_mode, requires_tool_use
+from agent.task_router import classify_execution_mode, requires_database_tools, requires_tool_use
 
 
 @pytest.mark.parametrize(
@@ -38,3 +38,12 @@ def test_attachments_force_agent() -> None:
         )
         == "agent"
     )
+
+
+def test_requires_database_tools() -> None:
+    assert requires_database_tools(
+        "Give me a csv file of all upcoming arena/stadium events with a ticket limit of 4"
+    )
+    assert requires_database_tools("export postgres query as csv") is True
+    assert requires_database_tools("fix the login bug") is False
+    assert requires_database_tools("hello") is False

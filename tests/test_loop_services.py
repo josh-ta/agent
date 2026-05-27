@@ -734,6 +734,61 @@ async def test_run_executor_retries_once_when_tool_use_required_but_no_tools_cal
     assert any(isinstance(event, ProgressEvent) and "Retrying" in event.message for event in bridge.events)
 
 
+class _StreamlessAlwaysToollessAgent:
+    def __init__(self) -> None:
+        self.stream_calls = 0
+        self.run_prompts: list[str] = []
+
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        self.stream_calls += 1
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "I would query postgres for you."
+        yield final
+
+    async def run(self, prompt: str, message_history=None, usage_limits=None):
+        self.run_prompts.append(prompt)
+        usage = SimpleNamespace(tool_calls=3)
+
+        class _Result:
+            output = "CSV ready at /workspace/export.csv"
+
+            @staticmethod
+            def usage() -> SimpleNamespace:
+                return usage
+
+        return _Result()
+
+
+@pytest.mark.asyncio
+async def test_run_executor_uses_non_streaming_recovery_when_streaming_never_calls_tools() -> None:
+    bridge = _Bridge()
+    agent = _StreamlessAlwaysToollessAgent()
+    executor = RunExecutor(event_bridge=bridge)
+    task = Task(
+        content="Give me a csv file of all upcoming arena events in my database with a ticket limit of 4"
+    )
+
+    result = await executor.run(
+        task=task,
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert agent.stream_calls == 3
+    assert agent.run_prompts
+    assert "FINAL ATTEMPT" in agent.run_prompts[0]
+    assert result.tool_calls == 3
+    assert result.output == "CSV ready at /workspace/export.csv"
+    assert any(
+        isinstance(event, ProgressEvent) and "forced tool pass" in event.message
+        for event in bridge.events
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_executor_emits_events_and_folds_injected_messages() -> None:
     bridge = _Bridge()

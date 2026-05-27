@@ -48,6 +48,15 @@ _COMPLEX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Postgres / CSV / SQL export work — needs list_postgres_tables + query_postgres.
+_DATABASE_WORK_RE = re.compile(
+    r"\b("
+    r"csv|postgres|database|sql|ticket\s+limit|export|spreadsheet|"
+    r"information_schema|query_postgres|list_postgres|arena|stadium|events?"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _has_attachments(metadata: dict[str, Any]) -> bool:
     attachments = metadata.get("attachments")
@@ -61,6 +70,12 @@ def _has_attachments(metadata: dict[str, Any]) -> bool:
 def requires_tool_use(content: str) -> bool:
     """True when the user request clearly needs tools (SQL, files, shell, etc.)."""
     return bool(_WORK_RE.search(content.strip()))
+
+
+def requires_database_tools(content: str) -> bool:
+    """True when the request needs Postgres query tools (CSV export, SQL, etc.)."""
+    text = content.strip()
+    return requires_tool_use(text) and bool(_DATABASE_WORK_RE.search(text))
 
 
 def classify_execution_mode(

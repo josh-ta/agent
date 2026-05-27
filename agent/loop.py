@@ -1037,9 +1037,13 @@ class AgentLoop:
         if await self._is_answer_acceptable(task=task, output=output, tool_calls=tool_calls):
             return output, True
 
-        repaired = await self._repair_user_answer(task=task, output=output)
-        if await self._is_answer_acceptable(task=task, output=repaired, tool_calls=tool_calls):
-            return repaired, True
+        from agent.task_router import requires_tool_use
+
+        repaired = output.strip()
+        if not (tool_calls == 0 and requires_tool_use(task.content)):
+            repaired = await self._repair_user_answer(task=task, output=output)
+            if await self._is_answer_acceptable(task=task, output=repaired, tool_calls=tool_calls):
+                return repaired, True
 
         fallback = (
             repaired.strip()
@@ -1049,8 +1053,6 @@ class AgentLoop:
                 "Please retry or ask me to continue from a narrower checkpoint."
             )
         )
-        from agent.task_router import requires_tool_use
-
         if tool_calls == 0 and requires_tool_use(task.content):
             fallback = (
                 "I couldn't complete this request because I didn't run the required tools "

@@ -72,6 +72,7 @@ _SHELL_CRITICAL_FAILURE_RE = re.compile(
     r"(?i)(\[timeout|\[error:|host key verification failed|permission denied|command not found|"
     r"module(?:not)?founderror|pull access denied|no module named|traceback )"
 )
+_MAX_STREAMING_TOOL_USE_RETRIES = 2
 
 
 @dataclass
@@ -193,6 +194,9 @@ class TaskContextBuilder:
             parts.append(attachment_context)
         if secret_context:
             parts.append(secret_context)
+        database_hint = self._load_database_workflow_hint(normalized_task.content)
+        if database_hint:
+            parts.append(database_hint)
         if retrieved_memory_ids:
             normalized_task.metadata["retrieved_memory_ids"] = retrieved_memory_ids
         if retrieved_procedure_ids:
@@ -228,6 +232,22 @@ class TaskContextBuilder:
     @staticmethod
     def _load_project_context() -> str:
         return load_project_memory()
+
+    @staticmethod
+    def _load_database_workflow_hint(content: str) -> str:
+        from agent.task_router import requires_database_tools
+
+        if not requires_database_tools(content):
+            return ""
+        skill_path = settings.skills_path / "query-database.md"
+        if not skill_path.exists():
+            return ""
+        body = skill_path.read_text(encoding="utf-8").strip()[:2500]
+        return (
+            "## Database / CSV workflow (use tools — do not answer from memory)\n"
+            f"{body}\n"
+            "Start with list_postgres_tables() when table names are unknown."
+        )
 
     async def _load_lessons(self, content: str) -> str:
         if self._memory and hasattr(self._memory, "search_lessons"):
@@ -414,6 +434,87 @@ class RunExecutor:
             else model_event_idle_timeout_s
         )
         self._model_event_idle_timeout_s = max(1.0, float(configured_timeout))
+
+    @staticmethod
+    def _load_query_database_skill() -> str:
+        skill_path = settings.skills_path / "query-database.md"
+        if not skill_path.exists():
+            return ""
+        return skill_path.read_text(encoding="utf-8").strip()[:2500]
+
+    def _build_tool_retry_prompt(self, *, base_prompt: str, task: "Task", retry_index: int) -> str:
+        from agent.task_router import requires_database_tools
+
+        skill_block = ""
+        if requires_database_tools(task.content):
+            skill = self._load_query_database_skill()
+            if skill:
+                skill_block = f"\n## Database workflow (follow exactly)\n{skill}\n"
+
+        if retry_index == 0:
+            mandatory = (
+                "## MANDATORY — tool use required\n"
+                "Your previous turn finished without calling any tools. That is not acceptable.\n"
+                "You MUST call at least one tool before giving a final answer.\n"
+                "- Database/CSV: list_postgres_tables() → query_postgres() → write_file() under /workspace/\n"
+                "- Other work: run_shell, read_file, write_file, or the relevant tool\n"
+                "Do not reply with prose only. Invoke a tool in your next step."
+            )
+        else:
+            mandatory = (
+                "## MANDATORY — still no tools called\n"
+                "You have repeatedly finished without calling any tools. Prose-only answers are rejected.\n"
+                "Your very next action MUST be a tool call — not text.\n"
+                "- Database/CSV: call list_postgres_tables() first, then query_postgres(output_format='csv'), "
+                "then write_file('/workspace/export.csv', ...)\n"
+                "- Other work: run_shell, read_file, write_file, or the relevant tool\n"
+                "Do not explain what you would do — call the tool."
+            )
+
+        return f"{base_prompt}\n\n---\n\n{mandatory}{skill_block}"
+
+    async def _run_non_streaming_tool_recovery(
+        self,
+        *,
+        task: "Task",
+        agent: Agent,  # type: ignore[type-arg]
+        base_prompt: str,
+    ) -> RunResult:
+        from agent.task_router import requires_database_tools
+
+        skill_block = ""
+        if requires_database_tools(task.content):
+            skill = self._load_query_database_skill()
+            if skill:
+                skill_block = f"\n## Database workflow\n{skill}\n"
+
+        prompt = (
+            f"{base_prompt}\n\n---\n\n"
+            "## FINAL ATTEMPT — complete this with tools\n"
+            "Streaming attempts returned text without calling any tools. That failed.\n"
+            "Use tools to finish the user's request. Do not answer from memory.\n"
+            f"{skill_block}"
+            "Your first action MUST be a tool call. Keep calling tools until the work is done."
+        )
+        await self._bridge.emit(
+            ProgressEvent(message="🔧 Running a forced tool pass to complete this request…")
+        )
+        composed = self._compose_user_prompt(prompt, task)
+        async with _agent_mcp_context(agent):
+            result = await agent.run(
+                composed,
+                usage_limits=UsageLimits(request_limit=50, tool_calls_limit=40),
+            )
+        tool_calls = int(getattr(result.usage(), "tool_calls", 0) or 0)
+        output = str(result.output).strip()
+        ic, oc = len(composed), len(output)
+        await self._maybe_warn_context(ic + oc)
+        return RunResult(
+            output=output,
+            tool_calls=tool_calls,
+            input_chars=ic,
+            output_chars=oc,
+        )
 
     async def _maybe_warn_context(self, total_chars: int) -> None:
         est = max(0, total_chars) // 4
@@ -621,7 +722,7 @@ class RunExecutor:
                 tool_retries = int((task.metadata or {}).get("_tool_use_retries", 0))
                 from agent.task_router import requires_tool_use
 
-                if tool_calls == 0 and requires_tool_use(task.content) and tool_retries < 1:
+                if tool_calls == 0 and requires_tool_use(task.content) and tool_retries < _MAX_STREAMING_TOOL_USE_RETRIES:
                     task.metadata["_tool_use_retries"] = tool_retries + 1
                     await self._bridge.emit(
                         ProgressEvent(
@@ -634,18 +735,30 @@ class RunExecutor:
                     return await self.run(
                         task=task,
                         agent=agent,
-                        base_prompt=(
-                            f"{base_prompt}\n\n---\n\n"
-                            "## MANDATORY — tool use required\n"
-                            "Your previous turn finished without calling any tools. That is not acceptable.\n"
-                            "You MUST call at least one tool before giving a final answer.\n"
-                            "- Database/CSV: list_postgres_tables() → query_postgres() → write_file() under /workspace/\n"
-                            "- Other work: run_shell, read_file, write_file, or the relevant tool\n"
-                            "Do not reply with prose only. Invoke a tool in your next step."
+                        base_prompt=self._build_tool_retry_prompt(
+                            base_prompt=base_prompt,
+                            task=task,
+                            retry_index=tool_retries,
                         ),
                         tier=tier,
                         message_history=message_history,
                     )
+
+                if (
+                    tool_calls == 0
+                    and requires_tool_use(task.content)
+                    and tool_retries >= _MAX_STREAMING_TOOL_USE_RETRIES
+                    and hasattr(agent, "run")
+                ):
+                    recovery = await self._run_non_streaming_tool_recovery(
+                        task=task,
+                        agent=agent,
+                        base_prompt=base_prompt,
+                    )
+                    if recovery.tool_calls > 0:
+                        return recovery
+                    tool_calls = recovery.tool_calls
+                    result_output = recovery.output or result_output
 
                 up = self._compose_user_prompt(prompt, task)
                 ic, oc = len(up), len(result_output)
