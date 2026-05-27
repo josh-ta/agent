@@ -486,14 +486,28 @@ class RunExecutor:
 
         return f"{base_prompt}\n\n---\n\n{mandatory}{skill_block}"
 
-    async def _run_non_streaming_tool_recovery(
+    async def _run_non_streaming_agent(
         self,
         *,
         task: "Task",
         agent: Agent,  # type: ignore[type-arg]
         base_prompt: str,
+        recovery: bool = False,
+        message_history: list | None = None,
     ) -> RunResult:
         from agent.task_router import requires_database_tools
+
+        _, cancel_reason = self._drain_injections(task)
+        if cancel_reason:
+            message = self._cancel_user_message(cancel_reason)
+            await self._bridge.emit(ProgressEvent(message=f"⏹️ {message}"))
+            composed = self._compose_user_prompt(base_prompt, task)
+            return RunResult(
+                output=message,
+                cancelled=True,
+                input_chars=len(composed),
+                output_chars=len(message),
+            )
 
         skill_block = ""
         if requires_database_tools(task.content):
@@ -501,32 +515,112 @@ class RunExecutor:
             if skill:
                 skill_block = f"\n## Database workflow\n{skill}\n"
 
-        prompt = (
-            f"{base_prompt}\n\n---\n\n"
-            "## FINAL ATTEMPT — complete this with tools\n"
-            "Streaming attempts returned text without calling any tools. That failed.\n"
-            "Use tools to finish the user's request. Do not answer from memory.\n"
-            f"{skill_block}"
-            "Your first action MUST be a tool call. Keep calling tools until the work is done."
-        )
-        await self._bridge.emit(
-            ProgressEvent(message="🔧 Running a forced tool pass to complete this request…")
-        )
+        if recovery:
+            prompt = (
+                f"{base_prompt}\n\n---\n\n"
+                "## FINAL ATTEMPT — complete this with tools\n"
+                "Streaming attempts returned text without calling any tools. That failed.\n"
+                "Use tools to finish the user's request. Do not answer from memory.\n"
+                f"{skill_block}"
+                "Your first action MUST be a tool call. Keep calling tools until the work is done."
+            )
+            progress_msg = "🔧 Running a forced tool pass to complete this request…"
+        else:
+            prompt = base_prompt
+            if skill_block:
+                prompt = f"{base_prompt}\n\n---\n{skill_block}"
+            progress_msg = "🔧 Running database query and export with multi-step tools…"
+
+        await self._bridge.emit(ProgressEvent(message=progress_msg))
+
+        tool_calls = 0
+        attachments: list[DiscordAttachment] = []
+        shell_failures: list[str] = []
+        user_visible_reply_sent = False
+        pending_visible_discord_sends: set[str] = set()
+
+        async def event_stream_handler(_ctx: object, stream: object) -> None:
+            nonlocal tool_calls, user_visible_reply_sent
+            async for event in stream:  # type: ignore[union-attr]
+                if isinstance(event, FunctionToolCallEvent):
+                    tool_calls += 1
+                    tool_name = event.part.tool_name
+                    parsed_args = self._parse_tool_args(event.part.args)
+                    log.info(
+                        "tool_call",
+                        tool_name=tool_name,
+                        call_id=event.part.tool_call_id,
+                        task_id=str((task.metadata or {}).get("task_id", "")).strip() or None,
+                    )
+                    if self._is_user_visible_discord_send(task, tool_name, parsed_args):
+                        pending_visible_discord_sends.add(event.part.tool_call_id)
+                    await self._bridge.emit(
+                        ToolCallStartEvent(
+                            tool_name=tool_name,
+                            call_id=event.part.tool_call_id,
+                            args=self._sanitize_tool_args(tool_name, parsed_args),
+                        )
+                    )
+                elif isinstance(event, FunctionToolResultEvent):
+                    ret = getattr(event, "result", None)
+                    tool_name = self._tool_name_from_result_event(event, ret)
+                    result_str = str(getattr(ret, "content", ret)) if ret is not None else ""
+                    if (
+                        tool_name == "send_discord"
+                        and getattr(ret, "tool_call_id", "") in pending_visible_discord_sends
+                        and self._is_successful_send_discord_result(result_str)
+                    ):
+                        user_visible_reply_sent = True
+                    if tool_name == "run_shell":
+                        failure = self._detect_shell_failure(result_str)
+                        if failure:
+                            shell_failures.append(failure)
+                    attachments.extend(
+                        self._extract_discord_attachments(tool_name, getattr(ret, "content", ret))
+                    )
+                    await self._bridge.emit(
+                        ToolResultEvent(
+                            tool_name=tool_name,
+                            call_id=getattr(ret, "tool_call_id", ""),
+                            result=self._sanitize_tool_result(tool_name, result_str),
+                        )
+                    )
+
         composed = self._compose_user_prompt(prompt, task)
         async with _agent_mcp_context(agent):
             result = await agent.run(
                 composed,
+                message_history=message_history or [],
                 usage_limits=UsageLimits(request_limit=50, tool_calls_limit=40),
+                event_stream_handler=event_stream_handler,
             )
-        tool_calls = int(getattr(result.usage(), "tool_calls", 0) or 0)
+        usage_tool_calls = int(getattr(result.usage(), "tool_calls", 0) or 0)
+        tool_calls = max(tool_calls, usage_tool_calls)
         output = str(result.output).strip()
         ic, oc = len(composed), len(output)
         await self._maybe_warn_context(ic + oc)
         return RunResult(
             output=output,
             tool_calls=tool_calls,
+            user_visible_reply_sent=user_visible_reply_sent,
+            attachments=attachments,
+            shell_failures=shell_failures,
             input_chars=ic,
             output_chars=oc,
+        )
+
+    async def _run_non_streaming_tool_recovery(
+        self,
+        *,
+        task: "Task",
+        agent: Agent,  # type: ignore[type-arg]
+        base_prompt: str,
+    ) -> RunResult:
+        return await self._run_non_streaming_agent(
+            task=task,
+            agent=agent,
+            base_prompt=base_prompt,
+            recovery=True,
         )
 
     async def _maybe_warn_context(self, total_chars: int) -> None:
@@ -579,6 +673,17 @@ class RunExecutor:
             progress_watchdog: asyncio.Task[None] | None = None
 
             try:
+                from agent.task_router import requires_database_tools
+
+                if requires_database_tools(task.content) and hasattr(agent, "run"):
+                    return await self._run_non_streaming_agent(
+                        task=task,
+                        agent=agent,
+                        base_prompt=base_prompt,
+                        recovery=False,
+                        message_history=message_history,
+                    )
+
                 progress_watchdog = loop.create_task(self._progress_watchdog(progress_state))
                 activity_sink_tag = f"run_executor_activity_{id(progress_state)}"
                 _rg = (task.metadata or {}).get("run_generation")

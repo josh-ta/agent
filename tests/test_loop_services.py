@@ -718,7 +718,7 @@ async def test_run_executor_retries_once_when_tool_use_required_but_no_tools_cal
     bridge = _Bridge()
     agent = _StreamingAgentToollessThenTool()
     executor = RunExecutor(event_bridge=bridge)
-    task = Task(content="Give me a csv file from postgres")
+    task = Task(content="Run pytest in the workspace and show me the output")
 
     result = await executor.run(
         task=task,
@@ -748,7 +748,8 @@ class _StreamlessAlwaysToollessAgent:
         final.output = "I would query postgres for you."
         yield final
 
-    async def run(self, prompt: str, message_history=None, usage_limits=None):
+    async def run(self, prompt: str, message_history=None, usage_limits=None, event_stream_handler=None):
+        del message_history, usage_limits, event_stream_handler
         self.run_prompts.append(prompt)
         usage = SimpleNamespace(tool_calls=3)
 
@@ -763,13 +764,38 @@ class _StreamlessAlwaysToollessAgent:
 
 
 @pytest.mark.asyncio
-async def test_run_executor_uses_non_streaming_recovery_when_streaming_never_calls_tools() -> None:
+async def test_run_executor_uses_non_streaming_for_database_tasks() -> None:
     bridge = _Bridge()
     agent = _StreamlessAlwaysToollessAgent()
     executor = RunExecutor(event_bridge=bridge)
     task = Task(
         content="Give me a csv file of all upcoming arena events in my database with a ticket limit of 4"
     )
+
+    result = await executor.run(
+        task=task,
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert agent.stream_calls == 0
+    assert agent.run_prompts
+    assert "FINAL ATTEMPT" not in agent.run_prompts[0]
+    assert result.tool_calls == 3
+    assert result.output == "CSV ready at /workspace/export.csv"
+    assert any(
+        isinstance(event, ProgressEvent) and "database query and export" in event.message
+        for event in bridge.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_executor_uses_non_streaming_recovery_when_streaming_never_calls_tools() -> None:
+    bridge = _Bridge()
+    agent = _StreamlessAlwaysToollessAgent()
+    executor = RunExecutor(event_bridge=bridge)
+    task = Task(content="Deploy the app to staging and verify health checks")
 
     result = await executor.run(
         task=task,
@@ -966,17 +992,35 @@ async def test_run_executor_collects_workspace_csv_attachments(tmp_path, monkeyp
         def run_mcp_servers(self) -> _NullContext:
             return _NullContext()
 
-        async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
-            yield FunctionToolResultEvent(
-                ToolReturnPart(
-                    tool_name="query_postgres",
-                    content=f"Exported CSV to {export.name} (1 row(s), limit 5000). Written 14 bytes to {export}",
-                    tool_call_id="call-1",
+        async def run(self, prompt: str, message_history=None, usage_limits=None, event_stream_handler=None):
+            del prompt, message_history, usage_limits
+
+            async def stream():
+                yield FunctionToolCallEvent(
+                    ToolCallPart(tool_name="query_postgres", args='{"sql": "SELECT 1"}', tool_call_id="call-1")
                 )
-            )
-            final = FinalResultEvent(tool_name=None, tool_call_id=None)
-            final.output = "CSV ready"
-            yield final
+                yield FunctionToolResultEvent(
+                    ToolReturnPart(
+                        tool_name="query_postgres",
+                        content=f"Exported CSV to {export.name} (1 row(s), limit 5000). Written 14 bytes to {export}",
+                        tool_call_id="call-1",
+                    )
+                )
+                final = FinalResultEvent(tool_name=None, tool_call_id=None)
+                final.output = "CSV ready"
+                yield final
+
+            if event_stream_handler is not None:
+                await event_stream_handler(None, stream())
+
+            class _Result:
+                output = "CSV ready"
+
+                @staticmethod
+                def usage() -> SimpleNamespace:
+                    return SimpleNamespace(tool_calls=1)
+
+            return _Result()
 
     result = await RunExecutor(event_bridge=_Bridge()).run(
         task=Task(content="export csv", source="discord", channel_id=101),
@@ -986,6 +1030,7 @@ async def test_run_executor_collects_workspace_csv_attachments(tmp_path, monkeyp
     )
 
     assert result.output == "CSV ready"
+    assert result.tool_calls == 1
     assert len(result.attachments) == 1
     assert result.attachments[0].filename == "export.csv"
     assert result.attachments[0].data == b"id,name\n1,Show"

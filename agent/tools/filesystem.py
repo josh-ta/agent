@@ -20,6 +20,7 @@ log = structlog.get_logger()
 
 MAX_READ_BYTES = 32 * 1024  # 32 KB for whole-file reads
 MAX_LINE_WINDOW = 2000  # max lines returned per read_file line-range call
+MAX_WRITE_FILE_CHARS = 64_000  # reject huge CSV pastes — use query_postgres output_path
 
 
 def _workspace_root() -> Path:
@@ -180,6 +181,13 @@ def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
         Success message or error.
     """
     try:
+        suffix = Path(path).suffix.lower()
+        if len(content) > MAX_WRITE_FILE_CHARS and suffix in {".csv", ".tsv"}:
+            return (
+                f"[ERROR: CSV/TSV content is too large for write_file ({len(content)} chars). "
+                "Use query_postgres(..., output_format='csv', output_path='/workspace/your-file.csv') "
+                "to write directly to disk.]"
+            )
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding=encoding)

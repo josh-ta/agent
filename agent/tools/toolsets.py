@@ -220,17 +220,19 @@ def attach_journal_tools(agent: Agent, *, sqlite: "SQLiteStore | None") -> None:
             journal_path.parent.mkdir(parents=True, exist_ok=True)
             with journal_path.open("a", encoding="utf-8") as handle:
                 handle.write(entry)
+            def _schedule_if_running(factory: object) -> None:
+                try:
+                    loop = _asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+                if loop.is_running():
+                    loop.create_task(factory())  # type: ignore[operator,misc]
+
             task_id = current_task_id()
             if sqlite is not None and task_id:
-                loop = _asyncio.get_running_loop()
-                if loop.is_running():
-                    loop.create_task(sqlite.append_task_note(task_id, f"[{ts}] {note.strip()}"))
-            try:
-                loop = _asyncio.get_running_loop()
-                if loop.is_running():
-                    loop.create_task(_bridge.emit(_ProgressEvent(message=f"📝 {note.strip()}")))
-            except Exception:
-                pass
+                note_text = f"[{ts}] {note.strip()}"
+                _schedule_if_running(lambda: sqlite.append_task_note(task_id, note_text))
+            _schedule_if_running(lambda: _bridge.emit(_ProgressEvent(message=f"📝 {note.strip()}")))
             return f"Journal updated ({journal_path})."
         except Exception as exc:
             return f"[journal write error: {exc}]"

@@ -349,3 +349,11 @@ def test_filesystem_list_dir_renders_unknown_entry_when_entry_stat_fails(monkeyp
 
     assert "????" in listing
     assert "broken.txt" in listing
+
+
+def test_write_file_rejects_large_csv_paste(isolated_paths) -> None:
+    huge = "a,b\n" * 20_000
+    result = filesystem.write_file("export.csv", huge)
+    assert result.startswith("[ERROR: CSV/TSV content is too large")
+    assert "output_path" in result
+    assert not (Path(isolated_paths["workspace"]) / "export.csv").exists()
