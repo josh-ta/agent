@@ -72,6 +72,17 @@ _DATABASE_CSV_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DATABASE_DENIAL_RE = re.compile(
+    r"\b("
+    r"do not have|don't have|cannot|can't|unable to|no access|i do not have"
+    r").{0,60}\b("
+    r"access|database|postgres|event data|information about|sales starting|data or information"
+    r")\b|"
+    r"\bprovide a list of events\b|"
+    r"\bcannot fulfill this request\b",
+    re.IGNORECASE,
+)
+
 
 def _has_attachments(metadata: dict[str, Any]) -> bool:
     attachments = metadata.get("attachments")
@@ -118,6 +129,18 @@ def _content_requires_database(text: str) -> bool:
     if not stripped:
         return False
     return bool(_DATABASE_WORK_RE.search(stripped)) or bool(_EVENT_DATA_RE.search(stripped))
+
+
+def looks_like_database_denial(text: str) -> bool:
+    """True when the model claims it lacks DB/event data instead of querying."""
+    return bool(_DATABASE_DENIAL_RE.search(text.strip()))
+
+
+def requires_database_analytics(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    """True when Postgres analytics are needed (not a CSV/file export)."""
+    return requires_database_query(content, metadata=metadata) and not requires_database_csv_export(
+        content, metadata=metadata
+    )
 
 
 def requires_database_csv_export(content: str, *, metadata: dict[str, Any] | None = None) -> bool:

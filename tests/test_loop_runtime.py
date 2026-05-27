@@ -453,6 +453,7 @@ async def test_process_discord_message_saves_without_session_turn_helper(monkeyp
     monkeypatch.setattr(loop._context_builder, "build", fake_build)
     monkeypatch.setattr(loop._run_executor, "run", fake_run)
     monkeypatch.setattr(loop, "_maybe_promote_memory_fact", fake_promote)
+    monkeypatch.setattr(loop, "_ensure_answer_required", lambda **kwargs: asyncio.sleep(0, result=("done", True)))
 
     result = await loop._process(Task(content="Fix parser", source="discord", author="Josh", channel_id=7))
 

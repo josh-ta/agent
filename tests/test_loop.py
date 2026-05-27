@@ -138,8 +138,9 @@ def test_agent_loop_legacy_single_agent_init_branch(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_process_success_skips_answer_gate_when_reply_already_sent(event_collector, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_process_success_always_runs_answer_gate(event_collector, monkeypatch: pytest.MonkeyPatch) -> None:
     loop = AgentLoop({"smart": _RecordingAgent(), "fast": _RecordingAgent(), "best": _RecordingAgent()})
+    gate_calls = 0
 
     async def fake_build(task: Task):
         return task, "smart", "prompt"
@@ -147,15 +148,18 @@ async def test_process_success_skips_answer_gate_when_reply_already_sent(event_c
     async def fake_run(**kwargs):
         return RunResult(output="done", tool_calls=1, user_visible_reply_sent=True)
 
-    async def fail_answer_gate(**kwargs):
-        raise AssertionError("_ensure_answer_required should not be called")
+    async def fake_answer_gate(**kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        return kwargs["output"], True
 
     monkeypatch.setattr(loop._context_builder, "build", fake_build)
     monkeypatch.setattr(loop._run_executor, "run", fake_run)
-    monkeypatch.setattr(loop, "_ensure_answer_required", fail_answer_gate)
+    monkeypatch.setattr(loop, "_ensure_answer_required", fake_answer_gate)
 
     result = await loop._process(Task(content="Fix parser"))
 
+    assert gate_calls == 1
     assert result.success is True
     assert isinstance(event_collector[1], TaskDoneEvent)
 

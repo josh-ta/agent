@@ -210,6 +210,9 @@ class TaskContextBuilder:
         routing_hint = self._load_routing_hint(normalized_task.metadata)
         if routing_hint:
             parts.append(routing_hint)
+        postgres_hint = self._load_postgres_capability_hint(normalized_task.metadata)
+        if postgres_hint:
+            parts.append(postgres_hint)
         database_hint = self._load_database_workflow_hint(
             normalized_task.content,
             metadata=normalized_task.metadata,
@@ -269,6 +272,18 @@ class TaskContextBuilder:
         if decision.reasoning.strip():
             lines.append(f"- Note: {decision.reasoning.strip()[:300]}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _load_postgres_capability_hint(metadata: dict | None) -> str:
+        if not (metadata or {}).get("postgres_connected"):
+            return ""
+        return (
+            "## Connected data sources\n"
+            "- **Postgres is connected** on this agent (`POSTGRES_URL`). You have `list_postgres_tables` "
+            "and `query_postgres` tools.\n"
+            "- The events/tickets database is in Postgres — **never** tell the user you lack event data or "
+            "ask them to paste a list of events. Query it directly."
+        )
 
     @staticmethod
     def _load_database_workflow_hint(content: str, metadata: dict | None = None) -> str:
@@ -536,6 +551,7 @@ class RunExecutor:
         agent: Agent,  # type: ignore[type-arg]
         base_prompt: str,
         recovery: bool = False,
+        analytics: bool = False,
         message_history: list | None = None,
     ) -> RunResult:
         from agent.task_router import requires_database_csv_export, requires_database_query
@@ -558,6 +574,15 @@ class RunExecutor:
             if skill:
                 skill_block = f"\n## Database workflow\n{skill}\n"
 
+        analytics_block = ""
+        if analytics and not recovery:
+            analytics_block = (
+                "\n## FIRST ACTION REQUIRED\n"
+                "This is a Postgres analytics question. Your FIRST step MUST be `list_postgres_tables()` "
+                "or `query_postgres()` (e.g. against the `events` table). "
+                "Do NOT answer from memory or claim you lack database access.\n"
+            )
+
         if recovery:
             prompt = (
                 f"{base_prompt}\n\n---\n\n"
@@ -570,9 +595,13 @@ class RunExecutor:
             progress_msg = "🔧 Running a forced tool pass to complete this request…"
         else:
             prompt = base_prompt
-            if skill_block:
-                prompt = f"{base_prompt}\n\n---\n{skill_block}"
-            progress_msg = "🔧 Running CSV export with multi-step tools…"
+            extra = f"{analytics_block}{skill_block}"
+            if extra.strip():
+                prompt = f"{base_prompt}\n\n---\n{extra}"
+            if analytics:
+                progress_msg = "🔧 Running database analytics with Postgres tools…"
+            else:
+                progress_msg = "🔧 Running CSV export with multi-step tools…"
 
         await self._bridge.emit(ProgressEvent(message=progress_msg))
 
@@ -695,6 +724,14 @@ class RunExecutor:
             output=output,
             extra_texts=tool_result_texts,
         )
+        from agent.task_router import looks_like_database_denial, requires_tool_use
+
+        if (
+            tool_calls == 0
+            and requires_tool_use(task.content, metadata=task.metadata)
+            and looks_like_database_denial(output)
+        ):
+            output = ""
         return RunResult(
             output=output,
             tool_calls=tool_calls,
@@ -774,7 +811,22 @@ class RunExecutor:
             progress_watchdog: asyncio.Task[None] | None = None
 
             try:
-                from agent.task_router import requires_database_csv_export
+                from agent.task_router import (
+                    looks_like_database_denial,
+                    requires_database_analytics,
+                    requires_database_csv_export,
+                    requires_tool_use,
+                )
+
+                if requires_database_analytics(task.content, metadata=task.metadata) and hasattr(agent, "run"):
+                    return await self._run_non_streaming_agent(
+                        task=task,
+                        agent=agent,
+                        base_prompt=base_prompt,
+                        recovery=False,
+                        analytics=True,
+                        message_history=message_history,
+                    )
 
                 if requires_database_csv_export(task.content, metadata=task.metadata) and hasattr(agent, "run"):
                     return await self._run_non_streaming_agent(
@@ -1012,6 +1064,12 @@ class RunExecutor:
                     output=result_output,
                     extra_texts=tool_result_texts,
                 )
+                if (
+                    tool_calls == 0
+                    and requires_tool_use(task.content, metadata=task.metadata)
+                    and looks_like_database_denial(result_output)
+                ):
+                    result_output = ""
                 return RunResult(
                     output=result_output,
                     tool_calls=tool_calls,

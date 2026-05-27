@@ -4,6 +4,7 @@ import pytest
 
 from agent.task_router import (
     classify_execution_mode,
+    requires_database_analytics,
     requires_database_csv_export,
     requires_database_query,
     requires_database_tools,
@@ -75,6 +76,23 @@ def test_requires_tool_use_for_event_analytics() -> None:
         "Of all the events with a sale starting today which 5 events should I focus on buying?"
     )
     assert requires_tool_use("hello") is False
+
+
+def test_requires_database_analytics() -> None:
+    query = "Of all the events with a sale starting today which 5 events should I focus on buying?"
+    assert requires_database_analytics(query) is True
+    assert requires_database_analytics(
+        "Give me a csv file of all upcoming arena events with a ticket limit of 4"
+    ) is False
+
+
+def test_looks_like_database_denial_matches_bob_refusal() -> None:
+    from agent.task_router import looks_like_database_denial
+
+    assert looks_like_database_denial(
+        "I cannot fulfill this request. I do not have access to any event data or "
+        "information about sales starting today. To help you, please provide a list of events."
+    )
 
 
 def test_requires_tool_use_ignores_router_false_for_database_content() -> None:

@@ -74,15 +74,6 @@ _DEPLOY_KEYWORDS = re.compile(
     r"\b(deploy|deployment|release|rollout|docker compose|docker-compose|ssh|prod|production|staging)\b",
     re.IGNORECASE,
 )
-_DATABASE_DENIAL_RE = re.compile(
-    r"\b("
-    r"do not have|don't have|cannot|can't|unable to|no access"
-    r").{0,60}\b("
-    r"access|database|postgres|event data|information about|sales starting"
-    r")\b|"
-    r"\bprovide a list of events\b",
-    re.IGNORECASE,
-)
 def _parse_override(content: str) -> tuple[str, str | None]:
     """
     Strip a /fast|/smart|/best prefix from the message.
@@ -613,6 +604,7 @@ class AgentLoop:
         session_context = await self._context_builder.session_context_for(task)
         routing = await self._intent_router.route(task=task, session_context=session_context)
         task.metadata["routing"] = routing.to_metadata()
+        task.metadata["postgres_connected"] = self._postgres is not None
         if routing.effective_request.strip():
             task.content = routing.effective_request.strip()
 
@@ -892,14 +884,11 @@ class AgentLoop:
                     output_tokens_est=out_tok,
                 )
 
-            answered_user = run_result.user_visible_reply_sent
-            final_output = result_output
-            if not answered_user:
-                final_output, answered_user = await self._ensure_answer_required(
-                    task=task,
-                    output=result_output,
-                    tool_calls=tool_calls,
-                )
+            final_output, answered_user = await self._ensure_answer_required(
+                task=task,
+                output=result_output,
+                tool_calls=tool_calls,
+            )
 
             task_succeeded = answered_user
             deploy_blocker = self._build_deploy_blocker_message(task=task, run_result=run_result, output=final_output)
@@ -1151,8 +1140,10 @@ class AgentLoop:
             return False
         if tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata):
             return False
+        from agent.task_router import looks_like_database_denial
+
         if tool_calls == 0 and requires_database_query(task.content, metadata=task.metadata):
-            if _DATABASE_DENIAL_RE.search(text):
+            if looks_like_database_denial(text):
                 return False
         if tool_calls == 0 and len(text.split()) >= 6:
             return True

@@ -764,34 +764,36 @@ class _StreamlessAlwaysToollessAgent:
 
 
 @pytest.mark.asyncio
-async def test_run_executor_uses_streaming_for_database_analytics_not_csv_export() -> None:
+async def test_run_executor_uses_non_streaming_for_database_analytics() -> None:
     bridge = _Bridge()
 
-    class _Agent:
+    class _AnalyticsAgent:
         stream_calls = 0
-        run_calls = 0
+        run_prompts: list[str] = []
 
         def run_mcp_servers(self) -> _NullContext:
             return _NullContext()
 
         async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+            del prompt, message_history, usage_limits
             self.stream_calls += 1
-            yield FunctionToolCallEvent(
-                ToolCallPart(tool_name="query_postgres", args='{"sql": "SELECT 1"}', tool_call_id="call-1")
-            )
-            yield FunctionToolResultEvent(
-                ToolReturnPart(tool_name="query_postgres", content="1", tool_call_id="call-1")
-            )
-            final = FinalResultEvent(tool_name=None, tool_call_id=None)
-            final.output = "Top 5 events listed."
-            yield final
+            raise AssertionError("Analytics should use non-streaming agent.run")
 
         async def run(self, prompt: str, message_history=None, usage_limits=None, event_stream_handler=None):
-            del prompt, message_history, usage_limits, event_stream_handler
-            self.run_calls += 1
-            raise AssertionError("CSV non-streaming path should not run for analytics")
+            del message_history, usage_limits, event_stream_handler
+            self.run_prompts.append(prompt)
+            usage = SimpleNamespace(tool_calls=2)
 
-    agent = _Agent()
+            class _Result:
+                output = "Top 5 events listed."
+
+                @staticmethod
+                def usage() -> SimpleNamespace:
+                    return usage
+
+            return _Result()
+
+    agent = _AnalyticsAgent()
     executor = RunExecutor(event_bridge=bridge)
     task = Task(
         content="Of all the events with a sale starting today which 5 events should I focus on buying?"
@@ -804,9 +806,15 @@ async def test_run_executor_uses_streaming_for_database_analytics_not_csv_export
         tier="smart",
     )
 
-    assert agent.stream_calls == 1
-    assert agent.run_calls == 0
+    assert agent.stream_calls == 0
+    assert agent.run_prompts
+    assert "FIRST ACTION REQUIRED" in agent.run_prompts[0]
     assert result.output == "Top 5 events listed."
+    assert result.tool_calls == 2
+    assert any(
+        isinstance(event, ProgressEvent) and "database analytics" in event.message.lower()
+        for event in bridge.events
+    )
 
 
 @pytest.mark.asyncio
