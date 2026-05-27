@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     # Route short conversational Discord messages through a lightweight chat agent
     # (no tools, tiny prompt) instead of the full tool-using agent stack.
     auto_chat_routing: bool = Field(default=True, alias="AUTO_CHAT_ROUTING")
+    # LLM intent router: classify each task against the tool catalog before execution.
+    intent_router_enabled: bool = Field(default=True, alias="INTENT_ROUTER_ENABLED")
 
     # ── Identity ──────────────────────────────────────────────────────────────
     agent_name: str = Field(default="agent-1", alias="AGENT_NAME")

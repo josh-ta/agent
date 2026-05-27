@@ -198,6 +198,14 @@ class AgentLoop:
         )
         self._run_guard = RunGuard()
         self._run_seq = 0
+        from agent.intent_router import IntentRouter
+
+        self._intent_router = IntentRouter(
+            router_agent=IntentRouter.create_router_agent_or_none()
+            if settings.intent_router_enabled
+            else None,
+            postgres_available=self._postgres is not None,
+        )
 
     def allocate_run_generation(self) -> int:
         """Monotonic id for a task run; assign to task.metadata before sinks register."""
@@ -219,6 +227,14 @@ class AgentLoop:
         self.agents = create_agents(self._tool_registry)
         self.chat_agent = create_chat_agent()
         self._reflection_service._agents = self.agents
+        from agent.intent_router import IntentRouter
+
+        self._intent_router = IntentRouter(
+            router_agent=IntentRouter.create_router_agent_or_none()
+            if settings.intent_router_enabled
+            else None,
+            postgres_available=self._postgres is not None,
+        )
         log.info(
             "agents_reloaded",
             fast=settings.model_fast,
@@ -584,14 +600,21 @@ class AgentLoop:
 
         # Parse user model override (/fast, /smart, /best) and classify tier/mode
         content, forced_tier = _parse_override(task.content)
-        tier = forced_tier or _classify_tier(content)
+
+        session_context = await self._context_builder.session_context_for(task)
+        routing = await self._intent_router.route(task=task, session_context=session_context)
+        task.metadata["routing"] = routing.to_metadata()
+        if routing.effective_request.strip():
+            task.content = routing.effective_request.strip()
+
+        tier = forced_tier or routing.tier or _classify_tier(task.content)
 
         from agent.task_router import classify_execution_mode
 
         execution_mode = "agent"
         if settings.auto_chat_routing:
             execution_mode = classify_execution_mode(
-                content,
+                task.content,
                 source=task.source,
                 metadata=task.metadata,
             )
@@ -624,6 +647,8 @@ class AgentLoop:
             source=task.source,
             author=task.author,
             content=task.content[:120],
+            intent=routing.intent,
+            routing_tier=routing.tier,
         )
 
         if self.memory and hasattr(self.memory, "ensure_session"):
@@ -1081,7 +1106,7 @@ class AgentLoop:
         from agent.task_router import requires_tool_use
 
         repaired = output.strip()
-        if not (tool_calls == 0 and requires_tool_use(task.content)):
+        if not (tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata)):
             repaired = await self._repair_user_answer(task=task, output=output)
             if await self._is_answer_acceptable(task=task, output=repaired, tool_calls=tool_calls):
                 return repaired, True
@@ -1094,7 +1119,7 @@ class AgentLoop:
                 "Please retry or ask me to continue from a narrower checkpoint."
             )
         )
-        if tool_calls == 0 and requires_tool_use(task.content):
+        if tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata):
             fallback = (
                 "I couldn't complete this request because I didn't run the required tools "
                 "(for example query_postgres for database/CSV work). Please retry — I'll query the database directly."
@@ -1109,9 +1134,9 @@ class AgentLoop:
             return False
         if text.startswith(("[ERROR", "Error: [No reply", "⏳ Still working", "🔧", "🟢", "💭")):
             return False
-        if tool_calls == 0 and requires_tool_use(task.content):
+        if tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata):
             return False
-        if tool_calls == 0 and len(text.split()) >= 2:
+        if tool_calls == 0 and len(text.split()) >= 6:
             return True
         validator_prompt = (
             "Decide whether the assistant's draft directly answers the user's request.\n"
@@ -1126,7 +1151,7 @@ class AgentLoop:
             verdict = str(result.output).strip().splitlines()[0].strip().upper()
             return verdict == "ANSWERED"
         except Exception:
-            if tool_calls == 0 and requires_tool_use(task.content):
+            if tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata):
                 return False
             return len(text.split()) >= 6
 

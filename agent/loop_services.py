@@ -207,7 +207,13 @@ class TaskContextBuilder:
             parts.append(attachment_context)
         if secret_context:
             parts.append(secret_context)
-        database_hint = self._load_database_workflow_hint(normalized_task.content)
+        routing_hint = self._load_routing_hint(normalized_task.metadata)
+        if routing_hint:
+            parts.append(routing_hint)
+        database_hint = self._load_database_workflow_hint(
+            normalized_task.content,
+            metadata=normalized_task.metadata,
+        )
         if database_hint:
             parts.append(database_hint)
         if retrieved_memory_ids:
@@ -247,21 +253,48 @@ class TaskContextBuilder:
         return load_project_memory()
 
     @staticmethod
-    def _load_database_workflow_hint(content: str) -> str:
-        from agent.task_router import requires_database_tools
+    def _load_routing_hint(metadata: dict | None) -> str:
+        from agent.intent_router import RoutingDecision
 
-        if not requires_database_tools(content):
+        decision = RoutingDecision.from_metadata((metadata or {}).get("routing"))
+        if decision is None:
+            return ""
+        lines = [
+            "## Routing plan (from intent classifier)",
+            f"- Intent: {decision.intent}",
+            f"- Needs tools: {decision.needs_tools}",
+        ]
+        if decision.suggested_tools:
+            lines.append(f"- Start with tools: {', '.join(decision.suggested_tools)}")
+        if decision.reasoning.strip():
+            lines.append(f"- Note: {decision.reasoning.strip()[:300]}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _load_database_workflow_hint(content: str, metadata: dict | None = None) -> str:
+        from agent.task_router import requires_database_csv_export, requires_database_query
+
+        if not requires_database_query(content, metadata=metadata):
             return ""
         skill_path = settings.skills_path / "query-database.md"
         if not skill_path.exists():
             return ""
         body = skill_path.read_text(encoding="utf-8").strip()[:2500]
+        if requires_database_csv_export(content, metadata=metadata):
+            return (
+                "## Database / CSV export (use tools — do not answer from memory)\n"
+                f"{body}\n"
+                "For CSV exports use query_postgres(..., output_format='csv', output_path='/workspace/export.csv') "
+                "so the file is written directly without piping rows through write_file. "
+                "The CSV is uploaded to Discord automatically — do not tell the user to open /workspace."
+            )
         return (
-            "## Database / CSV workflow (use tools — do not answer from memory)\n"
+            "## Database analytics (use query_postgres — do not answer from memory)\n"
             f"{body}\n"
-            "For CSV exports use query_postgres(..., output_format='csv', output_path='/workspace/export.csv') "
-            "so the file is written directly without piping rows through write_file. "
-            "The CSV is uploaded to Discord automatically — do not tell the user to open /workspace."
+            "Answer in Discord text unless the user explicitly asks for a CSV/file.\n"
+            "Be efficient: one schema check if needed, then 1–3 focused SELECT queries with LIMIT.\n"
+            "Do not run more than 5 query_postgres calls unless the user asks for deeper exploration.\n"
+            "Never claim you lack database access when POSTGRES_URL is configured."
         )
 
     async def _load_lessons(self, content: str) -> str:
@@ -308,6 +341,9 @@ class TaskContextBuilder:
             f"- {entry['name']}" + (f" ({entry['purpose']})" if entry["purpose"] else "")
             for entry in matches
         )
+
+    async def session_context_for(self, task: "Task") -> str:
+        return await self._load_session_context(task)
 
     async def _load_session_context(self, task: "Task") -> str:
         session_id = str((task.metadata or {}).get("session_id", "")).strip()
@@ -458,13 +494,18 @@ class RunExecutor:
         return skill_path.read_text(encoding="utf-8").strip()[:2500]
 
     def _build_tool_retry_prompt(self, *, base_prompt: str, task: "Task", retry_index: int) -> str:
-        from agent.task_router import requires_database_tools
+        from agent.task_router import requires_database_csv_export, requires_database_query
 
         skill_block = ""
-        if requires_database_tools(task.content):
+        if requires_database_query(task.content, metadata=task.metadata):
             skill = self._load_query_database_skill()
             if skill:
-                skill_block = f"\n## Database workflow (follow exactly)\n{skill}\n"
+                label = (
+                    "Database / CSV export"
+                    if requires_database_csv_export(task.content, metadata=task.metadata)
+                    else "Database analytics"
+                )
+                skill_block = f"\n## {label} (follow exactly)\n{skill}\n"
 
         if retry_index == 0:
             mandatory = (
@@ -497,7 +538,7 @@ class RunExecutor:
         recovery: bool = False,
         message_history: list | None = None,
     ) -> RunResult:
-        from agent.task_router import requires_database_tools
+        from agent.task_router import requires_database_csv_export, requires_database_query
 
         _, cancel_reason = self._drain_injections(task)
         if cancel_reason:
@@ -512,7 +553,7 @@ class RunExecutor:
             )
 
         skill_block = ""
-        if requires_database_tools(task.content):
+        if requires_database_query(task.content, metadata=task.metadata):
             skill = self._load_query_database_skill()
             if skill:
                 skill_block = f"\n## Database workflow\n{skill}\n"
@@ -531,7 +572,7 @@ class RunExecutor:
             prompt = base_prompt
             if skill_block:
                 prompt = f"{base_prompt}\n\n---\n{skill_block}"
-            progress_msg = "🔧 Running database query and export with multi-step tools…"
+            progress_msg = "🔧 Running CSV export with multi-step tools…"
 
         await self._bridge.emit(ProgressEvent(message=progress_msg))
 
@@ -597,15 +638,53 @@ class RunExecutor:
                     )
 
         composed = self._compose_user_prompt(prompt, task)
-        async with _agent_mcp_context(agent):
-            result = await agent.run(
-                composed,
-                message_history=message_history or [],
-                usage_limits=UsageLimits(request_limit=50, tool_calls_limit=40),
-                event_stream_handler=event_stream_handler,
-            )
-        raw_usage = getattr(result, "usage", None)
-        usage_obj = raw_usage() if callable(raw_usage) else raw_usage
+        network_retries = 0
+        max_network_retries = 2
+        result = None
+        while True:
+            try:
+                async with _agent_mcp_context(agent):
+                    result = await agent.run(
+                        composed,
+                        message_history=message_history or [],
+                        usage_limits=UsageLimits(request_limit=50, tool_calls_limit=40),
+                        event_stream_handler=event_stream_handler,
+                    )
+                break
+            except Exception as exc:
+                exc_lower = str(exc).lower()
+                transient = any(
+                    token in exc_lower
+                    for token in (
+                        "network connection lost",
+                        "connection reset",
+                        "connection error",
+                        "timeout",
+                        "502",
+                        "503",
+                        "504",
+                        "429",
+                    )
+                )
+                if transient and network_retries < max_network_retries:
+                    network_retries += 1
+                    delay = 5.0 * network_retries
+                    await self._bridge.emit(
+                        ProgressEvent(
+                            message=(
+                                f"🔄 API connection issue — retrying in {int(delay)}s "
+                                f"({network_retries}/{max_network_retries})…"
+                            )
+                        )
+                    )
+                    await self._sleep(delay)
+                    continue
+                raise
+
+        assert result is not None
+        usage_obj = getattr(result, "usage", None)
+        if callable(usage_obj):
+            usage_obj = usage_obj()
         usage_tool_calls = int(getattr(usage_obj, "tool_calls", 0) or 0)
         tool_calls = max(tool_calls, usage_tool_calls)
         output = str(result.output).strip()
@@ -695,9 +774,9 @@ class RunExecutor:
             progress_watchdog: asyncio.Task[None] | None = None
 
             try:
-                from agent.task_router import requires_database_tools
+                from agent.task_router import requires_database_csv_export
 
-                if requires_database_tools(task.content) and hasattr(agent, "run"):
+                if requires_database_csv_export(task.content, metadata=task.metadata) and hasattr(agent, "run"):
                     return await self._run_non_streaming_agent(
                         task=task,
                         agent=agent,
@@ -887,7 +966,7 @@ class RunExecutor:
                 tool_retries = int((task.metadata or {}).get("_tool_use_retries", 0))
                 from agent.task_router import requires_tool_use
 
-                if tool_calls == 0 and requires_tool_use(task.content) and tool_retries < _MAX_STREAMING_TOOL_USE_RETRIES:
+                if tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata) and tool_retries < _MAX_STREAMING_TOOL_USE_RETRIES:
                     task.metadata["_tool_use_retries"] = tool_retries + 1
                     await self._bridge.emit(
                         ProgressEvent(
@@ -911,7 +990,7 @@ class RunExecutor:
 
                 if (
                     tool_calls == 0
-                    and requires_tool_use(task.content)
+                    and requires_tool_use(task.content, metadata=task.metadata)
                     and tool_retries >= _MAX_STREAMING_TOOL_USE_RETRIES
                     and hasattr(agent, "run")
                 ):
@@ -977,6 +1056,10 @@ class RunExecutor:
                 exc_str = str(exc)
                 is_context_overflow = "prompt is too long" in exc_str or ("400" in exc_str and "maximum" in exc_str)
                 is_rate_limit = "429" in exc_str
+                is_network = any(
+                    token in exc_str.lower()
+                    for token in ("network connection lost", "connection reset", "connection error")
+                )
                 is_bad_args = "EOF while parsing" in exc_str or "args_as_dict" in exc_str
 
                 if is_context_overflow and context_retries < max_context_retries and self._summarize_context:
@@ -998,6 +1081,20 @@ class RunExecutor:
                         f"{base_prompt}\n\n"
                         f"## Progress so far (summarized — context was compressed):\n{summary}"
                     )
+                    continue
+
+                if is_network and rate_retries < max_rate_retries:
+                    rate_retries += 1
+                    await self._bridge.emit(
+                        ProgressEvent(
+                            message=(
+                                f"🔄 Network error — retrying in {int(rate_delay)}s "
+                                f"({rate_retries}/{max_rate_retries})…"
+                            )
+                        )
+                    )
+                    await self._sleep(rate_delay)
+                    rate_delay *= 2
                     continue
 
                 if is_rate_limit and rate_retries < max_rate_retries:

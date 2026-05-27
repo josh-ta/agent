@@ -36,7 +36,7 @@ _WORK_RE = re.compile(
     r"query|sql|select|insert|grep|curl|docker|"
     r"list\s+of|get\s+me|give\s+me|show\s+me|send\s+me|fetch|retrieve|"
     r"help\s+me|can\s+you|could\s+you|please|need\s+you\s+to|i\s+need|"
-    r"research|summarize|analyze|compare|review|audit|"
+    r"research|summarize|analyze|compare|review|audit|recommend|suggest|"
     r"ticket\s+limit|csv|spreadsheet|report|database|postgres|"
     r"/status"
     r")\b",
@@ -48,12 +48,27 @@ _COMPLEX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Postgres / CSV / SQL export work — needs list_postgres_tables + query_postgres.
+# Postgres / ticket-inventory data — answer via query_postgres, not from memory.
 _DATABASE_WORK_RE = re.compile(
     r"\b("
     r"csv|postgres|database|sql|ticket\s+limit|export|spreadsheet|"
     r"information_schema|query_postgres|list_postgres|arena|stadium|events?"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Event/sale analytics phrasing that implies the events database even without "database".
+_EVENT_DATA_RE = re.compile(
+    r"\b("
+    r"events?|sale?s?|ticket|tickets|venue|venues|arena|stadium|onsale|presale|"
+    r"chartmetric|buying|focus\s+on|which\s+\d+|top\s+\d+|starting\s+today|"
+    r"on\s+sale|ticketmaster"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_DATABASE_CSV_RE = re.compile(
+    r"\b(csv|spreadsheet|export|download|attach|resend)\b|\.csv\b",
     re.IGNORECASE,
 )
 
@@ -67,15 +82,54 @@ def _has_attachments(metadata: dict[str, Any]) -> bool:
     return bool(metadata.get("attachment_names"))
 
 
-def requires_tool_use(content: str) -> bool:
-    """True when the user request clearly needs tools (SQL, files, shell, etc.)."""
-    return bool(_WORK_RE.search(content.strip()))
+def _routing_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    raw = metadata.get("routing")
+    return raw if isinstance(raw, dict) else {}
 
 
-def requires_database_tools(content: str) -> bool:
-    """True when the request needs Postgres query tools (CSV export, SQL, etc.)."""
+def requires_database_query(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    """True when the request needs Postgres query tools (analytics or export)."""
+    routing = _routing_metadata(metadata)
+    intent = str(routing.get("intent", ""))
+    if intent in {"database_analytics", "database_csv_export"}:
+        return True
+    if "needs_tools" in routing and routing.get("export_csv"):
+        return True
     text = content.strip()
-    return requires_tool_use(text) and bool(_DATABASE_WORK_RE.search(text))
+    if not text:
+        return False
+    return bool(_DATABASE_WORK_RE.search(text)) or bool(_EVENT_DATA_RE.search(text))
+
+
+def requires_database_csv_export(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    """True when the user wants a CSV/file export (use non-streaming multi-step run)."""
+    routing = _routing_metadata(metadata)
+    if "export_csv" in routing:
+        return bool(routing["export_csv"])
+    if str(routing.get("intent", "")) == "database_csv_export":
+        return True
+    text = content.strip()
+    if not requires_database_query(text, metadata=metadata):
+        return False
+    return bool(_DATABASE_CSV_RE.search(text))
+
+
+def requires_database_tools(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    """Alias for requires_database_query (Postgres tools required)."""
+    return requires_database_query(content, metadata=metadata)
+
+
+def requires_tool_use(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    """True when the user request clearly needs tools (SQL, files, shell, etc.)."""
+    routing = _routing_metadata(metadata)
+    if "needs_tools" in routing:
+        return bool(routing["needs_tools"])
+    text = content.strip()
+    if requires_database_query(text, metadata=metadata):
+        return True
+    return bool(_WORK_RE.search(text))
 
 
 def classify_execution_mode(
@@ -93,6 +147,10 @@ def classify_execution_mode(
         return "agent"
 
     meta = metadata or {}
+    routing = _routing_metadata(meta)
+    if routing.get("execution_mode") in {"chat", "agent"}:
+        return routing["execution_mode"]  # type: ignore[return-value]
+
     text = content.strip()
     if not text:
         return "agent"
@@ -107,6 +165,9 @@ def classify_execution_mode(
         return "agent"
 
     if _WORK_RE.search(text):
+        return "agent"
+
+    if requires_database_query(text):
         return "agent"
 
     from agent.loop import _BEST_KEYWORDS, _SMART_KEYWORDS

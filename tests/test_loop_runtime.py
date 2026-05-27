@@ -1047,7 +1047,7 @@ async def test_is_answer_acceptable_rejects_empty_and_status_like_outputs() -> N
 
     assert await loop._is_answer_acceptable(task=task, output="", tool_calls=0) is False
     assert await loop._is_answer_acceptable(task=task, output="[ERROR] nope", tool_calls=1) is False
-    assert await loop._is_answer_acceptable(task=task, output="Looks good", tool_calls=0) is True
+    assert await loop._is_answer_acceptable(task=task, output="Looks good today and the weather is nice", tool_calls=0) is True
 
 
 @pytest.mark.asyncio
@@ -1059,6 +1059,23 @@ async def test_is_answer_acceptable_rejects_toolless_work_requests() -> None:
         await loop._is_answer_acceptable(
             task=task,
             output="Here is the data you asked for in plain text.",
+            tool_calls=0,
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_is_answer_acceptable_rejects_toolless_event_analytics() -> None:
+    loop = AgentLoop({"smart": _StubAgent(), "fast": _StubAgent(), "best": _StubAgent()})
+    task = Task(
+        content="Of all the events with a sale starting today which 5 events should I focus on buying?"
+    )
+
+    assert (
+        await loop._is_answer_acceptable(
+            task=task,
+            output="I do not have access to any event data.",
             tool_calls=0,
         )
         is False

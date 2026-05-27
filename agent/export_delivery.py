@@ -73,6 +73,9 @@ def attachments_from_registered_exports() -> list[DiscordAttachment]:
     return attachments_for_paths(take_export_paths())
 
 
+_IGNORE_BARE_EXPORT_FILENAMES = frozenset({"task_journal.md", "your-file.csv"})
+
+
 def bare_export_filenames_in_text(text: str) -> list[str]:
     if not text.strip():
         return []
@@ -80,7 +83,7 @@ def bare_export_filenames_in_text(text: str) -> list[str]:
     paths: list[str] = []
     for match in _BARE_EXPORT_FILENAME_RE.finditer(text):
         name = match.group(1)
-        if name in seen:
+        if name in seen or name.lower() in _IGNORE_BARE_EXPORT_FILENAMES:
             continue
         seen.add(name)
         paths.append(name)

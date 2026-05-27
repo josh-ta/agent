@@ -764,6 +764,52 @@ class _StreamlessAlwaysToollessAgent:
 
 
 @pytest.mark.asyncio
+async def test_run_executor_uses_streaming_for_database_analytics_not_csv_export() -> None:
+    bridge = _Bridge()
+
+    class _Agent:
+        stream_calls = 0
+        run_calls = 0
+
+        def run_mcp_servers(self) -> _NullContext:
+            return _NullContext()
+
+        async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+            self.stream_calls += 1
+            yield FunctionToolCallEvent(
+                ToolCallPart(tool_name="query_postgres", args='{"sql": "SELECT 1"}', tool_call_id="call-1")
+            )
+            yield FunctionToolResultEvent(
+                ToolReturnPart(tool_name="query_postgres", content="1", tool_call_id="call-1")
+            )
+            final = FinalResultEvent(tool_name=None, tool_call_id=None)
+            final.output = "Top 5 events listed."
+            yield final
+
+        async def run(self, prompt: str, message_history=None, usage_limits=None, event_stream_handler=None):
+            del prompt, message_history, usage_limits, event_stream_handler
+            self.run_calls += 1
+            raise AssertionError("CSV non-streaming path should not run for analytics")
+
+    agent = _Agent()
+    executor = RunExecutor(event_bridge=bridge)
+    task = Task(
+        content="Of all the events with a sale starting today which 5 events should I focus on buying?"
+    )
+
+    result = await executor.run(
+        task=task,
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert agent.stream_calls == 1
+    assert agent.run_calls == 0
+    assert result.output == "Top 5 events listed."
+
+
+@pytest.mark.asyncio
 async def test_run_executor_uses_non_streaming_for_database_tasks() -> None:
     bridge = _Bridge()
     agent = _StreamlessAlwaysToollessAgent()
@@ -785,7 +831,7 @@ async def test_run_executor_uses_non_streaming_for_database_tasks() -> None:
     assert result.tool_calls == 3
     assert result.output == "CSV ready at /workspace/export.csv"
     assert any(
-        isinstance(event, ProgressEvent) and "database query and export" in event.message
+        isinstance(event, ProgressEvent) and "CSV export" in event.message
         for event in bridge.events
     )
 

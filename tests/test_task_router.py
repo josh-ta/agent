@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from agent.task_router import classify_execution_mode, requires_database_tools, requires_tool_use
+from agent.task_router import (
+    classify_execution_mode,
+    requires_database_csv_export,
+    requires_database_query,
+    requires_database_tools,
+    requires_tool_use,
+)
 
 
 @pytest.mark.parametrize(
@@ -13,7 +19,7 @@ from agent.task_router import classify_execution_mode, requires_database_tools, 
         ("thanks", "chat"),
         ("no problem", "chat"),
         (
-            "Pull me a list of all upcoming events in stadiums and arenas with a ticket limit of 4.",
+            "Of all the events with a sale starting today which 5 events should I focus on buying?",
             "agent",
         ),
         ("Can you export that query result as a csv file?", "agent"),
@@ -45,5 +51,27 @@ def test_requires_database_tools() -> None:
         "Give me a csv file of all upcoming arena/stadium events with a ticket limit of 4"
     )
     assert requires_database_tools("export postgres query as csv") is True
+    assert requires_database_tools(
+        "Of all the events with a sale starting today which 5 events should I focus on buying?"
+    )
+    assert requires_database_tools("you have access to my database") is True
     assert requires_database_tools("fix the login bug") is False
     assert requires_database_tools("hello") is False
+
+
+def test_requires_database_csv_export() -> None:
+    assert requires_database_csv_export(
+        "Give me a csv file of all upcoming arena/stadium events with a ticket limit of 4"
+    )
+    assert requires_database_csv_export("can you resend me the csv?") is True
+    assert requires_database_csv_export(
+        "Of all the events with a sale starting today which 5 events should I focus on buying?"
+    ) is False
+    assert requires_database_csv_export("you have access to my database") is False
+
+
+def test_requires_tool_use_for_event_analytics() -> None:
+    assert requires_tool_use(
+        "Of all the events with a sale starting today which 5 events should I focus on buying?"
+    )
+    assert requires_tool_use("hello") is False
