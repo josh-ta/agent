@@ -111,6 +111,11 @@ class SystemPromptBuilder:
 9. Give one clear response. Do not send multiple messages saying the same thing.
 10. If the same approach fails twice, STOP and report what you tried and what is blocking you.
 11. For long-running commands, pass timeout=3600 or higher to run_shell.
+11b. When POSTGRES_URL is configured you CAN query the application database:
+    - list_postgres_tables() to discover schema
+    - query_postgres(sql, output_format='csv') for read-only SELECT queries
+    - write_file() to save CSV exports under /workspace/
+    Never claim you lack database access when these tools are available.
 11a. In your private Discord channel, prefer native control commands when appropriate:
     `/status`, `/cancel`, `/replace <task>`, `/queue <task>`, `/clear`, `/resume`, `/forget`, `/help`.
 12. Agent-comms is for actionable task handoffs and final results only. Never send receipt acks, thank-you notes, or status chatter there.

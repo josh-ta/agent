@@ -730,6 +730,27 @@ def attach_database_tools(
             return await postgres.list_agents()
 
         @agent.tool_plain
+        async def list_postgres_tables(schema: str = "public") -> str:
+            """List tables in the connected Postgres database (schema discovery)."""
+            return await postgres.list_tables(schema)
+
+        @agent.tool_plain
+        async def query_postgres(
+            sql: str,
+            limit: int = 500,
+            output_format: str = "table",
+        ) -> str:
+            """
+            Run a read-only SQL query against POSTGRES_URL (SELECT/WITH/EXPLAIN only).
+
+            Use list_postgres_tables() first when you do not know table names.
+            For CSV exports, set output_format='csv' then write_file() to /workspace/.
+            """
+            if msg := _tool_perm_block("query_postgres", sql=sql, limit=limit, output_format=output_format):
+                return msg
+            return await postgres.query_readonly(sql, limit=limit, output_format=output_format)
+
+        @agent.tool_plain
         async def create_shared_task(to_agent: str, description: str) -> str:
             return await postgres.create_task(to_agent, description)
 

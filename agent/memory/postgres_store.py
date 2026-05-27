@@ -28,6 +28,7 @@ from agent.memory.postgres_components import (
     SharedMemoryRepository,
     SharedTaskRepository,
 )
+from agent.memory.postgres_query import format_rows, validate_readonly_sql
 
 log = structlog.get_logger()
 
@@ -269,6 +270,67 @@ class PostgresStore:
     async def get_stats(self) -> dict:
         """Return row counts for diagnostics."""
         return await self.maintenance.get_stats()
+
+    async def query_readonly(
+        self,
+        sql: str,
+        *,
+        limit: int = 500,
+        output_format: str = "table",
+    ) -> str:
+        """Run a read-only SQL query and return formatted results."""
+        if not self._pool:
+            return "[ERROR: Postgres is not connected]"
+
+        try:
+            safe_sql = validate_readonly_sql(sql)
+        except ValueError as exc:
+            return f"[ERROR: {exc}]"
+
+        row_limit = max(1, min(int(limit), 5000))
+        fmt = "csv" if output_format.strip().lower() == "csv" else "table"
+
+        wrapped = f"SELECT * FROM ({safe_sql}) AS _q LIMIT {row_limit}"
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(wrapped)
+        except Exception as exc:
+            return f"[ERROR: query failed: {exc}]"
+
+        dict_rows = [dict(row) for row in rows]
+        body = format_rows(dict_rows, output_format=fmt)
+        suffix = f"\n\n({len(dict_rows)} row(s), limit {row_limit})"
+        if len(dict_rows) >= row_limit:
+            suffix += " — results truncated; narrow the query or raise limit"
+        return body + suffix
+
+    async def list_tables(self, schema: str = "public") -> str:
+        """List tables in a schema (for discovery before querying)."""
+        if not self._pool:
+            return "[ERROR: Postgres is not connected]"
+
+        schema_name = schema.strip() or "public"
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT table_schema, table_name, table_type
+                    FROM information_schema.tables
+                    WHERE table_schema = $1
+                    ORDER BY table_name
+                    """,
+                    schema_name,
+                )
+        except Exception as exc:
+            return f"[ERROR: list tables failed: {exc}]"
+
+        if not rows:
+            return f"(no tables in schema `{schema_name}`)"
+
+        lines = [f"## Tables in `{schema_name}`", ""]
+        for row in rows:
+            lines.append(f"- {row['table_name']} ({row['table_type']})")
+        return "\n".join(lines)
 
     async def _embed(self, text: str) -> list[float] | None:
         return await _embed(text)

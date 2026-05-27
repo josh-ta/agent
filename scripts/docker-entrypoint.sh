@@ -79,7 +79,11 @@ fi
 # ── Trim oversized MEMORY.md ──────────────────────────────────────────────────
 # Bob appends lessons after every failure. If MEMORY.md grows too large it
 # blows the context window. Keep only the last 4000 chars (most recent lessons).
-MEMORY_FILE="${IDENTITY_PATH:-/app/agent/identity}/MEMORY.md"
+IDENTITY_DIR="${IDENTITY_PATH:-/app/agent/identity}"
+if [[ -d "$IDENTITY_DIR" ]]; then
+    chmod -R a+rwX "$IDENTITY_DIR" 2>/dev/null || true
+fi
+MEMORY_FILE="${IDENTITY_DIR}/MEMORY.md"
 if [[ -f "$MEMORY_FILE" ]]; then
     SIZE=$(wc -c < "$MEMORY_FILE")
     if [[ "$SIZE" -gt 8000 ]]; then

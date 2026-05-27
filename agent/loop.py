@@ -1048,6 +1048,13 @@ class AgentLoop:
                 "Please retry or ask me to continue from a narrower checkpoint."
             )
         )
+        from agent.task_router import requires_tool_use
+
+        if tool_calls == 0 and requires_tool_use(task.content):
+            fallback = (
+                "I couldn't complete this request because I didn't run the required tools "
+                "(for example query_postgres for database/CSV work). Please retry — I'll query the database directly."
+            )
         return fallback, False
 
     async def _is_answer_acceptable(self, *, task: Task, output: str, tool_calls: int) -> bool:
@@ -1070,10 +1077,13 @@ class AgentLoop:
         )
         try:
             validator = self.agents.get("fast", self.agent)
-            result = await validator.run(validator_prompt, usage_limits=UsageLimits(request_limit=None))
+            async with validator.run_mcp_servers():
+                result = await validator.run(validator_prompt, usage_limits=UsageLimits(request_limit=None))
             verdict = str(result.output).strip().splitlines()[0].strip().upper()
             return verdict == "ANSWERED"
         except Exception:
+            if tool_calls == 0 and requires_tool_use(task.content):
+                return False
             return len(text.split()) >= 6
 
     async def _repair_user_answer(self, *, task: Task, output: str) -> str:
@@ -1088,7 +1098,8 @@ class AgentLoop:
         )
         try:
             repair_agent = self.agents.get("fast", self.agent)
-            result = await repair_agent.run(repair_prompt, usage_limits=UsageLimits(request_limit=None))
+            async with repair_agent.run_mcp_servers():
+                result = await repair_agent.run(repair_prompt, usage_limits=UsageLimits(request_limit=None))
             return str(result.output).strip()
         except Exception:
             return output.strip()

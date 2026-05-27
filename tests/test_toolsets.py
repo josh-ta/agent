@@ -135,8 +135,11 @@ class _Postgres:
     async def search_shared_memory(self, query: str, limit: int = 5) -> str:
         return f"shared:{query}:{limit}"
 
+    async def list_tables(self, schema: str = "public") -> str:
+        return f"tables:{schema}"
 
-@pytest.mark.asyncio
+    async def query_readonly(self, sql: str, *, limit: int = 500, output_format: str = "table") -> str:
+        return f"query:{sql}:{limit}:{output_format}"
 async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
     agent = _Agent()
     sqlite = _SQLite()
@@ -408,6 +411,8 @@ async def test_attach_database_tools_with_single_backend() -> None:
     postgres_agent = _Agent()
     toolsets.attach_database_tools(postgres_agent, sqlite=None, postgres=_Postgres())  # type: ignore[arg-type]
     assert "list_agents" in postgres_agent.funcs
+    assert "query_postgres" in postgres_agent.funcs
+    assert "list_postgres_tables" in postgres_agent.funcs
     assert "memory_search" not in postgres_agent.funcs
     assert "Postgres (shared)" in await postgres_agent.funcs["db_stats"]()
     assert "SQLite (local)" not in await postgres_agent.funcs["db_stats"]()

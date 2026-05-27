@@ -900,6 +900,12 @@ class ReflectionService:
     def _fast_agent(self) -> Agent:  # type: ignore[type-arg]
         return self._agents.get("fast") or self._agents.get("smart") or next(iter(self._agents.values()))
 
+    async def _run_fast_agent(self, prompt: str) -> str:
+        agent = self._fast_agent
+        async with agent.run_mcp_servers():
+            result = await agent.run(prompt, usage_limits=UsageLimits(request_limit=None))
+        return str(result.output).strip()
+
     async def reflect(self, task: "Task", result: "TaskResult", success_count: int, memory_update_interval: int) -> None:
         if not self._memory:
             return
@@ -972,11 +978,7 @@ class ReflectionService:
             "If there is nothing genuinely reusable to record, reply with exactly: NOTHING_TO_RECORD"
         )
         try:
-            insight_result = await self._fast_agent.run(
-                reflection_prompt,
-                usage_limits=UsageLimits(request_limit=None),
-            )
-            insight = str(insight_result.output).strip()
+            insight = await self._run_fast_agent(reflection_prompt)
             if not insight or "NOTHING_TO_RECORD" in insight:
                 return
             for raw_line in insight.splitlines():
@@ -1025,11 +1027,7 @@ class ReflectionService:
             "Be concise and specific."
         )
         try:
-            reflection = await self._fast_agent.run(
-                reflection_prompt,
-                usage_limits=UsageLimits(request_limit=None),
-            )
-            lesson = str(reflection.output).strip()
+            lesson = await self._run_fast_agent(reflection_prompt)
             for raw_line in lesson.splitlines():
                 line = raw_line.strip()
                 if not line:
