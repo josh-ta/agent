@@ -20,6 +20,16 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 from pydantic_ai import Agent
+
+
+@contextlib.asynccontextmanager
+async def _agent_mcp_context(agent: object):
+    run_mcp_servers = getattr(agent, "run_mcp_servers", None)
+    if run_mcp_servers is None:
+        yield
+        return
+    async with run_mcp_servers():
+        yield
 from pydantic_ai.messages import (
     FinalResultEvent,
     FunctionToolCallEvent,
@@ -468,7 +478,7 @@ class RunExecutor:
                             expected_run_generation=_expected_rg,
                         ),
                     )
-                async with agent.run_mcp_servers():
+                async with _agent_mcp_context(agent):
                     thinking_buf: list[str] = []
                     text_buf: list[str] = []
                     is_final = False
@@ -731,16 +741,28 @@ class RunExecutor:
         """Wait for the next model event, but only fail after real inactivity."""
         poll_s = 1.0
         loop = asyncio.get_running_loop()
-        while True:
-            now = loop.time()
-            idle_s = now - float(progress_state["last_activity_at"])
-            if idle_s >= self._model_event_idle_timeout_s:
-                raise asyncio.TimeoutError()
-            wait_s = min(poll_s, self._model_event_idle_timeout_s - idle_s)
-            try:
-                return await asyncio.wait_for(anext(event_iter), timeout=wait_s)
-            except asyncio.TimeoutError:
-                continue
+        pending: asyncio.Task[object] | None = None
+        try:
+            while True:
+                now = loop.time()
+                idle_s = now - float(progress_state["last_activity_at"])
+                if idle_s >= self._model_event_idle_timeout_s:
+                    raise asyncio.TimeoutError()
+                wait_s = min(poll_s, self._model_event_idle_timeout_s - idle_s)
+                if pending is None:
+                    pending = asyncio.create_task(anext(event_iter))
+                if pending.done():
+                    return pending.result()
+                try:
+                    await asyncio.wait_for(asyncio.shield(pending), timeout=wait_s)
+                except asyncio.TimeoutError:
+                    continue
+                return pending.result()
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await pending
 
     @staticmethod
     async def _close_event_stream(event_iter: object) -> None:
@@ -952,7 +974,7 @@ class ReflectionService:
 
     async def _run_fast_agent(self, prompt: str) -> str:
         agent = self._fast_agent
-        async with agent.run_mcp_servers():
+        async with _agent_mcp_context(agent):
             result = await agent.run(prompt, usage_limits=UsageLimits(request_limit=None))
         return str(result.output).strip()
 

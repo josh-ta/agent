@@ -36,6 +36,7 @@ from agent.loop_services import (
     RunExecutor,
     TaskContextBuilder,
     TaskJournal,
+    _agent_mcp_context,
 )
 from agent.tools.discord_tools import DiscordAttachment
 from agent.project_memory import extract_project_memory_facts, save_project_memory_facts
@@ -1077,7 +1078,7 @@ class AgentLoop:
         )
         try:
             validator = self.agents.get("fast", self.agent)
-            async with validator.run_mcp_servers():
+            async with _agent_mcp_context(validator):
                 result = await validator.run(validator_prompt, usage_limits=UsageLimits(request_limit=None))
             verdict = str(result.output).strip().splitlines()[0].strip().upper()
             return verdict == "ANSWERED"
@@ -1098,7 +1099,7 @@ class AgentLoop:
         )
         try:
             repair_agent = self.agents.get("fast", self.agent)
-            async with repair_agent.run_mcp_servers():
+            async with _agent_mcp_context(repair_agent):
                 result = await repair_agent.run(repair_prompt, usage_limits=UsageLimits(request_limit=None))
             return str(result.output).strip()
         except Exception:

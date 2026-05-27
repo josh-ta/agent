@@ -2099,6 +2099,7 @@ async def test_discord_event_presenter_ignores_empty_and_unhandled_events(fake_c
     await sink(TextTurnEndEvent(text="done", is_final=True))
     await sink(ProgressEvent(message=""))
     await sink(SimpleNamespace())
+    await sink.finalize_reply("done")  # type: ignore[attr-defined]
     await asyncio.sleep(0.01)
 
     assert channel.sent == ["done"]

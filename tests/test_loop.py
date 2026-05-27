@@ -29,10 +29,16 @@ class _RecordingAgent:
         return _NullContext()
 
     async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        from pydantic_ai.messages import FinalResultEvent, FunctionToolCallEvent, ToolCallPart
+
         self.prompts.append(prompt)
         self.histories.append(message_history)
-        if False:
-            yield None
+        yield FunctionToolCallEvent(
+            ToolCallPart(tool_name="read_file", args='{"path": "README.md"}', tool_call_id="call-1")
+        )
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "done"
+        yield final
 
 
 class _BadArgsAgent:
