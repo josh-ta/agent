@@ -92,6 +92,13 @@ class RunResult:
     shell_failures: list[str] = field(default_factory=list)
     input_chars: int = 0
     output_chars: int = 0
+    cancelled: bool = False
+
+
+class TaskRunCancelled(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 class TaskJournal:
@@ -598,9 +605,16 @@ class RunExecutor:
 
                     while True:
                         try:
-                            event = await self._await_next_stream_event(event_iter, progress_state)
+                            event = await self._await_next_stream_event(
+                                event_iter,
+                                progress_state,
+                                cancel_check=lambda: RunExecutor._cancel_reason(task),
+                            )
                         except StopAsyncIteration:
                             break
+                        except TaskRunCancelled:
+                            await self._close_event_stream(event_iter)
+                            raise
                         except asyncio.TimeoutError as exc:
                             await self._close_event_stream(event_iter)
                             timeout_message = self._model_timeout_message(progress_state)
@@ -671,15 +685,24 @@ class RunExecutor:
                                 )
                             )
 
-                        if task.inject_queue and isinstance(event, (FunctionToolResultEvent, FinalResultEvent)):
-                            injected_messages = self._drain_queue(task.inject_queue)
+                        if isinstance(event, (FunctionToolResultEvent, FinalResultEvent)):
+                            injected_messages, cancel_reason = self._drain_injections(task)
+                            if cancel_reason:
+                                await self._close_event_stream(event_iter)
+                                raise TaskRunCancelled(cancel_reason)
                             if injected_messages:
                                 injection_restart_requested = True
                                 await self._close_event_stream(event_iter)
                                 break
 
-                if injection_restart_requested or (task.inject_queue and not task.inject_queue.empty()):
-                    injected = injected_messages or self._drain_queue(task.inject_queue)
+                if not injection_restart_requested:
+                    drained, cancel_reason = self._drain_injections(task)
+                    if cancel_reason:
+                        raise TaskRunCancelled(cancel_reason)
+                    injected_messages = drained
+
+                if injection_restart_requested or injected_messages:
+                    injected = injected_messages
                     if injected:
                         count = len(injected)
                         combined = "\n".join(f"[{i + 1}] {msg}" for i, msg in enumerate(injected))
@@ -779,6 +802,21 @@ class RunExecutor:
                     output_chars=oc,
                 )
 
+            except TaskRunCancelled as exc:
+                message = self._cancel_user_message(str(exc.reason))
+                await self._bridge.emit(ProgressEvent(message=f"⏹️ {message}"))
+                up = self._compose_user_prompt(prompt, task)
+                ic, oc = len(up), len(result_output)
+                return RunResult(
+                    output=message,
+                    tool_calls=tool_calls,
+                    user_visible_reply_sent=user_visible_reply_sent,
+                    attachments=attachments,
+                    shell_failures=shell_failures,
+                    input_chars=ic,
+                    output_chars=oc,
+                    cancelled=True,
+                )
             except Exception as exc:
                 if isinstance(exc, UserInputRequired):
                     up = self._compose_user_prompt(prompt, task)
@@ -856,6 +894,8 @@ class RunExecutor:
         self,
         event_iter: object,
         progress_state: dict[str, object],
+        *,
+        cancel_check: Callable[[], str | None] | None = None,
     ) -> object:
         """Wait for the next model event, but only fail after real inactivity."""
         poll_s = 1.0
@@ -863,6 +903,10 @@ class RunExecutor:
         pending: asyncio.Task[object] | None = None
         try:
             while True:
+                if cancel_check is not None:
+                    reason = cancel_check()
+                    if reason:
+                        raise TaskRunCancelled(reason)
                 now = loop.time()
                 idle_s = now - float(progress_state["last_activity_at"])
                 if idle_s >= self._model_event_idle_timeout_s:
@@ -1047,6 +1091,45 @@ class RunExecutor:
             if content is not None and content is not value:
                 texts.extend(RunExecutor._iter_text_values(content))
         return texts
+
+    @staticmethod
+    def _cancel_reason(task: "Task") -> str | None:
+        meta = task.metadata or {}
+        if meta.get("_cancel_requested"):
+            return str(meta.get("_cancel_reason") or "Task cancelled.")
+        return None
+
+    @staticmethod
+    def _cancel_user_message(_reason: str) -> str:
+        return "Task cancelled."
+
+    @staticmethod
+    def _drain_injections(task: "Task") -> tuple[list[str], str | None]:
+        from agent.session_router import is_cancel_injection
+
+        meta_reason = RunExecutor._cancel_reason(task)
+        if meta_reason:
+            if task.inject_queue is not None:
+                while not task.inject_queue.empty():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        task.inject_queue.get_nowait()
+            return [], meta_reason
+
+        if task.inject_queue is None:
+            return [], None
+
+        normal: list[str] = []
+        cancel: str | None = None
+        while not task.inject_queue.empty():
+            try:
+                msg = task.inject_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if is_cancel_injection(msg):
+                cancel = msg
+            else:
+                normal.append(msg)
+        return normal, cancel
 
     @staticmethod
     def _drain_queue(queue: asyncio.Queue[str]) -> list[str]:

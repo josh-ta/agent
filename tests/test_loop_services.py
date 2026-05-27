@@ -992,6 +992,41 @@ async def test_run_executor_collects_workspace_csv_attachments(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_run_executor_honours_cancel_injection() -> None:
+    class _SlowAgent:
+        def run_mcp_servers(self) -> _NullContext:
+            return _NullContext()
+
+        async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+            await asyncio.sleep(2.0)
+            if False:
+                yield None
+
+    task = Task(content="export csv")
+    task.metadata = {}
+    task.inject_queue = asyncio.Queue()
+    cancel_reason = (
+        "Operator issued /cancel. Stop after the current safe step and acknowledge cancellation."
+    )
+    task.metadata["_cancel_requested"] = True
+    task.metadata["_cancel_reason"] = cancel_reason
+    await task.inject_queue.put(cancel_reason)
+
+    bridge = _Bridge()
+    executor = RunExecutor(event_bridge=bridge)
+    result = await executor.run(
+        task=task,
+        agent=_SlowAgent(),  # type: ignore[arg-type]
+        base_prompt="export csv",
+        tier="smart",
+    )
+
+    assert result.cancelled is True
+    assert result.output == "Task cancelled."
+    assert any(isinstance(event, ProgressEvent) and "Task cancelled" in event.message for event in bridge.events)
+
+
+@pytest.mark.asyncio
 async def test_run_executor_emits_idle_progress_when_task_goes_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "progress_heartbeat_seconds", 1)
     bridge = _Bridge()

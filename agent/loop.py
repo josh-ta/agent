@@ -294,9 +294,12 @@ class AgentLoop:
             return False
         if channel_id is not None and task.channel_id != channel_id:
             return False
-        if task.inject_queue is None:
-            return False
-        await task.inject_queue.put(reason)
+        if task.metadata is None:
+            task.metadata = {}
+        task.metadata["_cancel_requested"] = True
+        task.metadata["_cancel_reason"] = reason
+        if task.inject_queue is not None:
+            await task.inject_queue.put(reason)
         return True
 
     def describe_work(self, *, channel_id: int | None = None) -> str:
@@ -514,6 +517,15 @@ class AgentLoop:
             session_id = str(metadata.get("session_id", "")).strip()
             if not session_id:
                 metadata["session_id"] = f"{source}:{task_id}"
+            if row.get("status") == "running":
+                if hasattr(self.memory, "fail_task"):
+                    await self.memory.fail_task(
+                        task_id,
+                        error="Interrupted by agent restart.",
+                        metadata=metadata,
+                    )
+                log.info("pending_running_task_discarded_on_restore", task_id=task_id)
+                continue
             task = Task(
                 content=str(row.get("content", "")),
                 source=source,
@@ -521,9 +533,8 @@ class AgentLoop:
                 channel_id=self._coerce_int(metadata.get("channel_id")),
                 message_id=self._coerce_int(metadata.get("message_id")),
                 metadata=metadata,
+                inject_queue=asyncio.Queue(),
             )
-            if row.get("status") == "running" and hasattr(self.memory, "mark_task_queued"):
-                await self.memory.mark_task_queued(task_id, metadata=metadata)
             await self.enqueue(task)
             restored += 1
         if restored:
@@ -692,6 +703,34 @@ class AgentLoop:
             attachments = run_result.attachments
             in_tok = max(0, getattr(run_result, "input_chars", 0) or 0) // 4
             out_tok = max(0, getattr(run_result, "output_chars", 0) or 0) // 4
+
+            if run_result.cancelled:
+                elapsed_ms = (asyncio.get_running_loop().time() - start) * 1000
+                final_output = run_result.output or "Task cancelled."
+                await bridge.emit(TaskErrorEvent(error=final_output[:400]))
+                if self.memory and task_id and hasattr(self.memory, "fail_task"):
+                    try:
+                        await self.memory.fail_task(
+                            task_id,
+                            error=final_output,
+                            metadata=task.metadata,
+                        )
+                    except Exception:
+                        pass
+                Metrics.inc_task_completed(success=False)
+                return TaskResult(
+                    task=task,
+                    output=final_output,
+                    success=False,
+                    status="failed",
+                    elapsed_ms=elapsed_ms,
+                    tool_calls=tool_calls,
+                    attachments=attachments,
+                    retrieved_memory_ids=retrieved_memory_ids,
+                    retrieved_procedure_ids=retrieved_procedure_ids,
+                    input_tokens_est=in_tok,
+                    output_tokens_est=out_tok,
+                )
 
             if run_result.waiting_for_user:
                 if task.source == "a2a":

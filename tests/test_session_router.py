@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from agent.session_router import SessionRouter, TurnIntent
+from agent.session_router import SessionRouter, TurnIntent, is_cancel_injection
 from agent.task_waits import TaskWaitRegistry
+
+
+def test_is_cancel_injection() -> None:
+    assert is_cancel_injection("Operator issued /cancel. Stop after the current safe step.")
+    assert is_cancel_injection("User asked to pause/cancel after the current step.")
+    assert not is_cancel_injection("Please also filter by venue kind")
 
 
 def _suspend(

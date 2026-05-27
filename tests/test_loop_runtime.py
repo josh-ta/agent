@@ -750,7 +750,7 @@ async def test_restore_waiting_tasks_returns_zero_when_rows_do_not_restore() -> 
 
 
 @pytest.mark.asyncio
-async def test_restore_pending_tasks_requeues_running_and_queued_rows() -> None:
+async def test_restore_pending_tasks_requeues_queued_and_fails_running_rows() -> None:
     memory = _Memory()
     memory.rows["task-queued"] = {
         "task_id": "task-queued",
@@ -772,9 +772,10 @@ async def test_restore_pending_tasks_requeues_running_and_queued_rows() -> None:
 
     restored = await loop.restore_pending_tasks()
 
-    assert restored == 2
-    assert loop.queue.qsize() == 2
-    assert memory.rows["task-running"]["status"] == "queued"
+    assert restored == 1
+    assert loop.queue.qsize() == 1
+    assert memory.rows["task-running"]["status"] == "failed"
+    assert "Interrupted by agent restart" in memory.rows["task-running"]["error"]
 
 
 @pytest.mark.asyncio
@@ -788,6 +789,14 @@ async def test_restore_pending_tasks_skips_waiting_entries_and_builds_fallback_s
             "content": "Waiting work",
             "status": "waiting_for_user",
             "metadata": {"task_id": "task-waiting", "wait_state": {"question": "?", "timeout_s": 10}},
+        },
+        "task-queued": {
+            "task_id": "task-queued",
+            "source": "api",
+            "author": "Josh",
+            "content": "Queued work",
+            "status": "queued",
+            "metadata": {"task_id": "task-queued"},
         },
         "task-running": {
             "task_id": "task-running",
@@ -817,8 +826,8 @@ async def test_restore_pending_tasks_skips_waiting_entries_and_builds_fallback_s
     restored_task = await loop.queue.get()
 
     assert restored == 1
-    assert restored_task.metadata["session_id"] == "api:task-running"
-    assert memory.rows["task-running"]["status"] == "queued"
+    assert restored_task.metadata["session_id"] == "api:task-queued"
+    assert memory.rows["task-running"]["status"] == "failed"
 
 
 @pytest.mark.asyncio

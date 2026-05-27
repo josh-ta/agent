@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from agent.task_waits import TaskWaitRegistry
+
+_CANCEL_INJECTION_RE = re.compile(
+    r"(?i)(operator issued /(?:cancel|force-cancel|forget|replace)|"
+    r"user asked to pause/cancel|stop after the current safe step|"
+    r"discard (?:stale work|the old task)|hand off to the replacement|"
+    r"cancelled by operator)"
+)
+
+
+def is_cancel_injection(text: str) -> bool:
+    """True when an inject-queue message is a cancel/replace control signal."""
+    return bool(_CANCEL_INJECTION_RE.search(text.strip()))
 
 
 class TurnIntent(str, Enum):
