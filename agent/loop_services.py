@@ -286,30 +286,52 @@ class TaskContextBuilder:
         )
 
     @staticmethod
+    def _load_event_spec_skill() -> str:
+        skill_path = settings.skills_path / "event-spec-analysis.md"
+        if not skill_path.exists():
+            return ""
+        return skill_path.read_text(encoding="utf-8").strip()[:3500]
+
+    @staticmethod
     def _load_database_workflow_hint(content: str, metadata: dict | None = None) -> str:
-        from agent.task_router import requires_database_csv_export, requires_database_query
+        from agent.task_router import (
+            requires_database_csv_export,
+            requires_database_query,
+            requires_event_spec_analysis,
+        )
 
         if not requires_database_query(content, metadata=metadata):
             return ""
+        spec_block = ""
+        if requires_event_spec_analysis(content, metadata=metadata):
+            spec_body = TaskContextBuilder._load_event_spec_skill()
+            if spec_body:
+                spec_block = (
+                    "## Event spec / prediction analysis (rank & recommend — do not ask for criteria)\n"
+                    f"{spec_body}\n"
+                )
         skill_path = settings.skills_path / "query-database.md"
         if not skill_path.exists():
-            return ""
+            return spec_block
         body = skill_path.read_text(encoding="utf-8").strip()[:2500]
         if requires_database_csv_export(content, metadata=metadata):
             return (
-                "## Database / CSV export (use tools — do not answer from memory)\n"
+                spec_block
+                + "## Database / CSV export (use tools — do not answer from memory)\n"
                 f"{body}\n"
                 "For CSV exports use query_postgres(..., output_format='csv', output_path='/workspace/export.csv') "
                 "so the file is written directly without piping rows through write_file. "
                 "The CSV is uploaded to Discord automatically — do not tell the user to open /workspace."
             )
         return (
-            "## Database analytics (use query_postgres — do not answer from memory)\n"
+            spec_block
+            + "## Database analytics (use query_postgres — do not answer from memory)\n"
             f"{body}\n"
             "Answer in Discord text unless the user explicitly asks for a CSV/file.\n"
             "Be efficient: one schema check if needed, then 1–3 focused SELECT queries with LIMIT.\n"
             "Do not run more than 5 query_postgres calls unless the user asks for deeper exploration.\n"
-            "Never claim you lack database access when POSTGRES_URL is configured."
+            "Never claim you lack database access when POSTGRES_URL is configured.\n"
+            "For spec/prediction asks: rank events with reasoning using proxy signals — missing price history is not a blocker."
         )
 
     async def _load_lessons(self, content: str) -> str:
@@ -502,6 +524,13 @@ class RunExecutor:
         self._model_event_idle_timeout_s = max(1.0, float(configured_timeout))
 
     @staticmethod
+    def _load_event_spec_skill() -> str:
+        skill_path = settings.skills_path / "event-spec-analysis.md"
+        if not skill_path.exists():
+            return ""
+        return skill_path.read_text(encoding="utf-8").strip()[:3500]
+
+    @staticmethod
     def _load_query_database_skill() -> str:
         skill_path = settings.skills_path / "query-database.md"
         if not skill_path.exists():
@@ -509,7 +538,11 @@ class RunExecutor:
         return skill_path.read_text(encoding="utf-8").strip()[:2500]
 
     def _build_tool_retry_prompt(self, *, base_prompt: str, task: "Task", retry_index: int) -> str:
-        from agent.task_router import requires_database_csv_export, requires_database_query
+        from agent.task_router import (
+            requires_database_csv_export,
+            requires_database_query,
+            requires_event_spec_analysis,
+        )
 
         skill_block = ""
         if requires_database_query(task.content, metadata=task.metadata):
@@ -521,6 +554,15 @@ class RunExecutor:
                     else "Database analytics"
                 )
                 skill_block = f"\n## {label} (follow exactly)\n{skill}\n"
+            if requires_event_spec_analysis(task.content, metadata=task.metadata):
+                spec = self._load_event_spec_skill()
+                if spec:
+                    skill_block += (
+                        "\n## Event spec / prediction (MANDATORY)\n"
+                        f"{spec}\n"
+                        "Query Postgres, rank events, explain why each is a spec candidate. "
+                        "Do NOT ask for criteria or refuse due to missing price history.\n"
+                    )
 
         if retry_index == 0:
             mandatory = (
@@ -554,7 +596,7 @@ class RunExecutor:
         analytics: bool = False,
         message_history: list | None = None,
     ) -> RunResult:
-        from agent.task_router import requires_database_csv_export, requires_database_query
+        from agent.task_router import requires_database_query, requires_event_spec_analysis
 
         _, cancel_reason = self._drain_injections(task)
         if cancel_reason:
@@ -576,12 +618,23 @@ class RunExecutor:
 
         analytics_block = ""
         if analytics and not recovery:
-            analytics_block = (
-                "\n## FIRST ACTION REQUIRED\n"
-                "This is a Postgres analytics question. Your FIRST step MUST be `list_postgres_tables()` "
-                "or `query_postgres()` (e.g. against the `events` table). "
-                "Do NOT answer from memory or claim you lack database access.\n"
-            )
+            if requires_event_spec_analysis(task.content, metadata=task.metadata):
+                spec = self._load_event_spec_skill()
+                analytics_block = (
+                    "\n## FIRST ACTION REQUIRED — event spec / price-drop prediction\n"
+                    "Query the `events` table, rank the top N candidates, and explain WHY each is a spec pick.\n"
+                    "Use chartmetric scores, venue size, sale/event dates, ticket limits, genre — NOT historical price time series.\n"
+                    "Do NOT ask Josh for criteria. Do NOT refuse because price history is missing.\n"
+                )
+                if spec:
+                    analytics_block += f"\n{spec}\n"
+            else:
+                analytics_block = (
+                    "\n## FIRST ACTION REQUIRED\n"
+                    "This is a Postgres analytics question. Your FIRST step MUST be `list_postgres_tables()` "
+                    "or `query_postgres()` (e.g. against the `events` table). "
+                    "Do NOT answer from memory or claim you lack database access.\n"
+                )
 
         if recovery:
             prompt = (

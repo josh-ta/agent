@@ -113,6 +113,10 @@ def heuristic_route(
         intent = "database_csv_export"
     elif db_query:
         intent = "database_analytics"
+    elif re.search(r"\b(spec|specced|price\s+drop|drop\s+in\s+price|predict)\b", text, re.I) and (
+        re.search(r"\bevents?\b", text, re.I) or re.search(r"\bsale?s?\b", text, re.I)
+    ):
+        intent = "database_analytics"
     elif re.search(r"\b(code|implement|fix|debug|refactor|\.py\b)", text, re.I):
         intent = "code_work"
     elif re.search(r"\b(run|shell|deploy|docker|ssh)\b", text, re.I):
@@ -157,7 +161,7 @@ Given the user's message, recent session context, and available tools, output a 
 
 Rules:
 - social_chat: greetings, thanks, acknowledgments only — no tools needed.
-- database_analytics: questions about events, sales, tickets, venues, rankings, reports from Postgres — needs query_postgres (NOT csv unless user asks for a file).
+- database_analytics: questions about events, sales, tickets, venues, rankings, spec picks, price-drop predictions — needs query_postgres then **analyze and recommend** (NOT csv unless user asks for a file). Missing historical price data is NOT a reason to refuse; use chartmetric, venue, dates, limits.
 - database_csv_export: user explicitly wants a CSV/file/download/export/resend attachment.
 - code_work: implement, fix, debug, refactor code.
 - shell_ops: deploy, docker, ssh, run commands.

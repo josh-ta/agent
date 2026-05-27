@@ -19,6 +19,8 @@ For questions like "top 5 events", "sales starting today", "which should I buy":
 
 3. **Answer in prose** — summarize the rows for the user. Do not export CSV unless they ask for a file.
 
+For **spec picks**, **price-drop predictions**, or **which events to buy** — load the full `event-spec-analysis` skill behavior: query + rank + explain using proxy signals (chartmetric, venue, dates, limits). Do not refuse when historical price time series is missing.
+
 **Efficiency:** Aim for 1 schema check + 1–2 data queries. Do not loop more than 5 `query_postgres` calls.
 
 ## CSV export (only when user asks for a file)
@@ -45,5 +47,7 @@ The file is **uploaded to Discord automatically**. Do not tell the user to open 
 
 - Answering from memory instead of querying — always call tools first.
 - Claiming you lack database access — you have `list_postgres_tables` and `query_postgres`.
+- Refusing spec/prediction asks because price history is missing — use proxy signals (see `event-spec-analysis.md`).
+- Asking the user to define criteria for obvious spec/ranking questions — just query, rank, and explain.
 - Exporting CSV when the user only asked a question.
 - Running 10+ exploratory queries — tighten SQL instead.

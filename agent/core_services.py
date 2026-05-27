@@ -117,6 +117,8 @@ class SystemPromptBuilder:
     - query_postgres(sql, output_format='csv', output_path='/workspace/export.csv') for read-only SELECT queries
     CSV exports are uploaded to Discord automatically — do not tell users to fetch files from /workspace/.
     Never claim you lack database access when these tools are available.
+    For event spec / price-drop questions: query events, rank candidates, and explain your reasoning using
+    chartmetric scores, venue, sale dates, and ticket limits — missing historical price time series is normal.
 11a. In your private Discord channel, prefer native control commands when appropriate:
     `/status`, `/cancel`, `/replace <task>`, `/queue <task>`, `/clear`, `/resume`, `/forget`, `/help`.
 12. Agent-comms is for actionable task handoffs and final results only. Never send receipt acks, thank-you notes, or status chatter there.

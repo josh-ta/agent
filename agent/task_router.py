@@ -62,7 +62,17 @@ _EVENT_DATA_RE = re.compile(
     r"\b("
     r"events?|sale?s?|ticket|tickets|venue|venues|arena|stadium|onsale|presale|"
     r"chartmetric|buying|focus\s+on|which\s+\d+|top\s+\d+|starting\s+today|"
-    r"on\s+sale|ticketmaster"
+    r"on\s+sale|ticketmaster|spec|specced|speccing|public\s+sale|upcoming\s+sale|"
+    r"price\s+drop|drop\s+in\s+price|predict|forecast"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_EVENT_SPEC_RE = re.compile(
+    r"\b("
+    r"spec|specced|speccing|secondary\s+market|drop\s+in\s+price|price\s+drop|"
+    r"will\s+drop|predict|prediction|forecast|public\s+sale|upcoming\s+sale|"
+    r"between\s+the\s+onsale|onsale\s+date\s+and|before\s+the\s+event"
     r")\b",
     re.IGNORECASE,
 )
@@ -74,12 +84,17 @@ _DATABASE_CSV_RE = re.compile(
 
 _DATABASE_DENIAL_RE = re.compile(
     r"\b("
-    r"do not have|don't have|cannot|can't|unable to|no access|i do not have"
-    r").{0,60}\b("
-    r"access|database|postgres|event data|information about|sales starting|data or information"
+    r"do not have|don't have|cannot|can't|unable to|no access|i do not have|i am unable"
+    r").{0,80}\b("
+    r"access|database|postgres|event data|information about|sales starting|data or information|"
+    r"historical pricing|price changes over time|predictions|fulfill"
     r")\b|"
     r"\bprovide a list of events\b|"
-    r"\bcannot fulfill this request\b",
+    r"\bprovide the criteria\b|"
+    r"\bwithout these criteria\b|"
+    r"\bdoes not include historical\b|"
+    r"\bcannot fulfill this request\b|"
+    r"\bcannot definitively recommend\b",
     re.IGNORECASE,
 )
 
@@ -134,6 +149,19 @@ def _content_requires_database(text: str) -> bool:
 def looks_like_database_denial(text: str) -> bool:
     """True when the model claims it lacks DB/event data instead of querying."""
     return bool(_DATABASE_DENIAL_RE.search(text.strip()))
+
+
+def requires_event_spec_analysis(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    """True when the user wants spec picks or price-drop predictions from event data."""
+    text = content.strip()
+    if not text:
+        return False
+    if _EVENT_SPEC_RE.search(text) and (
+        _content_requires_database(text) or bool(_EVENT_DATA_RE.search(text))
+    ):
+        return True
+    routing = _routing_metadata(metadata)
+    return str(routing.get("intent", "")) == "event_spec_analysis"
 
 
 def requires_database_analytics(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
