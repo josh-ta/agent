@@ -301,8 +301,10 @@ class PostgresStore:
         dict_rows = [dict(row) for row in rows]
         body = format_rows(dict_rows, output_format=fmt)
         if fmt == "csv" and output_path:
+            from agent.export_delivery import register_export_path
             from agent.tools.filesystem import write_file
 
+            register_export_path(output_path)
             write_result = write_file(output_path, body)
             if write_result.startswith("[ERROR"):
                 return write_result

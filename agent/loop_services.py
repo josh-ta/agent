@@ -540,13 +540,14 @@ class RunExecutor:
         shell_failures: list[str] = []
         user_visible_reply_sent = False
         pending_visible_discord_sends: set[str] = set()
+        tool_result_texts: list[str] = []
 
         async def event_stream_handler(_ctx: object, stream: object) -> None:
             nonlocal tool_calls, user_visible_reply_sent
             async for event in stream:  # type: ignore[union-attr]
                 if isinstance(event, FunctionToolCallEvent):
                     tool_calls += 1
-                    tool_name = event.part.tool_name
+                    tool_name = RunExecutor._normalize_tool_name(event.part.tool_name)
                     parsed_args = self._parse_tool_args(event.part.args)
                     log.info(
                         "tool_call",
@@ -565,8 +566,12 @@ class RunExecutor:
                     )
                 elif isinstance(event, FunctionToolResultEvent):
                     ret = getattr(event, "result", None)
-                    tool_name = self._tool_name_from_result_event(event, ret)
+                    tool_name = RunExecutor._normalize_tool_name(
+                        self._tool_name_from_result_event(event, ret)
+                    )
                     result_str = str(getattr(ret, "content", ret)) if ret is not None else ""
+                    if result_str:
+                        tool_result_texts.append(result_str)
                     if (
                         tool_name == "send_discord"
                         and getattr(ret, "tool_call_id", "") in pending_visible_discord_sends
@@ -577,9 +582,12 @@ class RunExecutor:
                         failure = self._detect_shell_failure(result_str)
                         if failure:
                             shell_failures.append(failure)
-                    attachments.extend(
-                        self._extract_discord_attachments(tool_name, getattr(ret, "content", ret))
+                    found = self._extract_discord_attachments(
+                        tool_name, getattr(ret, "content", ret)
                     )
+                    if found:
+                        log.info("discord_attachment_from_tool", tool_name=tool_name, count=len(found))
+                    attachments.extend(found)
                     await self._bridge.emit(
                         ToolResultEvent(
                             tool_name=tool_name,
@@ -596,12 +604,18 @@ class RunExecutor:
                 usage_limits=UsageLimits(request_limit=50, tool_calls_limit=40),
                 event_stream_handler=event_stream_handler,
             )
-        usage_tool_calls = int(getattr(result.usage(), "tool_calls", 0) or 0)
+        raw_usage = getattr(result, "usage", None)
+        usage_obj = raw_usage() if callable(raw_usage) else raw_usage
+        usage_tool_calls = int(getattr(usage_obj, "tool_calls", 0) or 0)
         tool_calls = max(tool_calls, usage_tool_calls)
         output = str(result.output).strip()
         ic, oc = len(composed), len(output)
         await self._maybe_warn_context(ic + oc)
-        attachments = self._finalize_attachments(attachments=attachments, output=output)
+        attachments = self._finalize_attachments(
+            attachments=attachments,
+            output=output,
+            extra_texts=tool_result_texts,
+        )
         return RunResult(
             output=output,
             tool_calls=tool_calls,
@@ -660,6 +674,10 @@ class RunExecutor:
         max_bad_args_retries = 2
 
         while True:
+            from agent.export_delivery import take_export_paths
+
+            take_export_paths()
+
             user_visible_reply_sent = False
             tool_calls = 0
             result_output = ""
@@ -668,6 +686,7 @@ class RunExecutor:
             pending_visible_discord_sends: set[str] = set()
             injection_restart_requested = False
             injected_messages: list[str] = []
+            tool_result_texts: list[str] = []
             loop = asyncio.get_running_loop()
             progress_state = {
                 "last_activity_at": loop.time(),
@@ -770,10 +789,14 @@ class RunExecutor:
                             )
                         elif isinstance(event, FunctionToolResultEvent):
                             ret = getattr(event, "result", None)
-                            tool_name = self._tool_name_from_result_event(event, ret)
+                            tool_name = RunExecutor._normalize_tool_name(
+                                self._tool_name_from_result_event(event, ret)
+                            )
                             if tool_name:
                                 self._set_progress_activity(progress_state, f"reviewing results from `{tool_name}`")
                             result_str = str(getattr(ret, "content", ret)) if ret is not None else ""
+                            if result_str:
+                                tool_result_texts.append(result_str)
                             if (
                                 tool_name == "send_discord"
                                 and getattr(ret, "tool_call_id", "") in pending_visible_discord_sends
@@ -784,7 +807,12 @@ class RunExecutor:
                                 failure = self._detect_shell_failure(result_str)
                                 if failure:
                                     shell_failures.append(failure)
-                            attachments.extend(self._extract_discord_attachments(tool_name, getattr(ret, "content", ret)))
+                            found = self._extract_discord_attachments(
+                                tool_name, getattr(ret, "content", ret)
+                            )
+                            if found:
+                                log.info("discord_attachment_from_tool", tool_name=tool_name, count=len(found))
+                            attachments.extend(found)
                             await self._bridge.emit(
                                 ToolResultEvent(
                                     tool_name=tool_name,
@@ -900,7 +928,11 @@ class RunExecutor:
                 up = self._compose_user_prompt(prompt, task)
                 ic, oc = len(up), len(result_output)
                 await self._maybe_warn_context(ic + oc)
-                attachments = self._finalize_attachments(attachments=attachments, output=result_output)
+                attachments = self._finalize_attachments(
+                    attachments=attachments,
+                    output=result_output,
+                    extra_texts=tool_result_texts,
+                )
                 return RunResult(
                     output=result_output,
                     tool_calls=tool_calls,
@@ -1132,11 +1164,21 @@ class RunExecutor:
         return bool(text) and not text.startswith("[ERROR") and text.startswith("Sent ")
 
     @staticmethod
+    def _normalize_tool_name(name: str) -> str:
+        base = (name or "").strip()
+        if base.startswith("functions."):
+            base = base.split(".", 1)[1]
+        if ":" in base:
+            base = base.split(":", 1)[0]
+        return base
+
+    @staticmethod
     def _tool_name_from_result_event(event: FunctionToolResultEvent, result: object) -> str:
         return str(getattr(event, "tool_name", "") or getattr(result, "tool_name", "") or "")
 
     @staticmethod
     def _extract_discord_attachments(tool_name: str, result: object) -> list[DiscordAttachment]:
+        tool_name = RunExecutor._normalize_tool_name(tool_name)
         if tool_name == "browser_screenshot":
             attachments: list[DiscordAttachment] = []
             for text in RunExecutor._iter_text_values(result):
@@ -1163,6 +1205,12 @@ class RunExecutor:
         output: str,
         extra_texts: list[str] | None = None,
     ) -> list[DiscordAttachment]:
+        from agent.export_delivery import (
+            attachments_for_paths,
+            attachments_from_registered_exports,
+            bare_export_filenames_in_text,
+        )
+
         seen = {attachment.filename for attachment in attachments}
         merged = list(attachments)
         for text in [output, *(extra_texts or [])]:
@@ -1173,6 +1221,23 @@ class RunExecutor:
                     continue
                 seen.add(attachment.filename)
                 merged.append(attachment)
+            for name in bare_export_filenames_in_text(text):
+                for attachment in attachments_for_paths([name]):
+                    if attachment.filename in seen:
+                        continue
+                    seen.add(attachment.filename)
+                    merged.append(attachment)
+        for attachment in attachments_from_registered_exports():
+            if attachment.filename in seen:
+                continue
+            seen.add(attachment.filename)
+            merged.append(attachment)
+        if merged:
+            log.info(
+                "discord_attachments_ready",
+                count=len(merged),
+                filenames=[item.filename for item in merged],
+            )
         return merged
 
     @staticmethod

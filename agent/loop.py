@@ -877,6 +877,8 @@ class AgentLoop:
                 elapsed_ms=round(elapsed_ms),
                 output_len=len(final_output),
                 tool_calls=tool_calls,
+                attachment_count=len(attachments),
+                attachment_names=[item.filename for item in attachments],
             )
 
             status_value: TaskStatus = "succeeded" if task_succeeded else "failed"

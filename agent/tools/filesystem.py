@@ -192,6 +192,11 @@ def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding=encoding)
         log.info("file_written", path=str(fp), size=len(content))
+        suffix = fp.suffix.lower()
+        if suffix in {".csv", ".tsv", ".json", ".txt", ".md"}:
+            from agent.export_delivery import register_export_path
+
+            register_export_path(str(fp))
         return f"Written {len(content)} bytes to {fp}"
     except PermissionError as exc:
         return str(exc)

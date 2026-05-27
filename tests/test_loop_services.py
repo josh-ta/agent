@@ -1395,12 +1395,28 @@ def test_finalize_attachments_collects_from_output_when_events_missed(
 
     finalized = RunExecutor._finalize_attachments(
         attachments=[],
-        output=f"Done! See discord_attachment:{export.name} for the file.",
+        output=f"Done! File: {export.name} with 251 rows.",
     )
 
     assert len(finalized) == 1
     assert finalized[0].filename == "export.csv"
     assert finalized[0].data == b"id,name\n1,Show"
+
+
+def test_finalize_attachments_uses_registered_exports(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent.export_delivery import register_export_path, take_export_paths
+
+    monkeypatch.setattr(settings, "workspace_path", tmp_path)
+    export = tmp_path / "upcoming.csv"
+    export.write_text("id\n1", encoding="utf-8")
+    take_export_paths()
+    register_export_path(str(export))
+
+    finalized = RunExecutor._finalize_attachments(attachments=[], output="CSV ready.")
+    assert len(finalized) == 1
+    assert finalized[0].filename == "upcoming.csv"
 
 
 def test_run_executor_helper_methods_cover_more_edge_cases() -> None:
