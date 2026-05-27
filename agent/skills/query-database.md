@@ -12,7 +12,7 @@ Use when the user asks for data, reports, CSV exports, or SQL against the connec
 
 2. **Run the query** with `query_postgres()`. Only `SELECT`, `WITH`, `EXPLAIN`, or `TABLE` statements are allowed.
 
-3. **CSV export** (write directly to disk — never paste CSV into `write_file`):
+3. **CSV export** (write to workspace for upload — never paste CSV into `write_file`):
    ```
    query_postgres(
      "SELECT ...",
@@ -21,7 +21,7 @@ Use when the user asks for data, reports, CSV exports, or SQL against the connec
      limit=5000,
    )
    ```
-   The file is attached to the Discord reply automatically when export succeeds.
+   The file is **uploaded to Discord automatically** as a message attachment. Do not tell the user to open `/workspace` — they receive the file in chat.
 
 ## Tips
 
@@ -29,6 +29,7 @@ Use when the user asks for data, reports, CSV exports, or SQL against the connec
 - Start with `LIMIT 10` while iterating on the query shape.
 - If results hit the row limit, tighten filters instead of raising limit blindly.
 - Do not use `run_shell` + `psql` when `query_postgres` is available.
+- In your final reply, summarize filters/columns briefly; the CSV file itself is the attachment.
 
 ## Common mistakes
 

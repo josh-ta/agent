@@ -115,7 +115,7 @@ class SystemPromptBuilder:
 11b. When POSTGRES_URL is configured you CAN query the application database:
     - list_postgres_tables() to discover schema
     - query_postgres(sql, output_format='csv', output_path='/workspace/export.csv') for read-only SELECT queries
-    - write_file() to save CSV exports under /workspace/
+    CSV exports are uploaded to Discord automatically — do not tell users to fetch files from /workspace/.
     Never claim you lack database access when these tools are available.
 11a. In your private Discord channel, prefer native control commands when appropriate:
     `/status`, `/cancel`, `/replace <task>`, `/queue <task>`, `/clear`, `/resume`, `/forget`, `/help`.

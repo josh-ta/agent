@@ -60,6 +60,7 @@ async def test_query_readonly_writes_csv_to_output_path(tmp_path, monkeypatch: p
     assert export.exists()
     assert export.read_text(encoding="utf-8") == "id,title\n1,Show"
     assert "Exported CSV to export.csv" in out
+    assert "discord_attachment:export.csv" in out
     assert "Written" in out
 
 

@@ -74,7 +74,8 @@ _SHELL_CRITICAL_FAILURE_RE = re.compile(
 )
 _MAX_STREAMING_TOOL_USE_RETRIES = 2
 _WORKSPACE_EXPORT_PATH_RE = re.compile(
-    r"(?:Written \d+ bytes to|Exported CSV to)\s+(\S+\.(?:csv|tsv|json|txt|md))\b",
+    r"(?:(?:Written \d+ bytes to|Exported CSV to)\s+|discord_attachment:\s*)"
+    r"(\S+\.(?:csv|tsv|json|txt|md))\b",
     re.IGNORECASE,
 )
 _ATTACHABLE_EXTENSIONS = {".csv", ".tsv", ".json", ".txt", ".md"}
@@ -259,7 +260,8 @@ class TaskContextBuilder:
             "## Database / CSV workflow (use tools — do not answer from memory)\n"
             f"{body}\n"
             "For CSV exports use query_postgres(..., output_format='csv', output_path='/workspace/export.csv') "
-            "so the file is written directly without piping rows through write_file."
+            "so the file is written directly without piping rows through write_file. "
+            "The CSV is uploaded to Discord automatically — do not tell the user to open /workspace."
         )
 
     async def _load_lessons(self, content: str) -> str:
@@ -599,6 +601,7 @@ class RunExecutor:
         output = str(result.output).strip()
         ic, oc = len(composed), len(output)
         await self._maybe_warn_context(ic + oc)
+        attachments = self._finalize_attachments(attachments=attachments, output=output)
         return RunResult(
             output=output,
             tool_calls=tool_calls,
@@ -897,6 +900,7 @@ class RunExecutor:
                 up = self._compose_user_prompt(prompt, task)
                 ic, oc = len(up), len(result_output)
                 await self._maybe_warn_context(ic + oc)
+                attachments = self._finalize_attachments(attachments=attachments, output=result_output)
                 return RunResult(
                     output=result_output,
                     tool_calls=tool_calls,
@@ -1153,6 +1157,25 @@ class RunExecutor:
         return attachments
 
     @staticmethod
+    def _finalize_attachments(
+        *,
+        attachments: list[DiscordAttachment],
+        output: str,
+        extra_texts: list[str] | None = None,
+    ) -> list[DiscordAttachment]:
+        seen = {attachment.filename for attachment in attachments}
+        merged = list(attachments)
+        for text in [output, *(extra_texts or [])]:
+            if not text.strip():
+                continue
+            for attachment in RunExecutor._attachments_from_export_result(text):
+                if attachment.filename in seen:
+                    continue
+                seen.add(attachment.filename)
+                merged.append(attachment)
+        return merged
+
+    @staticmethod
     def _attachments_from_export_result(result: str) -> list[DiscordAttachment]:
         from agent.tools.filesystem import read_workspace_attachment
 
@@ -1164,11 +1187,13 @@ class RunExecutor:
                 continue
             payload = read_workspace_attachment(path)
             if payload is None:
+                log.warning("discord_attachment_skipped", path=path)
                 continue
             filename, data = payload
             if filename in seen:
                 continue
             seen.add(filename)
+            log.info("discord_attachment_collected", filename=filename, bytes=len(data))
             attachments.append(DiscordAttachment(filename=filename, data=data))
         return attachments
 

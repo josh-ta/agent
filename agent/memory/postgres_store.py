@@ -309,7 +309,11 @@ class PostgresStore:
             suffix = f" ({len(dict_rows)} row(s), limit {row_limit})"
             if len(dict_rows) >= row_limit:
                 suffix += " — results truncated; narrow the query or raise limit"
-            return f"Exported CSV to {output_path}{suffix}. {write_result}"
+            return (
+                f"Exported CSV to {output_path}{suffix}. {write_result} "
+                f"The CSV will be attached to the Discord reply automatically "
+                f"(discord_attachment:{output_path})."
+            )
 
         suffix = f"\n\n({len(dict_rows)} row(s), limit {row_limit})"
         if len(dict_rows) >= row_limit:
