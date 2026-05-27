@@ -277,6 +277,7 @@ class PostgresStore:
         *,
         limit: int = 500,
         output_format: str = "table",
+        output_path: str | None = None,
     ) -> str:
         """Run a read-only SQL query and return formatted results."""
         if not self._pool:
@@ -299,6 +300,17 @@ class PostgresStore:
 
         dict_rows = [dict(row) for row in rows]
         body = format_rows(dict_rows, output_format=fmt)
+        if fmt == "csv" and output_path:
+            from agent.tools.filesystem import write_file
+
+            write_result = write_file(output_path, body)
+            if write_result.startswith("[ERROR"):
+                return write_result
+            suffix = f" ({len(dict_rows)} row(s), limit {row_limit})"
+            if len(dict_rows) >= row_limit:
+                suffix += " — results truncated; narrow the query or raise limit"
+            return f"Exported CSV to {output_path}{suffix}. {write_result}"
+
         suffix = f"\n\n({len(dict_rows)} row(s), limit {row_limit})"
         if len(dict_rows) >= row_limit:
             suffix += " — results truncated; narrow the query or raise limit"

@@ -114,7 +114,7 @@ class SystemPromptBuilder:
 11. For long-running commands, pass timeout=3600 or higher to run_shell.
 11b. When POSTGRES_URL is configured you CAN query the application database:
     - list_postgres_tables() to discover schema
-    - query_postgres(sql, output_format='csv') for read-only SELECT queries
+    - query_postgres(sql, output_format='csv', output_path='/workspace/export.csv') for read-only SELECT queries
     - write_file() to save CSV exports under /workspace/
     Never claim you lack database access when these tools are available.
 11a. In your private Discord channel, prefer native control commands when appropriate:

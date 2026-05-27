@@ -43,6 +43,27 @@ async def test_query_readonly_formats_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_readonly_writes_csv_to_output_path(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent.config import settings
+
+    monkeypatch.setattr(settings, "workspace_path", tmp_path)
+    store = PostgresStore("postgresql://u:p@localhost/db")
+    store._pool = _FakePool(_FakeConn([{"id": 1, "title": "Show"}]))  # type: ignore[assignment]
+
+    out = await store.query_readonly(
+        "SELECT id, title FROM events",
+        output_format="csv",
+        output_path="export.csv",
+    )
+
+    export = tmp_path / "export.csv"
+    assert export.exists()
+    assert export.read_text(encoding="utf-8") == "id,title\n1,Show"
+    assert "Exported CSV to export.csv" in out
+    assert "Written" in out
+
+
+@pytest.mark.asyncio
 async def test_query_readonly_rejects_mutating_sql() -> None:
     store = PostgresStore("postgresql://u:p@localhost/db")
     store._pool = _FakePool(_FakeConn())  # type: ignore[assignment]

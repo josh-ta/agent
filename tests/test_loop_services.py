@@ -957,6 +957,41 @@ async def test_run_executor_collects_browser_screenshot_attachments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_executor_collects_workspace_csv_attachments(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "workspace_path", tmp_path)
+    export = tmp_path / "export.csv"
+    export.write_text("id,name\n1,Show", encoding="utf-8")
+
+    class _Agent:
+        def run_mcp_servers(self) -> _NullContext:
+            return _NullContext()
+
+        async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+            yield FunctionToolResultEvent(
+                ToolReturnPart(
+                    tool_name="query_postgres",
+                    content=f"Exported CSV to {export.name} (1 row(s), limit 5000). Written 14 bytes to {export}",
+                    tool_call_id="call-1",
+                )
+            )
+            final = FinalResultEvent(tool_name=None, tool_call_id=None)
+            final.output = "CSV ready"
+            yield final
+
+    result = await RunExecutor(event_bridge=_Bridge()).run(
+        task=Task(content="export csv", source="discord", channel_id=101),
+        agent=_Agent(),  # type: ignore[arg-type]
+        base_prompt="export csv",
+        tier="smart",
+    )
+
+    assert result.output == "CSV ready"
+    assert len(result.attachments) == 1
+    assert result.attachments[0].filename == "export.csv"
+    assert result.attachments[0].data == b"id,name\n1,Show"
+
+
+@pytest.mark.asyncio
 async def test_run_executor_emits_idle_progress_when_task_goes_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "progress_heartbeat_seconds", 1)
     bridge = _Bridge()

@@ -73,6 +73,11 @@ _SHELL_CRITICAL_FAILURE_RE = re.compile(
     r"module(?:not)?founderror|pull access denied|no module named|traceback )"
 )
 _MAX_STREAMING_TOOL_USE_RETRIES = 2
+_WORKSPACE_EXPORT_PATH_RE = re.compile(
+    r"(?:Written \d+ bytes to|Exported CSV to)\s+(\S+\.(?:csv|tsv|json|txt|md))\b",
+    re.IGNORECASE,
+)
+_ATTACHABLE_EXTENSIONS = {".csv", ".tsv", ".json", ".txt", ".md"}
 
 
 @dataclass
@@ -246,7 +251,8 @@ class TaskContextBuilder:
         return (
             "## Database / CSV workflow (use tools — do not answer from memory)\n"
             f"{body}\n"
-            "Start with list_postgres_tables() when table names are unknown."
+            "For CSV exports use query_postgres(..., output_format='csv', output_path='/workspace/export.csv') "
+            "so the file is written directly without piping rows through write_file."
         )
 
     async def _load_lessons(self, content: str) -> str:
@@ -456,7 +462,7 @@ class RunExecutor:
                 "## MANDATORY — tool use required\n"
                 "Your previous turn finished without calling any tools. That is not acceptable.\n"
                 "You MUST call at least one tool before giving a final answer.\n"
-                "- Database/CSV: list_postgres_tables() → query_postgres() → write_file() under /workspace/\n"
+                "- Database/CSV: list_postgres_tables() → query_postgres(output_format='csv', output_path='/workspace/export.csv') → attach file\n"
                 "- Other work: run_shell, read_file, write_file, or the relevant tool\n"
                 "Do not reply with prose only. Invoke a tool in your next step."
             )
@@ -465,8 +471,8 @@ class RunExecutor:
                 "## MANDATORY — still no tools called\n"
                 "You have repeatedly finished without calling any tools. Prose-only answers are rejected.\n"
                 "Your very next action MUST be a tool call — not text.\n"
-                "- Database/CSV: call list_postgres_tables() first, then query_postgres(output_format='csv'), "
-                "then write_file('/workspace/export.csv', ...)\n"
+                "- Database/CSV: call list_postgres_tables() first, then query_postgres(output_format='csv', "
+                "output_path='/workspace/export.csv') — do not paste CSV into write_file\n"
                 "- Other work: run_shell, read_file, write_file, or the relevant tool\n"
                 "Do not explain what you would do — call the tool."
             )
@@ -978,17 +984,43 @@ class RunExecutor:
 
     @staticmethod
     def _extract_discord_attachments(tool_name: str, result: object) -> list[DiscordAttachment]:
-        if tool_name != "browser_screenshot":
+        if tool_name == "browser_screenshot":
+            attachments: list[DiscordAttachment] = []
+            for text in RunExecutor._iter_text_values(result):
+                attachment = decode_data_url_attachment(
+                    text,
+                    filename=f"browser-screenshot-{len(attachments) + 1}.png",
+                )
+                if attachment is not None:
+                    attachments.append(attachment)
+            return attachments
+
+        if tool_name not in {"write_file", "query_postgres"}:
             return []
 
         attachments: list[DiscordAttachment] = []
         for text in RunExecutor._iter_text_values(result):
-            attachment = decode_data_url_attachment(
-                text,
-                filename=f"browser-screenshot-{len(attachments) + 1}.png",
-            )
-            if attachment is not None:
-                attachments.append(attachment)
+            attachments.extend(RunExecutor._attachments_from_export_result(text))
+        return attachments
+
+    @staticmethod
+    def _attachments_from_export_result(result: str) -> list[DiscordAttachment]:
+        from agent.tools.filesystem import read_workspace_attachment
+
+        attachments: list[DiscordAttachment] = []
+        seen: set[str] = set()
+        for match in _WORKSPACE_EXPORT_PATH_RE.finditer(result):
+            path = match.group(1)
+            if Path(path).suffix.lower() not in _ATTACHABLE_EXTENSIONS:
+                continue
+            payload = read_workspace_attachment(path)
+            if payload is None:
+                continue
+            filename, data = payload
+            if filename in seen:
+                continue
+            seen.add(filename)
+            attachments.append(DiscordAttachment(filename=filename, data=data))
         return attachments
 
     @staticmethod

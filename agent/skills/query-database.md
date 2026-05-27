@@ -12,10 +12,16 @@ Use when the user asks for data, reports, CSV exports, or SQL against the connec
 
 2. **Run the query** with `query_postgres()`. Only `SELECT`, `WITH`, `EXPLAIN`, or `TABLE` statements are allowed.
 
-3. **CSV export**:
-   - `query_postgres("SELECT ...", output_format='csv', limit=5000)`
-   - `write_file("/workspace/export.csv", <csv text>)`
-   - Attach or summarize the file path for the user.
+3. **CSV export** (write directly to disk — never paste CSV into `write_file`):
+   ```
+   query_postgres(
+     "SELECT ...",
+     output_format='csv',
+     output_path='/workspace/upcoming_arena_events_ticket_limit_4.csv',
+     limit=5000,
+   )
+   ```
+   The file is attached to the Discord reply automatically when export succeeds.
 
 ## Tips
 
@@ -28,4 +34,4 @@ Use when the user asks for data, reports, CSV exports, or SQL against the connec
 
 - Answering from memory instead of querying — always call tools first.
 - Guessing table names — use `list_postgres_tables()` or `information_schema`.
-- Forgetting to write CSV to `/workspace/` when the user asked for a file.
+- Piping large CSV results through `write_file` — use `output_path` on `query_postgres` instead.

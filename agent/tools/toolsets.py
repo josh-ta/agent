@@ -739,16 +739,30 @@ def attach_database_tools(
             sql: str,
             limit: int = 500,
             output_format: str = "table",
+            output_path: str = "",
         ) -> str:
             """
             Run a read-only SQL query against POSTGRES_URL (SELECT/WITH/EXPLAIN only).
 
             Use list_postgres_tables() first when you do not know table names.
-            For CSV exports, set output_format='csv' then write_file() to /workspace/.
+            For CSV exports, set output_format='csv' and output_path='/workspace/export.csv'
+            (writes directly to disk — do not paste CSV into write_file).
             """
-            if msg := _tool_perm_block("query_postgres", sql=sql, limit=limit, output_format=output_format):
+            if msg := _tool_perm_block(
+                "query_postgres",
+                sql=sql,
+                limit=limit,
+                output_format=output_format,
+                output_path=output_path,
+            ):
                 return msg
-            return await postgres.query_readonly(sql, limit=limit, output_format=output_format)
+            path = output_path.strip() or None
+            return await postgres.query_readonly(
+                sql,
+                limit=limit,
+                output_format=output_format,
+                output_path=path,
+            )
 
         @agent.tool_plain
         async def create_shared_task(to_agent: str, description: str) -> str:

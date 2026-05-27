@@ -138,8 +138,15 @@ class _Postgres:
     async def list_tables(self, schema: str = "public") -> str:
         return f"tables:{schema}"
 
-    async def query_readonly(self, sql: str, *, limit: int = 500, output_format: str = "table") -> str:
-        return f"query:{sql}:{limit}:{output_format}"
+    async def query_readonly(
+        self,
+        sql: str,
+        *,
+        limit: int = 500,
+        output_format: str = "table",
+        output_path: str | None = None,
+    ) -> str:
+        return f"query:{sql}:{limit}:{output_format}:{output_path}"
 async def test_toolsets_attach_and_invoke_wrapped_tools(monkeypatch: pytest.MonkeyPatch, isolated_paths) -> None:
     agent = _Agent()
     sqlite = _SQLite()

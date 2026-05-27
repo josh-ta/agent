@@ -152,6 +152,21 @@ def read_file(
         return f"[ERROR: {exc}]"
 
 
+def read_workspace_attachment(path: str, *, max_bytes: int | None = None) -> tuple[str, bytes] | None:
+    """Read a workspace file for outbound delivery (e.g. Discord upload)."""
+    cap = max_bytes if max_bytes is not None else settings.attachment_max_bytes
+    try:
+        fp = _safe_path(path)
+        if not fp.is_file():
+            return None
+        size = fp.stat().st_size
+        if size <= 0 or size > cap:
+            return None
+        return fp.name, fp.read_bytes()
+    except Exception:
+        return None
+
+
 def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
     """
     Write content to a file, creating parent directories as needed.
