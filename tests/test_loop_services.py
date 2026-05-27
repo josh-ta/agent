@@ -681,6 +681,59 @@ async def test_run_executor_retries_rate_limit(monkeypatch: pytest.MonkeyPatch) 
     assert result == RunResult(input_chars=10, output_chars=0)
 
 
+class _StreamingAgentToollessThenTool:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    def run_mcp_servers(self) -> _NullContext:
+        return _NullContext()
+
+    async def run_stream_events(self, prompt: str, message_history=None, usage_limits=None):
+        self.calls += 1
+        self.prompts.append(prompt)
+        if self.calls == 1:
+            final = FinalResultEvent(tool_name=None, tool_call_id=None)
+            final.output = "I would query the database for you."
+            yield PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta="thinking"))
+            yield PartEndEvent(index=0, part=ThinkingPart(content="thinking"))
+            yield PartDeltaEvent(index=1, delta=TextPartDelta(content_delta=final.output))
+            yield PartEndEvent(index=1, part=TextPart(content=final.output))
+            yield final
+            return
+
+        yield FunctionToolCallEvent(
+            ToolCallPart(tool_name="query_postgres", args='{"sql": "SELECT 1"}', tool_call_id="call-1")
+        )
+        yield FunctionToolResultEvent(
+            ToolReturnPart(tool_name="query_postgres", content="1", tool_call_id="call-1")
+        )
+        final = FinalResultEvent(tool_name=None, tool_call_id=None)
+        final.output = "Here is your CSV."
+        yield final
+
+
+@pytest.mark.asyncio
+async def test_run_executor_retries_once_when_tool_use_required_but_no_tools_called() -> None:
+    bridge = _Bridge()
+    agent = _StreamingAgentToollessThenTool()
+    executor = RunExecutor(event_bridge=bridge)
+    task = Task(content="Give me a csv file from postgres")
+
+    result = await executor.run(
+        task=task,
+        agent=agent,  # type: ignore[arg-type]
+        base_prompt="start",
+        tier="smart",
+    )
+
+    assert agent.calls == 2
+    assert "MANDATORY — tool use required" in agent.prompts[1]
+    assert result.tool_calls == 1
+    assert result.output == "Here is your CSV."
+    assert any(isinstance(event, ProgressEvent) and "Retrying" in event.message for event in bridge.events)
+
+
 @pytest.mark.asyncio
 async def test_run_executor_emits_events_and_folds_injected_messages() -> None:
     bridge = _Bridge()

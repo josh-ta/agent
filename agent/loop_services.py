@@ -611,6 +611,35 @@ class RunExecutor:
                             )
                         shell_failures.extend(followup_result.shell_failures)
 
+                tool_retries = int((task.metadata or {}).get("_tool_use_retries", 0))
+                from agent.task_router import requires_tool_use
+
+                if tool_calls == 0 and requires_tool_use(task.content) and tool_retries < 1:
+                    task.metadata["_tool_use_retries"] = tool_retries + 1
+                    await self._bridge.emit(
+                        ProgressEvent(
+                            message=(
+                                "🔧 Retrying — this task needs tools "
+                                "(database query, shell, files, etc.)."
+                            )
+                        )
+                    )
+                    return await self.run(
+                        task=task,
+                        agent=agent,
+                        base_prompt=(
+                            f"{base_prompt}\n\n---\n\n"
+                            "## MANDATORY — tool use required\n"
+                            "Your previous turn finished without calling any tools. That is not acceptable.\n"
+                            "You MUST call at least one tool before giving a final answer.\n"
+                            "- Database/CSV: list_postgres_tables() → query_postgres() → write_file() under /workspace/\n"
+                            "- Other work: run_shell, read_file, write_file, or the relevant tool\n"
+                            "Do not reply with prose only. Invoke a tool in your next step."
+                        ),
+                        tier=tier,
+                        message_history=message_history,
+                    )
+
                 up = self._compose_user_prompt(prompt, task)
                 ic, oc = len(up), len(result_output)
                 await self._maybe_warn_context(ic + oc)

@@ -19,6 +19,13 @@ def test_model_string_preserves_fully_qualified_models() -> None:
     assert settings._to_model_string("xai:grok-3-mini") == "xai:grok-3-mini"
 
 
+def test_model_string_maps_openrouter_slash_ids_to_openai() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings._to_model_string("moonshotai/kimi-k2.6") == "openai:moonshotai/kimi-k2.6"
+    assert settings._to_model_string("qwen/qwen3-14b") == "openai:qwen/qwen3-14b"
+
+
 def test_model_string_property_uses_agent_model() -> None:
     settings = Settings(_env_file=None, AGENT_MODEL="gpt-4o")
 

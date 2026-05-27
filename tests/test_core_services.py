@@ -204,3 +204,17 @@ def test_model_factory_model_settings_cover_non_reasoning_openai(monkeypatch: py
         "openai_prompt_cache_key": "agent-1",
         "openai_prompt_cache_retention": "24h",
     }
+
+
+def test_model_factory_disables_openrouter_qwen_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "thinking_enabled", False)
+    monkeypatch.setattr(settings, "agent_name", "agent-1")
+    monkeypatch.setattr(settings, "openai_base_url", "https://openrouter.ai/api/v1")
+
+    settings_map = ModelFactory().model_settings("openai:qwen/qwen3-14b")
+
+    assert settings_map == {
+        "openai_prompt_cache_key": "agent-1",
+        "openai_prompt_cache_retention": "24h",
+        "extra_body": {"reasoning": {"enabled": False}},
+    }

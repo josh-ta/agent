@@ -192,6 +192,9 @@ class Settings(BaseSettings):
         # Already fully-qualified with a provider prefix — pass through as-is.
         if ":" in model:
             return model
+        # OpenRouter model IDs use provider/model (e.g. moonshotai/kimi-k2.6).
+        if "/" in model:
+            return f"openai:{model}"
         # Bare open-source model names default to Groq inference.
         if model.startswith(("llama", "mixtral", "qwen", "deepseek", "kimi", "moonshotai")):
             return f"groq:{model}"

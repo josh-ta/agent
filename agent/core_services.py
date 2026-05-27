@@ -296,6 +296,17 @@ class ModelFactory:
         if is_groq and settings.thinking_enabled:
             model_settings["groq_reasoning_format"] = "parsed"
 
+        # Qwen3 on OpenRouter often spends the whole turn in reasoning text without
+        # emitting tool calls. Disable provider reasoning so tool use is reliable.
+        if (
+            is_openai
+            and settings.openai_base_url.strip()
+            and "qwen" in model_string.lower()
+        ):
+            extra_body = dict(model_settings.get("extra_body") or {})
+            extra_body.setdefault("reasoning", {"enabled": False})
+            model_settings["extra_body"] = extra_body
+
         return model_settings or None
 
     @staticmethod
