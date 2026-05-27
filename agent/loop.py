@@ -74,6 +74,15 @@ _DEPLOY_KEYWORDS = re.compile(
     r"\b(deploy|deployment|release|rollout|docker compose|docker-compose|ssh|prod|production|staging)\b",
     re.IGNORECASE,
 )
+_DATABASE_DENIAL_RE = re.compile(
+    r"\b("
+    r"do not have|don't have|cannot|can't|unable to|no access"
+    r").{0,60}\b("
+    r"access|database|postgres|event data|information about|sales starting"
+    r")\b|"
+    r"\bprovide a list of events\b",
+    re.IGNORECASE,
+)
 def _parse_override(content: str) -> tuple[str, str | None]:
     """
     Strip a /fast|/smart|/best prefix from the message.
@@ -619,6 +628,12 @@ class AgentLoop:
                 metadata=task.metadata,
             )
 
+        from agent.task_router import requires_tool_use
+
+        if execution_mode == "chat" and requires_tool_use(task.content, metadata=task.metadata):
+            execution_mode = "agent"
+            log.info("routing_chat_overridden", reason="content_requires_tools", intent=routing.intent)
+
         if execution_mode == "chat" and self.chat_agent is not None:
             task, tier, base_prompt = await self._context_builder.build_chat(task)
             agent = self.chat_agent
@@ -1127,7 +1142,7 @@ class AgentLoop:
         return fallback, False
 
     async def _is_answer_acceptable(self, *, task: Task, output: str, tool_calls: int) -> bool:
-        from agent.task_router import requires_tool_use
+        from agent.task_router import requires_database_query, requires_tool_use
 
         text = output.strip()
         if not text:
@@ -1136,6 +1151,9 @@ class AgentLoop:
             return False
         if tool_calls == 0 and requires_tool_use(task.content, metadata=task.metadata):
             return False
+        if tool_calls == 0 and requires_database_query(task.content, metadata=task.metadata):
+            if _DATABASE_DENIAL_RE.search(text):
+                return False
         if tool_calls == 0 and len(text.split()) >= 6:
             return True
         validator_prompt = (

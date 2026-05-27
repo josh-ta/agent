@@ -223,14 +223,24 @@ class IntentRouter:
             return heuristic_route(content=content, session_context=session_context)
 
         if not settings.intent_router_enabled:
-            return heuristic_route(
+            return merge_routing_with_heuristics(
+                heuristic_route(
+                    content=content,
+                    session_context=session_context,
+                    postgres_available=self._postgres_available,
+                ),
                 content=content,
                 session_context=session_context,
                 postgres_available=self._postgres_available,
             )
 
         if self._agent is None:
-            return heuristic_route(
+            return merge_routing_with_heuristics(
+                heuristic_route(
+                    content=content,
+                    session_context=session_context,
+                    postgres_available=self._postgres_available,
+                ),
                 content=content,
                 session_context=session_context,
                 postgres_available=self._postgres_available,
@@ -260,6 +270,12 @@ class IntentRouter:
             if not isinstance(decision, RoutingDecision):
                 decision = RoutingDecision.model_validate(decision)
             decision = self._normalize(decision, content=content, session_context=session_context)
+            decision = merge_routing_with_heuristics(
+                decision,
+                content=content,
+                session_context=session_context,
+                postgres_available=self._postgres_available,
+            )
             log.info(
                 "intent_routed",
                 intent=decision.intent,
@@ -273,7 +289,12 @@ class IntentRouter:
             return decision
         except Exception as exc:
             log.warning("intent_router_failed", error=str(exc))
-            return heuristic_route(
+            return merge_routing_with_heuristics(
+                heuristic_route(
+                    content=content,
+                    session_context=session_context,
+                    postgres_available=self._postgres_available,
+                ),
                 content=content,
                 session_context=session_context,
                 postgres_available=self._postgres_available,
@@ -317,6 +338,42 @@ class IntentRouter:
             effective = content
 
         return decision.model_copy(update={"effective_request": effective})
+
+
+def merge_routing_with_heuristics(
+    decision: RoutingDecision,
+    *,
+    content: str,
+    session_context: str = "",
+    postgres_available: bool = False,
+) -> RoutingDecision:
+    """Ensure the LLM router cannot disable tools for obvious database/work requests."""
+    floor = heuristic_route(
+        content=content,
+        session_context=session_context,
+        postgres_available=postgres_available,
+    )
+    updates: dict[str, object] = {}
+    if floor.needs_tools and not decision.needs_tools:
+        updates["needs_tools"] = True
+        updates["execution_mode"] = "agent"
+    if floor.export_csv and not decision.export_csv:
+        updates["export_csv"] = True
+        updates["intent"] = "database_csv_export"
+        updates["needs_tools"] = True
+        updates["execution_mode"] = "agent"
+    elif floor.intent == "database_analytics" and decision.intent in {"social_chat", "general_work"}:
+        updates["intent"] = "database_analytics"
+        updates["needs_tools"] = True
+        updates["execution_mode"] = "agent"
+    if floor.suggested_tools and not decision.suggested_tools:
+        updates["suggested_tools"] = floor.suggested_tools
+    if floor.fold_with_previous and not decision.fold_with_previous:
+        updates["fold_with_previous"] = True
+        updates["effective_request"] = floor.effective_request
+    if updates:
+        decision = decision.model_copy(update=updates)
+    return decision
 
 
 def parse_routing_json(text: str) -> RoutingDecision | None:

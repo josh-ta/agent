@@ -88,6 +88,25 @@ async def test_intent_router_uses_heuristic_when_disabled(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_merge_routing_overrides_social_chat_for_database() -> None:
+    from agent.intent_router import merge_routing_with_heuristics
+
+    decision = merge_routing_with_heuristics(
+        RoutingDecision(
+            intent="social_chat",
+            execution_mode="chat",
+            needs_tools=False,
+            effective_request="Which 5 events with sales starting today?",
+        ),
+        content="Of all the events with a sale starting today which 5 events should I focus on buying?",
+        postgres_available=True,
+    )
+    assert decision.needs_tools is True
+    assert decision.execution_mode == "agent"
+    assert decision.intent == "database_analytics"
+
+
+@pytest.mark.asyncio
 async def test_intent_router_llm_path_with_stub_agent() -> None:
     class _StubAgent:
         async def run(self, prompt: str, usage_limits=None):

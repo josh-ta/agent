@@ -89,28 +89,47 @@ def _routing_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _content_requires_tools(text: str) -> bool:
+    """Heuristic tool-use detection from message text alone (ignores routing metadata)."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if bool(_DATABASE_WORK_RE.search(stripped)) or bool(_EVENT_DATA_RE.search(stripped)):
+        return True
+    return bool(_WORK_RE.search(stripped))
+
+
 def requires_database_query(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
     """True when the request needs Postgres query tools (analytics or export)."""
+    text = content.strip()
+    if _content_requires_database(text):
+        return True
     routing = _routing_metadata(metadata)
     intent = str(routing.get("intent", ""))
     if intent in {"database_analytics", "database_csv_export"}:
         return True
-    if "needs_tools" in routing and routing.get("export_csv"):
+    if routing.get("needs_tools") and routing.get("export_csv"):
         return True
-    text = content.strip()
-    if not text:
+    return False
+
+
+def _content_requires_database(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
         return False
-    return bool(_DATABASE_WORK_RE.search(text)) or bool(_EVENT_DATA_RE.search(text))
+    return bool(_DATABASE_WORK_RE.search(stripped)) or bool(_EVENT_DATA_RE.search(stripped))
 
 
 def requires_database_csv_export(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
     """True when the user wants a CSV/file export (use non-streaming multi-step run)."""
+    text = content.strip()
+    if text and requires_database_query(text, metadata=None) and bool(_DATABASE_CSV_RE.search(text)):
+        return True
     routing = _routing_metadata(metadata)
-    if "export_csv" in routing:
-        return bool(routing["export_csv"])
+    if routing.get("export_csv"):
+        return True
     if str(routing.get("intent", "")) == "database_csv_export":
         return True
-    text = content.strip()
     if not requires_database_query(text, metadata=metadata):
         return False
     return bool(_DATABASE_CSV_RE.search(text))
@@ -123,13 +142,13 @@ def requires_database_tools(content: str, *, metadata: dict[str, Any] | None = N
 
 def requires_tool_use(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
     """True when the user request clearly needs tools (SQL, files, shell, etc.)."""
-    routing = _routing_metadata(metadata)
-    if "needs_tools" in routing:
-        return bool(routing["needs_tools"])
     text = content.strip()
-    if requires_database_query(text, metadata=metadata):
+    if _content_requires_tools(text):
         return True
-    return bool(_WORK_RE.search(text))
+    routing = _routing_metadata(metadata)
+    if routing.get("needs_tools"):
+        return True
+    return False
 
 
 def classify_execution_mode(
@@ -143,15 +162,16 @@ def classify_execution_mode(
 
     Same user, same session — only the per-message depth changes.
     """
+    meta = metadata or {}
+    routing = _routing_metadata(meta)
+    text = content.strip()
+
+    if routing.get("execution_mode") == "agent":
+        return "agent"
+
     if source != "discord":
         return "agent"
 
-    meta = metadata or {}
-    routing = _routing_metadata(meta)
-    if routing.get("execution_mode") in {"chat", "agent"}:
-        return routing["execution_mode"]  # type: ignore[return-value]
-
-    text = content.strip()
     if not text:
         return "agent"
 
@@ -164,11 +184,11 @@ def classify_execution_mode(
     if _COMPLEX_RE.search(text):
         return "agent"
 
-    if _WORK_RE.search(text):
+    if _content_requires_tools(text):
         return "agent"
 
-    if requires_database_query(text):
-        return "agent"
+    if routing.get("execution_mode") == "chat":
+        return "chat"
 
     from agent.loop import _BEST_KEYWORDS, _SMART_KEYWORDS
 

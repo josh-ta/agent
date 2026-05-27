@@ -75,3 +75,16 @@ def test_requires_tool_use_for_event_analytics() -> None:
         "Of all the events with a sale starting today which 5 events should I focus on buying?"
     )
     assert requires_tool_use("hello") is False
+
+
+def test_requires_tool_use_ignores_router_false_for_database_content() -> None:
+    bad_routing = {
+        "routing": {
+            "intent": "social_chat",
+            "execution_mode": "chat",
+            "needs_tools": False,
+        }
+    }
+    query = "Of all the events with a sale starting today which 5 events should I focus on buying?"
+    assert requires_tool_use(query, metadata=bad_routing) is True
+    assert classify_execution_mode(query, source="discord", metadata=bad_routing) == "agent"
