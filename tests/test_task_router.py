@@ -112,20 +112,35 @@ def test_looks_like_database_denial_matches_spec_refusal() -> None:
     )
 
 
-def test_task_context_builder_loads_event_spec_skill(isolated_paths: dict) -> None:
+def test_task_context_builder_loads_analysis_skills(isolated_paths: dict) -> None:
     from agent.loop_services import TaskContextBuilder
 
-    isolated_paths["skills"].joinpath("event-spec-analysis.md").write_text(
-        "# Event spec\n\nUse chartmetric proxy signals when price history is missing.\n",
-        encoding="utf-8",
-    )
-    isolated_paths["skills"].joinpath("query-database.md").write_text("# Query\n", encoding="utf-8")
+    for name in (
+        "event-spec-analysis",
+        "events-schema-reference",
+        "discord-analyst-replies",
+        "query-database",
+    ):
+        isolated_paths["skills"].joinpath(f"{name}.md").write_text(
+            f"# {name}\n\nSkill body for {name}.\n",
+            encoding="utf-8",
+        )
 
     hint = TaskContextBuilder._load_database_workflow_hint(
         "Which events with upcoming public sales should we spec?"
     )
-    assert "Event spec / prediction" in hint
-    assert "chartmetric" in hint.lower()
+    assert "Event spec" in hint or "event-spec" in hint.lower()
+    assert "Events schema reference" in hint
+    assert "Discord analyst" in hint
+
+
+def test_requires_sale_day_focus() -> None:
+    from agent.task_router import requires_sale_day_focus
+
+    assert requires_sale_day_focus(
+        "Of all the events with a sale starting today which 5 events should I focus on buying?"
+    )
+    assert requires_sale_day_focus("Which events should we spec?") is False
 
 
 def test_requires_tool_use_ignores_router_false_for_database_content() -> None:

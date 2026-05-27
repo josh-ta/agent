@@ -19,7 +19,7 @@ For questions like "top 5 events", "sales starting today", "which should I buy":
 
 3. **Answer in prose** — summarize the rows for the user. Do not export CSV unless they ask for a file.
 
-For **spec picks**, **price-drop predictions**, or **which events to buy** — load the full `event-spec-analysis` skill behavior: query + rank + explain using proxy signals (chartmetric, venue, dates, limits). Do not refuse when historical price time series is missing.
+For **spec picks**, **price-drop predictions**, **sale-day buy focus**, **hold analysis**, or **price history** — see skills: `event-spec-analysis`, `sale-day-focus`, `event-hold-analysis`, `price-history-analysis`. Schema: `events-schema-reference`. Reply format: `discord-analyst-replies`.
 
 **Efficiency:** Aim for 1 schema check + 1–2 data queries. Do not loop more than 5 `query_postgres` calls.
 

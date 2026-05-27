@@ -68,6 +68,33 @@ _EVENT_DATA_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EVENT_HOLD_RE = re.compile(
+    r"\b("
+    r"hold|holding|won't\s+drop|wont\s+drop|won't\s+fall|wont\s+fall|"
+    r"sticky|floor\s+price|keep\s+inventory|bad\s+spec|won't\s+soften|"
+    r"stay\s+firm|hold\s+case"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_SALE_DAY_FOCUS_RE = re.compile(
+    r"\b("
+    r"sale\s+starting\s+today|sales?\s+start(?:ing)?\s+today|onsale\s+today|"
+    r"going\s+on\s+sale\s+today|focus\s+on\s+buying|"
+    r"which\s+\d+\s+events?\s+should\s+i\s+focus"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_PRICE_HISTORY_RE = re.compile(
+    r"\b("
+    r"price\s+history|historical\s+pric|over\s+time|since\s+onsale|"
+    r"price\s+change|track\s+price|snapshot|dropped\s+\d+|percent\s+drop|"
+    r"how\s+much\s+.*drop"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _EVENT_SPEC_RE = re.compile(
     r"\b("
     r"spec|specced|speccing|secondary\s+market|drop\s+in\s+price|price\s+drop|"
@@ -156,12 +183,62 @@ def requires_event_spec_analysis(content: str, *, metadata: dict[str, Any] | Non
     text = content.strip()
     if not text:
         return False
+    if requires_sale_day_focus(content, metadata=metadata):
+        return False
+    if requires_event_hold_analysis(content, metadata=metadata):
+        return False
     if _EVENT_SPEC_RE.search(text) and (
         _content_requires_database(text) or bool(_EVENT_DATA_RE.search(text))
     ):
         return True
     routing = _routing_metadata(metadata)
     return str(routing.get("intent", "")) == "event_spec_analysis"
+
+
+def _event_context(text: str) -> bool:
+    return _content_requires_database(text) or bool(_EVENT_DATA_RE.search(text))
+
+
+def requires_sale_day_focus(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    text = content.strip()
+    if not text or not _event_context(text):
+        return False
+    return bool(_SALE_DAY_FOCUS_RE.search(text))
+
+
+def requires_event_hold_analysis(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    text = content.strip()
+    if not text or not _event_context(text):
+        return False
+    return bool(_EVENT_HOLD_RE.search(text))
+
+
+def requires_price_history_analysis(content: str, *, metadata: dict[str, Any] | None = None) -> bool:
+    text = content.strip()
+    if not text or not _event_context(text):
+        return False
+    if requires_sale_day_focus(content, metadata=metadata):
+        return False
+    return bool(_PRICE_HISTORY_RE.search(text))
+
+
+def matching_event_analysis_skills(content: str, *, metadata: dict[str, Any] | None = None) -> list[str]:
+    """Ordered skill stems to inject for this message (most specific first)."""
+    skills: list[str] = []
+    if requires_sale_day_focus(content, metadata=metadata):
+        skills.append("sale-day-focus")
+    if requires_price_history_analysis(content, metadata=metadata):
+        skills.append("price-history-analysis")
+    if requires_event_hold_analysis(content, metadata=metadata):
+        skills.append("event-hold-analysis")
+    if requires_event_spec_analysis(content, metadata=metadata):
+        skills.append("event-spec-analysis")
+    return skills
+
+
+def primary_event_analysis_skill(content: str, *, metadata: dict[str, Any] | None = None) -> str | None:
+    matched = matching_event_analysis_skills(content, metadata=metadata)
+    return matched[0] if matched else None
 
 
 def requires_database_analytics(content: str, *, metadata: dict[str, Any] | None = None) -> bool:

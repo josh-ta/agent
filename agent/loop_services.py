@@ -286,53 +286,41 @@ class TaskContextBuilder:
         )
 
     @staticmethod
-    def _load_event_spec_skill() -> str:
-        skill_path = settings.skills_path / "event-spec-analysis.md"
-        if not skill_path.exists():
-            return ""
-        return skill_path.read_text(encoding="utf-8").strip()[:3500]
-
-    @staticmethod
     def _load_database_workflow_hint(content: str, metadata: dict | None = None) -> str:
-        from agent.task_router import (
-            requires_database_csv_export,
-            requires_database_query,
-            requires_event_spec_analysis,
-        )
+        from agent.skill_loader import build_event_analysis_blocks
+        from agent.task_router import requires_database_csv_export, requires_database_query
 
         if not requires_database_query(content, metadata=metadata):
             return ""
-        spec_block = ""
-        if requires_event_spec_analysis(content, metadata=metadata):
-            spec_body = TaskContextBuilder._load_event_spec_skill()
-            if spec_body:
-                spec_block = (
-                    "## Event spec / prediction analysis (rank & recommend — do not ask for criteria)\n"
-                    f"{spec_body}\n"
-                )
+
+        analysis_blocks = build_event_analysis_blocks(content, metadata=metadata)
         skill_path = settings.skills_path / "query-database.md"
-        if not skill_path.exists():
-            return spec_block
-        body = skill_path.read_text(encoding="utf-8").strip()[:2500]
+        if not skill_path.exists() and not analysis_blocks:
+            return ""
+        body = ""
+        if skill_path.exists():
+            body = skill_path.read_text(encoding="utf-8").strip()[:2500]
         if requires_database_csv_export(content, metadata=metadata):
-            return (
-                spec_block
-                + "## Database / CSV export (use tools — do not answer from memory)\n"
-                f"{body}\n"
+            parts = [analysis_blocks] if analysis_blocks else []
+            parts.append("## Database / CSV export (use tools — do not answer from memory)\n" + body)
+            parts.append(
                 "For CSV exports use query_postgres(..., output_format='csv', output_path='/workspace/export.csv') "
                 "so the file is written directly without piping rows through write_file. "
                 "The CSV is uploaded to Discord automatically — do not tell the user to open /workspace."
             )
-        return (
-            spec_block
-            + "## Database analytics (use query_postgres — do not answer from memory)\n"
-            f"{body}\n"
+            return "\n\n".join(p for p in parts if p.strip())
+        parts = []
+        if analysis_blocks:
+            parts.append(analysis_blocks)
+        parts.append("## Database analytics (use query_postgres — do not answer from memory)\n" + body)
+        parts.append(
             "Answer in Discord text unless the user explicitly asks for a CSV/file.\n"
             "Be efficient: one schema check if needed, then 1–3 focused SELECT queries with LIMIT.\n"
             "Do not run more than 5 query_postgres calls unless the user asks for deeper exploration.\n"
             "Never claim you lack database access when POSTGRES_URL is configured.\n"
-            "For spec/prediction asks: rank events with reasoning using proxy signals — missing price history is not a blocker."
+            "Rank and recommend with reasoning — you are an analyst, not a report generator."
         )
+        return "\n\n".join(p for p in parts if p.strip())
 
     async def _load_lessons(self, content: str) -> str:
         if self._memory and hasattr(self._memory, "search_lessons"):
@@ -524,13 +512,6 @@ class RunExecutor:
         self._model_event_idle_timeout_s = max(1.0, float(configured_timeout))
 
     @staticmethod
-    def _load_event_spec_skill() -> str:
-        skill_path = settings.skills_path / "event-spec-analysis.md"
-        if not skill_path.exists():
-            return ""
-        return skill_path.read_text(encoding="utf-8").strip()[:3500]
-
-    @staticmethod
     def _load_query_database_skill() -> str:
         skill_path = settings.skills_path / "query-database.md"
         if not skill_path.exists():
@@ -538,31 +519,14 @@ class RunExecutor:
         return skill_path.read_text(encoding="utf-8").strip()[:2500]
 
     def _build_tool_retry_prompt(self, *, base_prompt: str, task: "Task", retry_index: int) -> str:
-        from agent.task_router import (
-            requires_database_csv_export,
-            requires_database_query,
-            requires_event_spec_analysis,
-        )
+        from agent.skill_loader import build_event_analysis_blocks
+        from agent.task_router import requires_database_query
 
         skill_block = ""
         if requires_database_query(task.content, metadata=task.metadata):
-            skill = self._load_query_database_skill()
-            if skill:
-                label = (
-                    "Database / CSV export"
-                    if requires_database_csv_export(task.content, metadata=task.metadata)
-                    else "Database analytics"
-                )
-                skill_block = f"\n## {label} (follow exactly)\n{skill}\n"
-            if requires_event_spec_analysis(task.content, metadata=task.metadata):
-                spec = self._load_event_spec_skill()
-                if spec:
-                    skill_block += (
-                        "\n## Event spec / prediction (MANDATORY)\n"
-                        f"{spec}\n"
-                        "Query Postgres, rank events, explain why each is a spec candidate. "
-                        "Do NOT ask for criteria or refuse due to missing price history.\n"
-                    )
+            blocks = build_event_analysis_blocks(task.content, metadata=task.metadata)
+            if blocks:
+                skill_block = f"\n## Analysis skills (follow exactly)\n{blocks}\n"
 
         if retry_index == 0:
             mandatory = (
@@ -612,29 +576,24 @@ class RunExecutor:
 
         skill_block = ""
         if requires_database_query(task.content, metadata=task.metadata):
-            skill = self._load_query_database_skill()
-            if skill:
-                skill_block = f"\n## Database workflow\n{skill}\n"
+            from agent.skill_loader import build_event_analysis_blocks
+
+            blocks = build_event_analysis_blocks(task.content, metadata=task.metadata)
+            if blocks:
+                skill_block = f"\n{blocks}\n"
+            else:
+                skill = self._load_query_database_skill()
+                if skill:
+                    skill_block = f"\n## Database workflow\n{skill}\n"
 
         analytics_block = ""
         if analytics and not recovery:
-            if requires_event_spec_analysis(task.content, metadata=task.metadata):
-                spec = self._load_event_spec_skill()
-                analytics_block = (
-                    "\n## FIRST ACTION REQUIRED — event spec / price-drop prediction\n"
-                    "Query the `events` table, rank the top N candidates, and explain WHY each is a spec pick.\n"
-                    "Use chartmetric scores, venue size, sale/event dates, ticket limits, genre — NOT historical price time series.\n"
-                    "Do NOT ask Josh for criteria. Do NOT refuse because price history is missing.\n"
-                )
-                if spec:
-                    analytics_block += f"\n{spec}\n"
-            else:
-                analytics_block = (
-                    "\n## FIRST ACTION REQUIRED\n"
-                    "This is a Postgres analytics question. Your FIRST step MUST be `list_postgres_tables()` "
-                    "or `query_postgres()` (e.g. against the `events` table). "
-                    "Do NOT answer from memory or claim you lack database access.\n"
-                )
+            from agent.skill_loader import analytics_first_action, build_event_analysis_blocks
+
+            analytics_block = analytics_first_action(task.content, metadata=task.metadata)
+            extra_skills = build_event_analysis_blocks(task.content, metadata=task.metadata)
+            if extra_skills:
+                analytics_block += f"\n{extra_skills}\n"
 
         if recovery:
             prompt = (
