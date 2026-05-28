@@ -26,6 +26,7 @@ from agent.task_router import (
         ("Can you export that query result as a csv file?", "agent"),
         ("Fix the login bug in auth.py", "agent"),
         ("```python\nprint(1)\n```", "agent"),
+        ("what should i buy today", "agent"),
     ],
 )
 def test_classify_execution_mode(content: str, expected: str) -> None:
@@ -75,6 +76,8 @@ def test_requires_tool_use_for_event_analytics() -> None:
     assert requires_tool_use(
         "Of all the events with a sale starting today which 5 events should I focus on buying?"
     )
+    assert requires_tool_use("what should i buy today")
+    assert requires_database_query("what should i buy today")
     assert requires_tool_use("hello") is False
 
 

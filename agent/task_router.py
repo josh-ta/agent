@@ -61,9 +61,9 @@ _DATABASE_WORK_RE = re.compile(
 _EVENT_DATA_RE = re.compile(
     r"\b("
     r"events?|sale?s?|ticket|tickets|venue|venues|arena|stadium|onsale|presale|"
-    r"chartmetric|buying|focus\s+on|which\s+\d+|top\s+\d+|starting\s+today|"
-    r"on\s+sale|ticketmaster|spec|specced|speccing|public\s+sale|upcoming\s+sale|"
-    r"price\s+drop|drop\s+in\s+price|predict|forecast"
+    r"chartmetric|buy(?:ing)?|should\s+i\s+buy|what\s+should\s+i|focus\s+on|which\s+\d+|top\s+\d+|"
+    r"starting\s+today|buy\s+today|on\s+sale|ticketmaster|spec|specced|speccing|"
+    r"public\s+sale|upcoming\s+sale|price\s+drop|drop\s+in\s+price|predict|forecast"
     r")\b",
     re.IGNORECASE,
 )
@@ -313,6 +313,9 @@ def classify_execution_mode(
         return "agent"
 
     if _content_requires_tools(text):
+        return "agent"
+
+    if _content_requires_database(text):
         return "agent"
 
     if routing.get("execution_mode") == "chat":

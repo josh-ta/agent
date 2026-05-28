@@ -140,12 +140,14 @@ class MessageHandlingService:
         parsed: ParsedMessage,
         task_content: str,
         private_channel: discord.abc.Messageable | None,
+        message_channel: discord.abc.Messageable | None = None,
     ) -> tuple[discord.abc.Messageable, discord.abc.Messageable | None]:
         """Return (work_channel, reply_channel). Thread creation is deferred until tools run."""
         _ = task_content
         originating = parsed.channel_id
         if parsed.is_direct_message:
-            dm_channel = self._client.get_channel(originating)
+            # DM channels are often missing from the client cache; use the live channel.
+            dm_channel = message_channel or self._client.get_channel(originating)
             if dm_channel is not None:
                 return dm_channel, dm_channel  # type: ignore[return-value]
         if originating == settings.discord_agent_channel_id:
@@ -743,6 +745,7 @@ class MessageHandlingService:
             parsed=parsed,
             task_content=task_content,
             private_channel=private_channel,  # type: ignore[arg-type]
+            message_channel=message.channel,  # type: ignore[arg-type]
         )
         sink_tag = f"discord_{parsed.channel_id}_{id(task)}"
         run_gen = int(metadata["run_generation"])

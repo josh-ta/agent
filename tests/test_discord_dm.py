@@ -31,6 +31,33 @@ def test_dm_user_allowed_respects_allowlist(monkeypatch: pytest.MonkeyPatch) -> 
     assert dm_user_allowed(8) is False
 
 
+@pytest.mark.asyncio
+async def test_resolve_stream_target_uses_message_channel_for_dm(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent.communication.discord_services import MessageHandlingService
+    from agent.communication.message_router import MessageKind, ParsedMessage
+
+    monkeypatch.setattr("agent.communication.discord_services.settings.discord_agent_channel_id", 101)
+    guild_channel = FakeChannel(id=101)
+    dm_channel = FakeChannel(id=999)
+    client = SimpleNamespace(get_channel=lambda _cid: guild_channel)
+    service = MessageHandlingService(
+        agent_loop=SimpleNamespace(),
+        client=client,  # type: ignore[arg-type]
+        presenter=SimpleNamespace(),
+    )
+    parsed = ParsedMessage(MessageKind.TASK, "hi", "josh", 999, 1, is_direct_message=True)
+
+    work, reply = await service._resolve_stream_target(
+        parsed=parsed,
+        task_content="analyze sales",
+        private_channel=guild_channel,  # type: ignore[arg-type]
+        message_channel=dm_channel,  # type: ignore[arg-type]
+    )
+
+    assert work is dm_channel
+    assert reply is dm_channel
+
+
 def test_is_operator_surface_treats_dm_and_private_channel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent.communication.discord_services.settings.discord_agent_channel_id", 101)
     service = MessageHandlingService(
