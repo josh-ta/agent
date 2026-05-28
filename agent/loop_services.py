@@ -724,8 +724,6 @@ class RunExecutor:
 
         assert result is not None
         usage_obj = getattr(result, "usage", None)
-        if callable(usage_obj):
-            usage_obj = usage_obj()
         usage_tool_calls = int(getattr(usage_obj, "tool_calls", 0) or 0)
         tool_calls = max(tool_calls, usage_tool_calls)
         output = str(result.output).strip()

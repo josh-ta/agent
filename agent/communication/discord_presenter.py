@@ -403,21 +403,30 @@ class DiscordEventPresenter:
                 return
             reply_buffer = cleaned
             chunks = split_message_chunks(cleaned)
+            delivered_any = False
             for index, chunk in enumerate(chunks):
                 if index == 0 and reply_message is None:
                     if reply_to is not None:
                         try:
                             reply_message = await reply_to.reply(chunk, mention_author=False)
-                        except discord.HTTPException:
+                            delivered_any = reply_message is not None
+                        except discord.HTTPException as exc:
+                            log.warning("discord_reply_failed", error=str(exc), chunk_index=index)
                             reply_message = await send_with_retry(reply_channel, content=chunk)
+                            delivered_any = reply_message is not None
                     else:
                         reply_message = await send_with_retry(reply_channel, content=chunk)
+                        delivered_any = reply_message is not None
                 elif index == 0 and reply_message is not None:
-                    await edit_with_retry(reply_message, content=chunk)
+                    if await edit_with_retry(reply_message, content=chunk):
+                        delivered_any = True
+                    else:
+                        followup = await send_with_retry(reply_channel, content=chunk)
+                        delivered_any = followup is not None
                 else:
-                    await send_with_retry(reply_channel, content=chunk)
-            if chunks:
-                reply_delivered = True
+                    followup = await send_with_retry(reply_channel, content=chunk)
+                    delivered_any = delivered_any or followup is not None
+            reply_delivered = delivered_any
 
         sink.finalize_status = status.finalize  # type: ignore[attr-defined]
         sink.mark_stopped = status.set_stopped  # type: ignore[attr-defined]

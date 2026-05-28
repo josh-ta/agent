@@ -765,7 +765,8 @@ class MessageHandlingService:
         )
         self._bridge.register(sink_tag, sink)
 
-        typing_ctx = stream_channel.typing() if hasattr(stream_channel, "typing") else message.channel.typing()  # type: ignore[union-attr]
+        # Always tie typing to the user's message channel (DM channels are often uncached).
+        typing_ctx = message.channel.typing()  # type: ignore[union-attr]
         result: TaskResult | None = None
         reply_delivered = False
         try:
@@ -776,7 +777,18 @@ class MessageHandlingService:
             if result is not None and not result.waiting_for_user and result.output:
                 finalize_reply = getattr(sink, "finalize_reply", None)
                 if finalize_reply is not None:
-                    await finalize_reply(result.output)  # type: ignore[misc]
+                    try:
+                        await asyncio.wait_for(
+                            finalize_reply(result.output),  # type: ignore[misc]
+                            timeout=90.0,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "discord_finalize_reply_failed",
+                            error=str(exc),
+                            channel_id=parsed.channel_id,
+                            task_id=metadata.get("task_id"),
+                        )
             reply_delivered = getattr(sink, "reply_delivered", lambda: False)()
             self._session_state.pop_inject_queue(parsed.channel_id)
             self._session_state.pop_active_session(parsed.channel_id)
@@ -784,7 +796,18 @@ class MessageHandlingService:
             self._bridge.unregister(sink_tag)
             finalize = getattr(sink, "finalize_status", None)
             if finalize is not None and result is not None:
-                await finalize(success=bool(result.success))  # type: ignore[misc]
+                try:
+                    await asyncio.wait_for(
+                        finalize(success=bool(result.success)),  # type: ignore[misc]
+                        timeout=30.0,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "discord_finalize_status_failed",
+                        error=str(exc),
+                        channel_id=parsed.channel_id,
+                        task_id=metadata.get("task_id"),
+                    )
 
         if result is None:
             return

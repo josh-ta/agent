@@ -386,6 +386,10 @@ class AgentLoop:
 
                 result = await self._process(task)
 
+                # Unblock Discord (and other interactive waiters) before durable bookkeeping.
+                if task.response_future and not task.response_future.done():
+                    task.response_future.set_result(result)
+
                 if (
                     self._postgres is not None
                     and task.source == "a2a"
@@ -402,9 +406,6 @@ class AgentLoop:
                 # Post-task reflection (non-blocking, best-effort)
                 if result.status in {"succeeded", "failed"}:
                     asyncio.create_task(self._reflect(task, result))
-
-                if task.response_future and not task.response_future.done():
-                    task.response_future.set_result(result)
 
                 return result
         finally:
