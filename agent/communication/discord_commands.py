@@ -97,7 +97,7 @@ class CommandHandler:
         task_content: str,
         attachment_metadata: dict[str, Any],
     ) -> bool:
-        if not self._service._is_private_channel(parsed.channel_id):  # noqa: SLF001
+        if not self._service._is_operator_surface(parsed):  # noqa: SLF001
             return False
 
         await self._service._acknowledge_message(message)  # noqa: SLF001

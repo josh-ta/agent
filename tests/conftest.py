@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import discord
 import pytest
 
 from agent.config import settings
@@ -79,6 +80,7 @@ class FakeDiscordAttachment:
 @dataclass
 class FakeChannel:
     id: int
+    type: object | None = None
     sent: list[str] = field(default_factory=list)
     sent_files: list[str] = field(default_factory=list)
     sent_messages: list[FakeSentMessage] = field(default_factory=list)
@@ -203,12 +205,15 @@ def discord_channels(monkeypatch: pytest.MonkeyPatch) -> dict[str, FakeChannel]:
     private = FakeChannel(id=101)
     bus = FakeChannel(id=202)
     comms = FakeChannel(id=303)
+    dm = FakeChannel(id=404, type=discord.ChannelType.private)
 
     monkeypatch.setattr(settings, "discord_agent_channel_id", private.id)
     monkeypatch.setattr(settings, "discord_bus_channel_id", bus.id)
     monkeypatch.setattr(settings, "discord_comms_channel_id", comms.id)
+    monkeypatch.setattr(settings, "discord_dm_enabled", True)
+    monkeypatch.setattr(settings, "discord_dm_allowed_user_ids", "")
 
-    return {"private": private, "bus": bus, "comms": comms}
+    return {"private": private, "bus": bus, "comms": comms, "dm": dm}
 
 
 @pytest.fixture

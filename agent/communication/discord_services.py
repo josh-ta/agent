@@ -92,8 +92,10 @@ class MessageHandlingService:
         lowered = text.strip().lower()
         return lowered.startswith(("forget it", "forget that", "never mind", "nevermind", "scratch that", "/forget"))
 
-    def _is_private_channel(self, channel_id: int) -> bool:
-        return channel_id == settings.discord_agent_channel_id
+    @staticmethod
+    def _is_operator_surface(parsed: ParsedMessage) -> bool:
+        """Guild private agent channel or an allowed DM thread."""
+        return parsed.is_direct_message or parsed.channel_id == settings.discord_agent_channel_id
 
     def _build_task_metadata(
         self,
@@ -142,6 +144,10 @@ class MessageHandlingService:
         """Return (work_channel, reply_channel). Thread creation is deferred until tools run."""
         _ = task_content
         originating = parsed.channel_id
+        if parsed.is_direct_message:
+            dm_channel = self._client.get_channel(originating)
+            if dm_channel is not None:
+                return dm_channel, dm_channel  # type: ignore[return-value]
         if originating == settings.discord_agent_channel_id:
             target = private_channel or originating  # type: ignore[return-value]
             return target, target
@@ -186,7 +192,7 @@ class MessageHandlingService:
             await self._agent_loop.enqueue_front(task)
         else:
             await self._agent_loop.enqueue(task)
-        if self._is_private_channel(parsed.channel_id):
+        if self._is_operator_surface(parsed):
             waiter = asyncio.create_task(
                 self._wait_for_deferred_result(
                     parsed=parsed,
@@ -329,7 +335,9 @@ class MessageHandlingService:
     ) -> Callable[[], Awaitable[discord.abc.Messageable | None]] | None:
         if not settings.discord_use_task_threads:
             return None
-        if private_channel is None or parsed.channel_id != settings.discord_agent_channel_id:
+        if private_channel is None or not (
+            parsed.channel_id == settings.discord_agent_channel_id and not parsed.is_direct_message
+        ):
             return None
 
         async def _create() -> discord.abc.Messageable | None:
@@ -491,7 +499,10 @@ class MessageHandlingService:
         if parsed.kind in {MessageKind.IGNORE, MessageKind.BUS}:
             return
 
-        if self._is_private_channel(parsed.channel_id) and self._config.has_wizard(parsed.channel_id):
+        if (
+            parsed.channel_id == settings.discord_agent_channel_id
+            and self._config.has_wizard(parsed.channel_id)
+        ):
             handled = await self._config.maybe_handle_wizard(message, parsed)
             if handled:
                 return
@@ -503,12 +514,12 @@ class MessageHandlingService:
         )
         native_command = (
             parse_native_command(raw_task_content)
-            if parsed.kind == MessageKind.TASK and self._is_private_channel(parsed.channel_id)
+            if parsed.kind == MessageKind.TASK and self._is_operator_surface(parsed)
             else None
         )
         sticky_session_id = (
             self._session_state.get_sticky_session(parsed.channel_id)
-            if self._is_private_channel(parsed.channel_id) and native_command is None
+            if self._is_operator_surface(parsed) and native_command is None
             else ""
         )
         base_content = native_command.argument if native_command and native_command.expects_task_text else raw_task_content
@@ -576,7 +587,7 @@ class MessageHandlingService:
             return
 
         if (
-            parsed.channel_id == settings.discord_agent_channel_id
+            self._is_operator_surface(parsed)
             and getattr(message, "reference", None) is None
             and len(self._agent_loop.wait_registry.pending_for_channel(parsed.channel_id)) > 1
         ):
@@ -625,7 +636,7 @@ class MessageHandlingService:
                     ),
                 )
                 return
-            if self._is_private_channel(parsed.channel_id) and decision.intent == TurnIntent.START_NEW_TASK:
+            if self._is_operator_surface(parsed) and decision.intent == TurnIntent.START_NEW_TASK:
                 await self._clear_queued_channel_tasks(
                     channel_id=parsed.channel_id,
                     reason="Replaced by a newer operator task.",
@@ -658,7 +669,7 @@ class MessageHandlingService:
             return
 
         if self._agent_loop.has_pending_work:
-            if self._is_private_channel(parsed.channel_id) and decision.intent == TurnIntent.START_NEW_TASK:
+            if self._is_operator_surface(parsed) and decision.intent == TurnIntent.START_NEW_TASK:
                 await self._clear_queued_channel_tasks(
                     channel_id=parsed.channel_id,
                     reason="Replaced by a newer operator task.",
@@ -824,11 +835,15 @@ class MessageHandlingService:
                     await self._presenter.send_attachments(private_channel, attachments)  # type: ignore[arg-type]
             return True
 
+        reply_in_place = (
+            parsed.is_direct_message
+            or original_message.channel.id == settings.discord_agent_channel_id
+        )
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
-        target = private_channel or original_message.channel
+        target = original_message.channel if reply_in_place else (private_channel or original_message.channel)
         try:
             chunks = split_message_chunks(output, max_len=MAX_REPLY_LEN)
-            if original_message.channel.id == settings.discord_agent_channel_id and chunks:
+            if reply_in_place and chunks:
                 await original_message.reply(chunks[0], mention_author=False)
                 for chunk in chunks[1:]:
                     await target.send(chunk)  # type: ignore[union-attr]

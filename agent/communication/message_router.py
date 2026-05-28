@@ -18,6 +18,7 @@ from typing import Any
 
 import discord
 
+from agent.communication.discord_constants import dm_user_allowed, is_dm_channel
 from agent.config import settings
 
 A2A_RE = re.compile(r'^\s*\{.*"from"\s*:.*\}', re.DOTALL)
@@ -57,6 +58,7 @@ class ParsedMessage:
     channel_id: int
     message_id: int
     a2a_payload: dict[str, Any] | None = None
+    is_direct_message: bool = False
 
 
 def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMessage:
@@ -119,6 +121,19 @@ def classify(message: discord.Message, bot_user: discord.ClientUser) -> ParsedMe
     # Private channel for this agent → always a task
     if channel_id == settings.discord_agent_channel_id:
         return ParsedMessage(MessageKind.TASK, content, author, channel_id, message_id)
+
+    # Direct message to the bot → task when DMs are enabled (and user allowlisted, if configured)
+    if is_dm_channel(message.channel):
+        if not dm_user_allowed(message.author.id):
+            return ParsedMessage(MessageKind.IGNORE, content, author, channel_id, message_id)
+        return ParsedMessage(
+            MessageKind.TASK,
+            content,
+            author,
+            channel_id,
+            message_id,
+            is_direct_message=True,
+        )
 
     # Bus channel → task only if mentioned
     if channel_id == settings.discord_bus_channel_id:

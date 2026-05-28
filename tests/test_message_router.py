@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.communication.message_router import (
     MessageKind,
     _normalize_a2a_task,
@@ -9,6 +11,7 @@ from agent.communication.message_router import (
     a2a_to_task_content,
     classify,
 )
+from tests.conftest import FakeAuthor
 
 
 def test_classify_ignores_own_messages(discord_channels, fake_client, fake_message_factory) -> None:
@@ -148,6 +151,59 @@ def test_classify_bus_mention_becomes_task_and_strips_mention(discord_channels, 
 
     assert parsed.kind == MessageKind.TASK
     assert parsed.content == "please investigate"
+
+
+def test_classify_dm_becomes_task_when_enabled(discord_channels, fake_client, fake_message_factory) -> None:
+    message = fake_message_factory(
+        channel=discord_channels["dm"],
+        content="what sales start today?",
+    )
+
+    parsed = classify(message, fake_client.user)
+
+    assert parsed.kind == MessageKind.TASK
+    assert parsed.is_direct_message is True
+    assert parsed.content == "what sales start today?"
+
+
+def test_classify_dm_ignored_when_disabled(
+    discord_channels,
+    fake_client,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent.communication.message_router.settings.discord_dm_enabled", False)
+    message = fake_message_factory(channel=discord_channels["dm"], content="hello")
+
+    parsed = classify(message, fake_client.user)
+
+    assert parsed.kind == MessageKind.IGNORE
+
+
+def test_classify_dm_respects_user_allowlist(
+    discord_channels,
+    fake_client,
+    fake_message_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent.communication.message_router.settings.discord_dm_allowed_user_ids",
+        "42",
+    )
+    allowed = fake_message_factory(
+        channel=discord_channels["dm"],
+        content="hi",
+        author=FakeAuthor(id=42),
+    )
+    blocked = fake_message_factory(
+        channel=discord_channels["dm"],
+        content="hi",
+        author=FakeAuthor(id=99),
+    )
+
+    assert classify(allowed, fake_client.user).kind == MessageKind.TASK
+    assert classify(blocked, fake_client.user).is_direct_message is False
+    assert classify(blocked, fake_client.user).kind == MessageKind.IGNORE
 
 
 def test_classify_bus_without_mention_becomes_bus_and_private_channel_always_task(

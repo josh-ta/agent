@@ -69,7 +69,7 @@ async def test_command_handler_clear_reports_empty_queue() -> None:
             queue=SimpleNamespace(qsize=lambda: 0),
             has_pending_work=False,
         ),
-        _is_private_channel=lambda _cid: True,
+        _is_operator_surface=lambda _parsed: True,
         _acknowledge_message=acknowledge,
         _reply_safe=reply_safe,
         _clear_queued_channel_tasks=clear_tasks,
@@ -114,7 +114,7 @@ async def test_command_handler_status_uses_fallback_format() -> None:
             queue=SimpleNamespace(qsize=lambda: 2),
             has_pending_work=True,
         ),
-        _is_private_channel=lambda _cid: True,
+        _is_operator_surface=lambda _parsed: True,
         _acknowledge_message=lambda _message: __import__("asyncio").sleep(0),
         _reply_safe=reply_safe,
     )
@@ -163,7 +163,7 @@ async def test_command_handler_force_cancel_marks_cancelling() -> None:
 
     service = SimpleNamespace(
         _agent_loop=SimpleNamespace(),
-        _is_private_channel=lambda _cid: True,
+        _is_operator_surface=lambda _parsed: True,
         _acknowledge_message=lambda _message: __import__("asyncio").sleep(0),
         _reply_safe=reply_safe,
         _clear_queued_channel_tasks=clear_tasks,

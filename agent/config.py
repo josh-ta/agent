@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     discord_comms_channel_id: int = Field(default=0, alias="DISCORD_COMMS_CHANNEL_ID")
     discord_guild_id: int = Field(default=0, alias="DISCORD_GUILD_ID")
     discord_use_task_threads: bool = Field(default=True, alias="DISCORD_USE_TASK_THREADS")
+    discord_dm_enabled: bool = Field(default=True, alias="DISCORD_DM_ENABLED")
+    # Comma-separated Discord user IDs allowed to DM the bot (empty = any human DM).
+    discord_dm_allowed_user_ids: str = Field(default="", alias="DISCORD_DM_ALLOWED_USER_IDS")
 
     # ── Databases ─────────────────────────────────────────────────────────────
     sqlite_path: Path = Field(default=Path("/data/agent.db"), alias="SQLITE_PATH")

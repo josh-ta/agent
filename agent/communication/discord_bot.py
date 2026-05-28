@@ -39,6 +39,7 @@ class DiscordBot:
         intents.message_content = True
         intents.guilds = True
         intents.guild_messages = True
+        intents.dm_messages = True
 
         self._client = discord.Client(intents=intents)
         self._tree = discord.app_commands.CommandTree(self._client)
@@ -179,11 +180,20 @@ class DiscordBot:
             if followup is not None:
                 await followup.send(text, ephemeral=ephemeral)  # type: ignore[arg-type]
 
-        if interaction.channel.id != settings.discord_agent_channel_id:
+        from agent.communication.discord_constants import dm_user_allowed, is_dm_channel
+
+        channel = interaction.channel
+        in_agent_channel = channel.id == settings.discord_agent_channel_id
+        in_dm = is_dm_channel(channel)
+        if not in_agent_channel and not in_dm:
             await _respond(
-                f"Use `/{name}` in <#{settings.discord_agent_channel_id}> — this agent's private channel.",
+                f"Use `/{name}` in <#{settings.discord_agent_channel_id}> or in a DM with {settings.agent_name}.",
                 ephemeral=True,
             )
+            return
+        user_id = getattr(interaction.user, "id", None)
+        if in_dm and user_id is not None and not dm_user_allowed(int(user_id)):
+            await _respond("DM access is restricted for this bot.", ephemeral=True)
             return
 
         content = f"/{name} {argument}".strip()

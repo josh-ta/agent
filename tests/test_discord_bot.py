@@ -23,8 +23,9 @@ class _NullTyping:
 
 
 class _FakeChannel:
-    def __init__(self, channel_id: int) -> None:
+    def __init__(self, channel_id: int, *, channel_type: discord.ChannelType | None = None) -> None:
         self.id = channel_id
+        self.type = channel_type
         self.sent: list[str] = []
 
     def typing(self) -> _NullTyping:
@@ -120,7 +121,7 @@ class _FakeFollowup:
 class _FakeInteraction:
     def __init__(self, channel: _FakeChannel, *, user=None, interaction_id: int = 123) -> None:
         self.channel = channel
-        self.user = user or SimpleNamespace(display_name="Josh", bot=False)
+        self.user = user or SimpleNamespace(id=1, display_name="Josh", bot=False)
         self.id = interaction_id
         self.response = _FakeResponse()
         self.followup = _FakeFollowup()
@@ -188,7 +189,28 @@ async def test_handle_slash_command_rejects_non_private_channel(monkeypatch: pyt
     await bot._handle_slash_command(interaction, "status")
 
     assert interaction.response.sent
-    assert "private channel" in interaction.response.sent[0].lower()
+    reply = interaction.response.sent[0].lower()
+    assert "private channel" in reply or "dm" in reply
+
+
+@pytest.mark.asyncio
+async def test_handle_slash_command_allows_dm_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = DiscordBot(_FakeLoop())  # type: ignore[arg-type]
+    dm_channel = _FakeChannel(500, channel_type=discord.ChannelType.private)
+    interaction = _FakeInteraction(dm_channel)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_agent_channel_id", 101)
+    monkeypatch.setattr(discord_bot_module.settings, "discord_dm_enabled", True)
+
+    seen: list[str] = []
+
+    async def capture_handle(message) -> None:
+        seen.append(message.content)
+
+    monkeypatch.setattr(bot._messages, "handle_message", capture_handle)
+
+    await bot._handle_slash_command(interaction, "status")
+
+    assert seen == ["/status"]
 
 
 @pytest.mark.asyncio

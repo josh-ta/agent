@@ -74,6 +74,11 @@ class SystemPromptBuilder:
         comms_id = settings.discord_comms_channel_id
         bus_id = settings.discord_bus_channel_id
         private_id = settings.discord_agent_channel_id
+        dm_line = (
+            "- Direct messages (DM): enabled — chat with the bot 1:1; slash commands work in DMs too.\n"
+            if settings.discord_dm_enabled
+            else ""
+        )
 
         peers_block = ""
         if other_agents:
@@ -89,7 +94,7 @@ class SystemPromptBuilder:
 {peers_block}
 ## Discord Channels
 - Your private channel (streaming + direct chat): {private_id}
-- Agent comms — structured JSON A2A only: {comms_id}
+{dm_line}- Agent comms — structured JSON A2A only: {comms_id}
 - Agent bus — brief broadcast announcements: {bus_id}
 
 ## Rules

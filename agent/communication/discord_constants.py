@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+import discord
+
 from agent.config import settings
 
 MAX_REPLY_LEN = 1990
@@ -146,6 +148,35 @@ def format_args(args: object) -> str:
             parts.append(f"{key}={text[:60] + '…' if len(text) > 60 else text}")
         return ", ".join(parts)[:200]
     return str(args)[:200]
+
+
+def is_dm_channel(channel: discord.abc.Messageable | None) -> bool:
+    if channel is None:
+        return False
+    if isinstance(channel, discord.DMChannel):
+        return True
+    return getattr(channel, "type", None) == discord.ChannelType.private
+
+
+def dm_allowed_user_ids() -> frozenset[int]:
+    raw = settings.discord_dm_allowed_user_ids.strip()
+    if not raw:
+        return frozenset()
+    ids: set[int] = set()
+    for part in raw.split(","):
+        piece = part.strip()
+        if piece.isdigit():
+            ids.add(int(piece))
+    return frozenset(ids)
+
+
+def dm_user_allowed(user_id: int) -> bool:
+    if not settings.discord_dm_enabled:
+        return False
+    allowed = dm_allowed_user_ids()
+    if not allowed:
+        return True
+    return user_id in allowed
 
 
 def allows_inline_reply(channel_id: int) -> bool:
