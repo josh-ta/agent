@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Sequence
 import discord
 import structlog
 
+from agent.communication.discord_constants import split_message_chunks
 from agent.task_waits import UserInputRequired, current_task_wait_context
 
 if TYPE_CHECKING:
@@ -85,7 +86,7 @@ async def send_text(channel: "Messageable", message: str, *, max_len: int = 1990
     if not message:
         return 0
 
-    chunks = [message[i:i + max_len] for i in range(0, len(message), max_len)]
+    chunks = split_message_chunks(message, max_len=max_len)
     for chunk in chunks:
         await channel.send(chunk)
     return len(chunks)

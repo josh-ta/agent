@@ -18,7 +18,7 @@ import structlog
 from agent.attachment_ingest import ingest_discord_attachments
 from agent.communication.discord_commands import CommandHandler, NativeCommand, parse_native_command
 from agent.communication.discord_config import ConfigCommandHandler
-from agent.communication.discord_constants import MAX_REPLY_LEN, allows_inline_reply
+from agent.communication.discord_constants import MAX_REPLY_LEN, allows_inline_reply, split_message_chunks
 from agent.communication.discord_presenter import DiscordEventPresenter
 from agent.communication.discord_session import DiscordSessionState
 from agent.communication.message_router import (
@@ -823,7 +823,7 @@ class MessageHandlingService:
         private_channel = self._client.get_channel(settings.discord_agent_channel_id)
         target = private_channel or original_message.channel
         try:
-            chunks = [output[i : i + MAX_REPLY_LEN] for i in range(0, len(output), MAX_REPLY_LEN)]
+            chunks = split_message_chunks(output, max_len=MAX_REPLY_LEN)
             if original_message.channel.id == settings.discord_agent_channel_id and chunks:
                 await original_message.reply(chunks[0], mention_author=False)
                 for chunk in chunks[1:]:

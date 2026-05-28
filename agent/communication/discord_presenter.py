@@ -16,6 +16,7 @@ from agent.communication.discord_constants import (
     SILENT_TOOLS,
     STATUS_EMBED_DEBOUNCE_SECONDS,
     escape_codeblock,
+    split_message_chunks,
     summarize_tool_activity,
 )
 from agent.events import (
@@ -52,7 +53,7 @@ async def send_with_retry(
                 return await channel.send(embed=embed)
             if not content:
                 return None
-            chunks = [content[i : i + max_len] for i in range(0, len(content), max_len)]
+            chunks = split_message_chunks(content, max_len=max_len)
             sent: discord.Message | None = None
             for chunk in chunks:
                 sent = await channel.send(chunk)
@@ -327,25 +328,6 @@ class DiscordEventPresenter:
             work_channel = thread
             status.set_channel(work_channel)
 
-        async def _update_reply(text: str, *, final: bool = False) -> None:
-            nonlocal reply_message, reply_delivered
-            preview = text.strip()
-            if not preview and not final:
-                return
-            body = preview[:MAX_REPLY_LEN] if preview else "…"
-            if reply_message is None:
-                if reply_to is not None:
-                    try:
-                        reply_message = await reply_to.reply(body, mention_author=False)
-                    except discord.HTTPException:
-                        reply_message = await send_with_retry(reply_channel, content=body)
-                else:
-                    reply_message = await send_with_retry(reply_channel, content=body)
-            else:
-                await edit_with_retry(reply_message, content=body)
-            if final and preview:
-                reply_delivered = True
-
         async def sink(event: AgentEvent) -> None:
             nonlocal reply_buffer, shell_lines
 
@@ -415,12 +397,27 @@ class DiscordEventPresenter:
 
         async def finalize_reply(text: str) -> None:
             """Apply the authoritative task output to the user-visible reply."""
-            nonlocal reply_buffer
+            nonlocal reply_buffer, reply_message, reply_delivered
             cleaned = text.strip()
             if not cleaned:
                 return
             reply_buffer = cleaned
-            await _update_reply(reply_buffer, final=True)
+            chunks = split_message_chunks(cleaned)
+            for index, chunk in enumerate(chunks):
+                if index == 0 and reply_message is None:
+                    if reply_to is not None:
+                        try:
+                            reply_message = await reply_to.reply(chunk, mention_author=False)
+                        except discord.HTTPException:
+                            reply_message = await send_with_retry(reply_channel, content=chunk)
+                    else:
+                        reply_message = await send_with_retry(reply_channel, content=chunk)
+                elif index == 0 and reply_message is not None:
+                    await edit_with_retry(reply_message, content=chunk)
+                else:
+                    await send_with_retry(reply_channel, content=chunk)
+            if chunks:
+                reply_delivered = True
 
         sink.finalize_status = status.finalize  # type: ignore[attr-defined]
         sink.mark_stopped = status.set_stopped  # type: ignore[attr-defined]

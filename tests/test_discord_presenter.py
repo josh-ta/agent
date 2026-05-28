@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import discord
 import pytest
 
+from agent.communication.discord_constants import MAX_REPLY_LEN, split_message_chunks
 from agent.communication.discord_presenter import (
     DiscordEventPresenter,
     StatusEmbedManager,
@@ -76,6 +77,44 @@ async def test_presenter_streams_text_deltas(fake_client, fake_message_factory, 
     assert message.replies == []
     await sink.finalize_reply("Hello! How can I assist you today? 😊")  # type: ignore[attr-defined]
     assert message.replies == ["Hello! How can I assist you today? 😊"]
+    assert sink.reply_delivered()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_presenter_finalize_reply_splits_long_output(
+    fake_client,
+    fake_message_factory,
+    discord_channels,
+) -> None:
+    channel = FakeChannel(id=1)
+    message = fake_message_factory(channel=discord_channels["private"], content="hello")
+    presenter = DiscordEventPresenter(fake_client)  # type: ignore[arg-type]
+    sink = presenter.make_sink(
+        channel,
+        debounce_seconds=0,
+        main_channel=channel,
+        reply_to=message,  # type: ignore[arg-type]
+    )
+    intro = "Summary — Top 10 events with sales starting today."
+    events = "\n\n".join(
+        (
+            f"Arcángel – La 8va Maravilla World Tour · Coca-Cola Roxy, Atlanta · "
+            f"Sale May 28, 2026 · Show Oct {15 + i}, 2026\n"
+            "Signal: Chartmetric popularity 95.97, momentum 28.0, arena venue, ticket limit 6.\n"
+            "Take: Buy focus. High popularity and momentum suggest strong demand.\n"
+            "Risk: Mid-show distance for this leg means more legs might announce."
+        )
+        for i in range(10)
+    )
+    text = f"{intro}\n\n{events}"
+    assert len(text) > MAX_REPLY_LEN
+
+    await sink.finalize_reply(text)  # type: ignore[attr-defined]
+
+    expected = split_message_chunks(text)
+    assert len(expected) > 1
+    assert message.replies == [expected[0]]
+    assert channel.sent == expected[1:]
     assert sink.reply_delivered()  # type: ignore[attr-defined]
 
 
