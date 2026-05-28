@@ -18,7 +18,11 @@ import structlog
 from agent.attachment_ingest import ingest_discord_attachments
 from agent.communication.discord_commands import CommandHandler, NativeCommand, parse_native_command
 from agent.communication.discord_config import ConfigCommandHandler
-from agent.communication.discord_constants import MAX_REPLY_LEN, allows_inline_reply, split_message_chunks
+from agent.communication.discord_constants import (
+    MAX_REPLY_LEN,
+    allows_inline_reply,
+    split_message_chunks,
+)
 from agent.communication.discord_presenter import DiscordEventPresenter
 from agent.communication.discord_session import DiscordSessionState
 from agent.communication.message_router import (
